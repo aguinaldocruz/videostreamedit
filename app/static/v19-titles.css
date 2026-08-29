@@ -1,0 +1,5 @@
+.title-with-alternatives[title]:not([title=""]) {
+  text-decoration: underline dotted color-mix(in srgb, var(--muted) 65%, transparent);
+  text-underline-offset: 4px;
+  cursor: help;
+}

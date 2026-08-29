@@ -1,0 +1,9 @@
+.git
+.gitignore
+__pycache__
+*.py[cod]
+*.db
+.pytest_cache
+data
+config
+sample-media

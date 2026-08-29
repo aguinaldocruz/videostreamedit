@@ -1,0 +1,6 @@
+.clone-last-change {
+  border-color: color-mix(in srgb, var(--accent) 65%, var(--line));
+  color: var(--accent);
+  white-space: nowrap;
+}
+

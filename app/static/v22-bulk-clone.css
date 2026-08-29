@@ -1,0 +1,10 @@
+.bulk-clone-button { white-space: nowrap; }
+.bulk-clone-dialog { width: min(820px, 94vw); }
+.bulk-clone-content { display: grid; grid-template-columns: minmax(220px, .8fr) minmax(300px, 1.2fr); gap: 20px; padding: 20px; }
+.bulk-clone-content section { min-width: 0; }
+.bulk-clone-content h3 { margin-bottom: 10px; }
+.bulk-clone-content ul, .bulk-clone-content ol { margin: 0; padding-left: 24px; max-height: 330px; overflow-y: auto; }
+.bulk-clone-content li { padding: 6px 4px; overflow-wrap: anywhere; }
+.bulk-clone-content li small { display: block; margin-top: 2px; color: var(--muted); }
+.bulk-clone-dialog .apply-progress { max-width: 430px; }
+@media (max-width: 720px) { .bulk-clone-content { grid-template-columns: 1fr; } }

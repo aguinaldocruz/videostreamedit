@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>VideoStreamEdit</title>
+  <link rel="stylesheet" href="/app.css">
+</head>
+<body>
+  <header>
+    <h1>VideoStreamEdit</h1>
+    <nav><button data-page="movies">Movies</button><button data-page="tv">TV Shows</button><button data-page="setup">Setup</button></nav>
+  </header>
+  <main>
+    <section id="movies" class="page">
+      <div class="page-title"><div><h2>Movies</h2><p>Select one or more movies, then edit their shared stream properties.</p></div><button class="scan" data-kind="movies">Refresh</button></div>
+      <div class="editor-layout"><div class="browser-pane"><div class="selection-bar"><label><input id="movies-all" type="checkbox"> Select all</label><span id="movies-count">0 selected</span></div><table><thead><tr><th></th><th>Movie</th><th>Library</th><th>Size</th></tr></thead><tbody id="movie-list"></tbody></table><div id="movies-empty" class="empty">No movies found. Add a movie folder in Setup.</div></div><aside id="movies-editor" class="properties"></aside></div>
+    </section>
+
+    <section id="tv" class="page hidden">
+      <div class="page-title"><div><h2>TV Shows</h2><p>Browse by show and season, or show every episode at once.</p></div><button class="scan" data-kind="tv">Refresh</button></div>
+      <div class="tv-layout">
+        <aside class="show-pane"><h3>Shows</h3><div id="show-list"></div><div id="tv-empty" class="empty compact">No TV shows found.</div></aside>
+        <section class="episode-pane"><div class="episode-heading"><div><h3 id="show-title">Choose a show</h3><p id="episode-scope"></p></div><select id="season-filter" disabled></select></div><div class="selection-bar"><label><input id="episodes-all" type="checkbox"> Select all shown</label><span id="episodes-count">0 selected</span></div><table><thead><tr><th></th><th>Episode</th><th>Season</th><th>Size</th></tr></thead><tbody id="episode-list"></tbody></table></section>
+        <aside id="tv-editor" class="properties"></aside>
+      </div>
+    </section>
+
+    <section id="setup" class="page hidden">
+      <div class="page-title"><div><h2>Media folders</h2><p>Add any number of folders visible inside this container.</p></div></div>
+      <div class="setup-grid"><article><h3>Movies</h3><div id="movie-roots" class="roots"></div><button class="primary add-root" data-kind="movies">Add movie folder</button></article><article><h3>TV Shows</h3><div id="tv-roots" class="roots"></div><button class="primary add-root" data-kind="tv">Add TV folder</button></article></div>
+    </section>
+  </main>
+
+  <dialog id="folder-browser"><form method="dialog"><div class="dialog-title"><div><h2>Choose folder</h2><code id="current-path">/</code></div><button value="cancel" aria-label="Close">×</button></div><div id="directories"></div><div class="dialog-actions"><button value="cancel">Cancel</button><button type="button" id="choose-folder" class="primary">Use this folder</button></div></form></dialog>
+  <div id="toast" role="status"></div>
+  <script src="/app.js"></script>
+</body>
+</html>

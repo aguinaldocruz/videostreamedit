@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>VideoStreamEdit</title>
+  <link rel="stylesheet" href="/app.css">
+</head>
+<body>
+  <header><h1>VideoStreamEdit</h1><nav><button data-view="library">Library</button><button data-view="setup">Setup</button></nav></header>
+  <main>
+    <section id="setup" class="view hidden">
+      <div class="section-title"><div><h2>Media folders</h2><p>Add one or more folders visible inside this container.</p></div></div>
+      <div class="setup-grid">
+        <article><h3>Movies</h3><div id="movie-roots" class="roots"></div><button class="primary add-root" data-kind="movies">Add movie folder</button></article>
+        <article><h3>TV Shows</h3><div id="tv-roots" class="roots"></div><button class="primary add-root" data-kind="tv">Add TV folder</button></article>
+      </div>
+    </section>
+    <section id="library" class="view">
+      <div class="section-title"><div><h2>Library</h2><p>Select a file to inspect its streams.</p></div><div><select id="kind-filter"><option value="">All media</option><option value="movies">Movies</option><option value="tv">TV shows</option></select><button id="refresh">Scan folders</button></div></div>
+      <div class="workspace">
+        <div class="file-pane"><table><thead><tr><th></th><th>Name</th><th>Library</th><th>Size</th></tr></thead><tbody id="files"></tbody></table><div id="empty" class="empty">No media found. Add folders in Setup.</div></div>
+        <aside id="inspector"><h3>Stream editor</h3><p class="muted">Select one file to inspect its video, audio, and subtitle streams.</p></aside>
+      </div>
+    </section>
+  </main>
+  <dialog id="browser"><form method="dialog"><div class="dialog-title"><div><h2>Choose folder</h2><code id="current-path">/</code></div><button value="cancel">×</button></div><div id="directories"></div><div class="dialog-actions"><button value="cancel">Cancel</button><button type="button" id="choose-folder" class="primary">Use this folder</button></div></form></dialog>
+  <div id="toast" role="status"></div>
+  <script src="/app.js"></script>
+</body>
+</html>

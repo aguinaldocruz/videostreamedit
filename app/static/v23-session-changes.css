@@ -1,0 +1,30 @@
+#episode-list tr.episode-session-changed {
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+}
+
+.episode-changed-badge {
+  display: inline-block;
+  margin-left: 8px;
+  padding: 1px 6px;
+  border: 1px solid color-mix(in srgb, var(--accent) 58%, transparent);
+  border-radius: 10px;
+  color: var(--accent);
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1.5;
+  vertical-align: middle;
+}
+
+.clone-choice-dialog {
+  width: min(650px, 92vw);
+}
+
+.clone-choice-content {
+  padding: 24px;
+}
+
+@media (max-width: 620px) {
+  .clone-choice-dialog .dialog-actions {
+    align-items: stretch;
+  }
+}

@@ -1,0 +1,1 @@
+.stream-row input.property-value-changed,.stream-row .property-value-changed{border-color:color-mix(in srgb,var(--accent) 72%,var(--line));background-color:color-mix(in srgb,var(--accent) 9%,#202832)}.stream-row.stream-order-changed .drag-handle{color:var(--accent)}.undo-stream-changes{color:#e5bb76;border-color:#806b48;white-space:nowrap}

@@ -1,0 +1,33 @@
+# Runtime state and secrets
+config/*
+!config/.gitkeep
+!config/README.md
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.key
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Local artifacts
+dist/
+build/
+coverage.xml
+.coverage
+htmlcov/
+*.log

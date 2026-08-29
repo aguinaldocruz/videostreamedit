@@ -1,0 +1,4 @@
+.import-destination { align-items: center; cursor: grab; }
+.destination-drag-handle { flex: 0 0 22px; color: var(--muted); font-size: 19px; text-align: center; }
+.import-destination.dragging { opacity: .4; }
+.import-destination.drag-over { outline: 2px solid var(--accent); outline-offset: -2px; }

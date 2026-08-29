@@ -1,0 +1,2 @@
+.browse-output-folder { width: 100%; margin-top: 8px; border-style: dashed; color: var(--accent); }
+.destination-folder-dialog { width: min(700px, 92vw); }

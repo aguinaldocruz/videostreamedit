@@ -1,0 +1,31 @@
+body.app-busy {
+  cursor: progress;
+}
+
+body.app-busy button,
+body.app-busy input,
+body.app-busy select,
+body.app-busy textarea,
+body.app-busy a {
+  opacity: .5;
+  pointer-events: none;
+  cursor: not-allowed;
+}
+
+body.app-busy::after {
+  content: 'Processing… controls temporarily locked';
+  position: fixed;
+  z-index: 2147483647;
+  left: 50%;
+  bottom: 18px;
+  transform: translateX(-50%);
+  padding: 9px 15px;
+  border: 1px solid color-mix(in srgb, var(--accent) 55%, var(--line));
+  border-radius: 18px;
+  background: #111820ee;
+  color: var(--accent);
+  box-shadow: 0 8px 28px #000a;
+  font-size: 12px;
+  font-weight: 700;
+  white-space: nowrap;
+}

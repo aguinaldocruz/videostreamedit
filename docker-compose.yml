@@ -1,0 +1,28 @@
+name: videostreamedit
+
+services:
+  videostreamedit:
+    # Replace this with a published image later, for example:
+    # image: ghcr.io/your-user/videostreamedit:latest
+    build:
+      context: .
+    image: videostreamedit:local
+    container_name: videostreamedit
+    restart: unless-stopped
+    init: true
+
+    ports:
+      - "8383:8080"
+
+    environment:
+      TZ: "America/Sao_Paulo"
+      PUID: "1000"
+      PGID: "1000"
+
+    volumes:
+      - /media/:/media
+      - ./config:/config
+
+    security_opt:
+      - no-new-privileges:true
+

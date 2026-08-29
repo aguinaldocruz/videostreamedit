@@ -1,0 +1,40 @@
+.stream-dialog {
+  width: min(1320px, 98vw);
+  max-width: 98vw;
+}
+
+.stream-dialog .dialog-title,
+.stream-dialog .dialog-actions {
+  padding: 13px 16px;
+}
+
+#selected-file {
+  display: inline-block;
+  max-width: min(900px, 72vw);
+  vertical-align: middle;
+}
+
+#selected-file + .media-path-indicator {
+  margin: 0 0 0 6px;
+  vertical-align: middle;
+}
+
+.stream-content {
+  max-height: 72vh;
+  padding: 12px;
+}
+
+.stream-grid.v7 {
+  grid-template-columns: 28px minmax(160px, 190px) minmax(130px, 1fr) minmax(105px, .75fr) minmax(190px, 1.5fr) 62px 62px 72px 62px;
+  gap: 6px;
+  padding: 10px 8px;
+}
+
+.stream-grid.v7.head {
+  top: -12px;
+}
+
+@media (max-width: 980px) {
+  .stream-dialog { width: 99vw; max-width: 99vw; }
+  .stream-grid.v7 { grid-template-columns: 24px 130px 1fr .8fr 1.3fr 56px 56px 66px 58px; gap: 5px; }
+}

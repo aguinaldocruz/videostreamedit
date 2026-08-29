@@ -1,0 +1,5 @@
+.template-choice-dialog { width: min(720px, 92vw); }
+.template-choice-list { display: grid; gap: 8px; max-height: 52vh; overflow-y: auto; padding: 18px; }
+.template-choice-list button { display: block; width: 100%; text-align: left; }
+.template-choice-list button strong, .template-choice-list button small { display: block; }
+.template-choice-list button small { margin-top: 5px; color: var(--muted); line-height: 1.4; }
