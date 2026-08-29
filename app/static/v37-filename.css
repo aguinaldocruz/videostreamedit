@@ -1,0 +1,30 @@
+.stream-filename-editor {
+  display: grid;
+  grid-template-columns: auto minmax(260px, 620px);
+  align-items: center;
+  gap: 6px 10px;
+  margin-top: 7px;
+}
+
+.stream-filename-editor span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.stream-filename-editor input {
+  width: 100%;
+  padding: 6px 9px;
+  font: 12px/1.35 ui-monospace, SFMono-Regular, Consolas, monospace;
+}
+
+.stream-filename-original {
+  grid-column: 2;
+  color: var(--muted);
+  font: 11px/1.3 ui-monospace, SFMono-Regular, Consolas, monospace;
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 720px) {
+  .stream-filename-editor { grid-template-columns: 1fr; }
+  .stream-filename-original { grid-column: 1; }
+}

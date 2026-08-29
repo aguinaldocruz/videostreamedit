@@ -15,6 +15,7 @@ It provides an MP3Tag-style workflow for language, region, track name, default/f
 - Drag-and-drop stream ordering.
 - Default and forced disposition controls, including an untagged state.
 - External subtitle discovery, editing, integration, ordering, and removal.
+- Filename editing in Stream Properties: destination naming for imports and in-place renaming for synchronized movies and episodes.
 - Previous/next and first/last media navigation.
 - Session change markers, reusable property values, and compatible change templates.
 - Bulk cloning for compatible TV episodes.

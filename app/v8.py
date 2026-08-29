@@ -68,7 +68,12 @@ async def v8_assets(request: Request, call_next):
 def saved_values() -> dict[str, list[str]]:
     result = {"language": [], "region": [], "title_audio": [], "title_subtitle": []}
     with connection() as db:
-        rows = db.execute("SELECT field, value FROM reusable_stream_values WHERE saved = 1 ORDER BY value COLLATE NOCASE").fetchall()
+        rows = db.execute(
+            """SELECT field, value
+               FROM reusable_stream_values
+               WHERE saved = 1
+               ORDER BY field, use_count DESC, value COLLATE NOCASE"""
+        ).fetchall()
     for row in rows:
         result[row["field"]].append(row["value"])
     return result
