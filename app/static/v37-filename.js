@@ -1,4 +1,5 @@
 let streamFilenameOriginal = '';
+let streamFilenameEditEnabled = false;
 
 function mediaBasename(path) {
   return String(path || '').split('/').pop() || '';
@@ -7,25 +8,47 @@ function mediaBasename(path) {
 function ensureStreamFilenameEditor() {
   let editor = $('#stream-filename-editor');
   if (editor) return editor;
-  $('#selected-file').insertAdjacentHTML('afterend', '<label id="stream-filename-editor" class="stream-filename-editor"><span>Original filename</span><small id="stream-filename-original" class="stream-filename-original"></small><span>Filename</span><input id="stream-filename" type="text" autocomplete="off" spellcheck="false"></label>');
+  const indicator = ensureMediaPathIndicator();
+  indicator.insertAdjacentHTML('afterend', '<button id="stream-filename-edit" class="filename-edit-toggle" type="button" aria-label="Edit filename" title="Edit filename" aria-pressed="false">e</button>');
+  $('#stream-filename-edit').insertAdjacentHTML('afterend', '<div id="stream-filename-editor" class="stream-filename-editor filename-edit-disabled"><label class="stream-filename-label" for="stream-filename">New filename</label><input id="stream-filename" type="text" autocomplete="off" spellcheck="false"></div>');
   editor = $('#stream-filename-editor');
   $('#stream-filename').addEventListener('input', updateQueuedChangeLabels);
+  $('#stream-filename-edit').addEventListener('click', toggleStreamFilenameEditing);
   return editor;
+}
+
+function toggleStreamFilenameEditing() {
+  streamFilenameEditEnabled = !streamFilenameEditEnabled;
+  const editor = $('#stream-filename-editor'), button = $('#stream-filename-edit'), input = $('#stream-filename');
+  editor.classList.toggle('filename-edit-disabled', !streamFilenameEditEnabled);
+  button.classList.toggle('active', streamFilenameEditEnabled);
+  button.setAttribute('aria-pressed', String(streamFilenameEditEnabled));
+  if (!streamFilenameEditEnabled) {
+    input.value = streamFilenameOriginal;
+  } else {
+    input.focus({preventScroll: true});
+    const dot = input.value.lastIndexOf('.');
+    input.setSelectionRange(0, dot > 0 ? dot : input.value.length);
+  }
+  updateQueuedChangeLabels();
 }
 
 function setStreamFilename(path) {
   ensureStreamFilenameEditor();
   streamFilenameOriginal = mediaBasename(path);
+  streamFilenameEditEnabled = false;
+  $('#stream-filename-editor').classList.add('filename-edit-disabled');
+  $('#stream-filename-edit').classList.remove('active');
+  $('#stream-filename-edit').setAttribute('aria-pressed', 'false');
   $('#stream-filename').value = movieImportMode?.editing ? (movieImportMode.filename || streamFilenameOriginal) : streamFilenameOriginal;
-  $('#stream-filename-original').textContent = streamFilenameOriginal;
 }
 
 function requestedStreamFilename() {
-  return $('#stream-filename')?.value.trim() || '';
+  return streamFilenameEditEnabled ? ($('#stream-filename')?.value.trim() || '') : streamFilenameOriginal;
 }
 
 function streamFilenameChanged() {
-  return Boolean(streamFilenameOriginal && requestedStreamFilename() && requestedStreamFilename() !== streamFilenameOriginal);
+  return Boolean(streamFilenameEditEnabled && streamFilenameOriginal && requestedStreamFilename() && requestedStreamFilename() !== streamFilenameOriginal);
 }
 
 function validateStreamFilename() {

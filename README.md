@@ -99,6 +99,8 @@ VideoStreamEdit is intended for trusted networks. It currently has no user authe
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) and [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
+For the optional standalone spoken-language checker, see [docs/AUDIO_LANGUAGE_AUDIT.md](docs/AUDIO_LANGUAGE_AUDIT.md).
+
 ## License
 
 No open-source license has been selected yet. All rights are reserved; choose and add an explicit license before accepting outside contributions or presenting the project as open source.

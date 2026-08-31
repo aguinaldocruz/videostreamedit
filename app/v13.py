@@ -19,8 +19,9 @@ def matroska_tracks(path: Path) -> dict[str, list[dict]]:
     try:
         result = subprocess.run(["mkvmerge", "-J", str(path)], capture_output=True, text=True, timeout=90, check=True)
         for track in json.loads(result.stdout).get("tracks", []):
-            if track.get("type") in found:
-                found[track["type"]].append(track.get("properties") or {})
+            track_type = "subtitle" if track.get("type") == "subtitles" else track.get("type")
+            if track_type in found:
+                found[track_type].append(track.get("properties") or {})
     except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired, json.JSONDecodeError):
         pass
     return found
@@ -60,7 +61,7 @@ def media_details_with_ietf(path: str) -> dict:
         language, legacy_region = split_tag(tags.get("language") or "")
         properties = mkv[codec_type][type_index] if type_index < len(mkv[codec_type]) else {}
         ietf_language, ietf_region = split_tag(properties.get("language_ietf") or "")
-        if language in {"", "und"} and ietf_language:
+        if ietf_language:
             language = ietf_language
         streams.append({
             "codec_type": codec_type, "type_index": type_index,

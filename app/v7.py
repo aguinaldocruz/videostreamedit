@@ -157,6 +157,25 @@ def reorder_edit(request: ReorderEditRequest) -> dict:
         for source_kind, identity, _ in ordered[codec_type]:
             command += ["-map", f"0:{short}:{identity}" if source_kind == "embedded" else f"{input_index[identity]}:0"]
     command += ["-map", "0:t?", "-map", "0:d?", "-map_metadata", "0", "-map_chapters", "0", "-c", "copy"]
+    # Preserve effective Matroska metadata for every manually mapped stream.
+    try:
+        from app.v13 import matroska_tracks
+        matroska = matroska_tracks(source)
+    except Exception:
+        matroska = {"audio": [], "subtitle": []}
+    for codec_type in ("audio", "subtitle"):
+        short = "a" if codec_type == "audio" else "s"
+        for output_index, (source_kind, identity, stream) in enumerate(ordered[codec_type]):
+            if source_kind != "embedded":
+                continue
+            properties = matroska[codec_type][identity] if identity < len(matroska[codec_type]) else {}
+            tags = (stream or {}).get("tags") or {}
+            language = properties.get("language_ietf") or properties.get("language") or tags.get("language") or ""
+            title = properties.get("track_name") if "track_name" in properties else tags.get("title")
+            if language:
+                command += [f"-metadata:s:{short}:{output_index}", f"language={language}"]
+            if title is not None:
+                command += [f"-metadata:s:{short}:{output_index}", f"title={str(title).strip()}"]
     new_index = {(kind, identity): index for codec_type in ordered for index, (kind, identity, _) in enumerate(ordered[codec_type])}
     for update in request.tracks:
         output_index = new_index.get(("embedded", update.type_index)) if update.codec_type in ordered else None
