@@ -27,6 +27,8 @@ def renamed_subtitle_path(source: Path, target: Path, subtitle: Path) -> Path:
 @app.post("/api/v37/media/rename")
 def rename_media(request: MediaRenameRequest) -> dict:
     source = plex_authorized_file(request.path)
+    with connection() as db:
+        catalog = db.execute("SELECT library_key,rating_key FROM plex_media WHERE path=?", (str(source),)).fetchone()
     filename = request.filename.strip()
     if not filename or filename != Path(filename).name or filename in {".", ".."}:
         raise HTTPException(400, "Filename cannot be empty or contain folders")
@@ -62,4 +64,12 @@ def rename_media(request: MediaRenameRequest) -> dict:
     logger.info("change=media_file_renamed from=%s to=%s", str(source).replace("\n", "\\n"), str(target).replace("\n", "\\n"))
     for old, new in subtitle_moves:
         logger.info("change=external_subtitle_renamed from=%s to=%s", str(old).replace("\n", "\\n"), str(new).replace("\n", "\\n"))
+    if catalog:
+        from app.v65 import enqueue
+        enqueue(
+            "plex_import_refresh",
+            {"path": str(target), "library_key": str(catalog["library_key"]), "rating_key": str(catalog["rating_key"])},
+            f"Discover renamed media {target.name}",
+            deduplicate=True,
+        )
     return {"renamed": True, "path": str(target), "external_subtitles": [str(new) for _, new in subtitle_moves]}

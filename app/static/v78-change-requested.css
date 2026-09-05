@@ -1,0 +1,3 @@
+.change-requested-badge{display:inline-flex;align-items:center;margin-left:.45rem;padding:.12rem .38rem;border-radius:999px;background:#a66b1730;border:1px solid #d79635;color:#f1bd68;font-size:.68rem;font-weight:700;white-space:nowrap}.change-requested-row{background:#a66b170b}.change-requested-notice{margin:.2rem 0 .45rem;padding:.5rem .7rem;border:1px solid #d79635;border-radius:.45rem;background:#a66b171c;color:#f1c77f}
+
+.change-requested-badge.running{border-color:#59c3b4;background:#256d6638;color:#8fe0d4}.change-requested-badge.failed{border-color:#d65d5d;background:#9b2f2f30;color:#ffaaaa}.dialog-title .change-requested-badge{margin-top:.3rem;width:max-content}.change-requested-notice[title]{cursor:help}

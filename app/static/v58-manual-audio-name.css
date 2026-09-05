@@ -1,0 +1,1 @@
+.manual-audio-name{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:7px;padding:7px;border:1px dashed color-mix(in srgb,var(--accent,#49a8ff) 45%,var(--border,#303943));border-radius:.45rem;background:color-mix(in srgb,var(--accent,#49a8ff) 5%,transparent)}.manual-audio-name input{min-width:0}.manual-audio-name button{padding:8px 12px}

@@ -17,7 +17,7 @@ async function inspectListedEpisodes(){
 }
 
 const bulkRenderEpisodes=renderEpisodes;
-renderEpisodes=function(){bulkRenderEpisodes();clearTimeout(bulkInspectionTimer);bulkInspectionTimer=setTimeout(inspectListedEpisodes,350)};
+renderEpisodes=function(){bulkRenderEpisodes()};
 
 function bulkField(name,label,value,list=''){return`<label class="bulk-field"><span>${label}</span><input type="text" name="${name}" value="${attr(value||'')}" ${list?`list="${list}"`:''}></label>`}
 async function openBulkAudioEditor(){
@@ -45,5 +45,8 @@ async function applyBulkAudio(event){
   }catch(error){$('#bulk-audio-progress').innerHTML=`<strong class="error">Stopped after ${completed} episodes</strong><small>${esc(error.message)}</small>`;toast(error.message,true)}finally{close.disabled=false;updateBulkApply()}
 }
 
-ensureBulkAudioUi();inspectListedEpisodes();
-document.addEventListener('media-properties-applied',event=>{if(listedEpisodePaths().includes(event.detail.path)){clearTimeout(bulkInspectionTimer);bulkInspectionTimer=setTimeout(inspectListedEpisodes,250)}});
+// The stream-value filter/editor supersedes the old automatic common-audio
+// inspection. Keep listedEpisodePaths() for clone workflows, but do not create
+// the legacy header control, dialog, timers, or network checks.
+$('#bulk-audio-button')?.remove();
+$('#bulk-audio-dialog')?.remove();

@@ -7,7 +7,7 @@ from collections import Counter
 from pathlib import Path
 
 from fastapi import HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 import app.v7 as v7_module
 import app.v13 as v13_module
@@ -26,11 +26,17 @@ class ImportConfigRequest(BaseModel):
     input_folder: str
 
 
+class ImportHtmlCleanup(BaseModel):
+    type_index: int | None = None
+    external_path: str | None = None
+
+
 class MovieImportRequest(BaseModel):
     source: str
     destination: str
     filename: str
     edit: ReorderEditRequest
+    html_cleanups: list[ImportHtmlCleanup] = Field(default_factory=list)
 
 
 class ImportCleanupRequest(BaseModel):
@@ -168,6 +174,45 @@ def target_subtitle_path(source: Path, target: Path, subtitle: Path) -> Path:
     return target.with_name(target.stem + suffix)
 
 
+def queue_post_import_refresh(source: Path, target: Path) -> None:
+    """Ask Plex to discover the copy before VideoStreamEdit indexes it."""
+    from app.v65 import enqueue
+
+    with connection() as db:
+        source_row = db.execute(
+            "SELECT library_key,rating_key FROM plex_media WHERE path=?",
+            (str(source),),
+        ).fetchone()
+        libraries = [dict(row) for row in db.execute(
+            "SELECT library_key,path FROM plex_media WHERE kind='movie'"
+        )]
+    library_key = str(source_row["library_key"]) if source_row else ""
+    rating_key = str(source_row["rating_key"]) if source_row else ""
+    if not library_key:
+        grouped: dict[str, list[str]] = {}
+        for row in libraries:
+            grouped.setdefault(str(row["library_key"]), []).append(row["path"])
+        candidates: list[tuple[int, str]] = []
+        for key, paths in grouped.items():
+            try:
+                root = Path(os.path.commonpath(paths)).resolve()
+            except (ValueError, OSError):
+                continue
+            if inside(target, root):
+                candidates.append((len(root.parts), key))
+        if candidates:
+            library_key = max(candidates)[1]
+    if not library_key:
+        logger.warning("plex_sync event=post_import_not_queued reason=library_not_found target=%s", str(target).replace("\n", "\\n"))
+        return
+    enqueue(
+        "plex_import_refresh",
+        {"path": str(target), "library_key": library_key, "rating_key": rating_key},
+        f"Discover and index {target.name}",
+        deduplicate=True,
+    )
+
+
 @app.post("/api/v28/import/movie")
 def import_movie(request: MovieImportRequest) -> dict:
     source = authorized_import_file(request.source)
@@ -192,6 +237,18 @@ def import_movie(request: MovieImportRequest) -> dict:
                 raise HTTPException(409, f"External subtitle already exists: {new.name}")
             shutil.copy2(old, new)
             copied_subtitles[str(old)] = str(new)
+        # Cleanup belongs to the imported copy. Doing it before the general edit
+        # also keeps subtitle type indexes aligned with the preview the user saw.
+        if request.html_cleanups:
+            from app.v51 import clean_embedded, clean_external_html
+            for cleanup in request.html_cleanups:
+                if cleanup.external_path:
+                    copied = copied_subtitles.get(cleanup.external_path)
+                    if not copied:
+                        raise HTTPException(404, "The selected external subtitle was not copied")
+                    clean_external_html(Path(copied))
+                elif cleanup.type_index is not None:
+                    clean_embedded(target, cleanup.type_index)
         payload = request.edit.model_dump()
         payload["path"] = str(target)
         for item in payload["external_subtitles"]:
@@ -210,7 +267,8 @@ def import_movie(request: MovieImportRequest) -> dict:
         for value in copied_subtitles.values():
             Path(value).unlink(missing_ok=True)
         raise
-    logger.info("change=movie_imported source=%s target=%s", str(source).replace("\n", "\\n"), str(target).replace("\n", "\\n"))
+    logger.info("change=movie_imported source=%s target=%s html_cleanups=%d", str(source).replace("\n", "\\n"), str(target).replace("\n", "\\n"), len(request.html_cleanups))
+    queue_post_import_refresh(source, target)
     return {"source": str(source), "target": str(target), "external_subtitles": list(copied_subtitles.values()), "warnings": result.get("warnings", [])}
 
 

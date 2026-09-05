@@ -1,0 +1,27 @@
+(function () {
+  const streamType=$('#movie-stream-type');
+  const filterBox=document.querySelector('.movie-stream-filters');
+  if(streamType&&filterBox){
+    filterBox.insertAdjacentHTML('beforeend',`<label class="subtitle-extended-filter hidden">Encoding<select id="movie-subtitle-encoding"><option value="">All encodings</option></select></label><label class="subtitle-extended-filter hidden">Subtitle content<select id="movie-subtitle-markup"><option value="">All content types</option></select></label>`);
+    const encoding=$('#movie-subtitle-encoding'),markup=$('#movie-subtitle-markup');
+    function options(select,values,label){const current=select.value;select.innerHTML=`<option value="">${esc(label)}</option>`+values.map(value=>`<option value="${attr(value)}">${esc(value)}</option>`).join('');if(values.includes(current))select.value=current}
+    async function loadExtendedFilters(){try{const values=await api('/api/v53/movies/stream-filter-values');options(encoding,values.subtitle_encodings||[],'All encodings');options(markup,values.subtitle_markup||[],'All content types')}catch(error){console.warn('Could not load extended subtitle filters',error)}}
+    function visibility(){const visible=streamType.value==='subtitle';document.querySelectorAll('.subtitle-extended-filter').forEach(label=>label.classList.toggle('hidden',!visible));if(!visible){encoding.value='';markup.value=''}}
+    streamType.addEventListener('change',()=>{visibility();loadExtendedFilters()});encoding.onchange=()=>streamType.onchange?.();markup.onchange=()=>streamType.onchange?.();visibility();loadExtendedFilters();
+    const baseApi=api;
+    api=async function(resource,options){let value=resource;if(typeof value==='string'&&value.startsWith('/api/v38/movies/stream-filter-matches')){const url=new URL(value,location.origin);url.pathname='/api/v51/movies/stream-filter-matches';if(streamType.value==='subtitle'){url.searchParams.set('subtitle_encoding',encoding.value);url.searchParams.set('subtitle_markup',markup.value)}value=url.pathname+url.search}else if(value==='/api/v39/movies/stream-filter-values')value='/api/v53/movies/stream-filter-values';else if(value==='/api/v39/setup/movie-index/rebuild')value='/api/v52/setup/movie-index/rebuild';else if(value==='/api/v39/movies/stream-filter-refresh')value='/api/v52/movies/stream-filter-refresh';return baseApi(value,options)};
+  }
+
+  let indexedProperties=[];
+  function propertyFor(row){return indexedProperties.find(item=>item.source===(row.dataset.external==='true'?'external':'embedded')&&(item.source==='external'?item.external_path===row.dataset.path:item.type_index===Number(row.dataset.typeIndex)))}
+  function installPropertyIcons(){document.querySelectorAll('#stream-content .stream-row[data-codec-type="subtitle"]').forEach(row=>{const item=propertyFor(row),kind=row.querySelector('.stream-kind');if(!item||!kind||kind.querySelector('.subtitle-property-info'))return;const icon=document.createElement('span');icon.className='subtitle-property-info';icon.tabIndex=0;icon.textContent='◦';icon.title=`Codec: ${item.codec}\nEncoding: ${item.encoding}\nContent: ${item.markup}`;kind.querySelector('strong')?.append(icon)})}
+  const propertiesOpenEditor=openEditor;
+  openEditor=async function(...args){const result=await propertiesOpenEditor(...args);indexedProperties=[];try{const data=await api(`/api/v51/subtitle-properties?path=${encodeURIComponent(state.selectedPath)}`);indexedProperties=data.properties;installPropertyIcons()}catch(error){console.warn('Could not load indexed subtitle properties',error)}return result};
+
+  const previewDialog=$("#stream-preview-dialog"),previewContent=$("#stream-preview-content");
+  if(!previewDialog)return;
+  previewContent.insertAdjacentHTML("afterend",`<section id="subtitle-maintenance" class="subtitle-maintenance hidden"><h3>Subtitle text maintenance</h3><p>HTML tags were detected in this subtitle.</p><button type="button" id="subtitle-cleanup-apply" class="primary">Remove HTML tags</button><small id="subtitle-cleanup-note"></small></section>`);
+  const maintenance=$("#subtitle-maintenance"),apply=$("#subtitle-cleanup-apply"),note=$("#subtitle-cleanup-note");let selectedRow=null;
+  document.addEventListener("click",event=>{const trigger=event.target.closest("[data-preview-stream]");if(!trigger)return;selectedRow=trigger.closest(".stream-row");const item=selectedRow&&propertyFor(selectedRow),hasHtml=selectedRow?.dataset.codecType==="subtitle"&&String(item?.markup||"").includes("HTML tags");maintenance.classList.toggle("hidden",!hasHtml);if(hasHtml)note.textContent=selectedRow.dataset.external==="true"?"The external subtitle file will be updated.":"The embedded subtitle will be replaced with cleaned text; this requires one remux."},true);
+  apply.onclick=async()=>{if(!selectedRow)return;if(queuedChangeCount()>0){toast("Apply or undo pending stream-property changes first",true);return}if(!confirm("Remove all HTML tags from this subtitle now?"))return;const external=selectedRow.dataset.external==="true",body={path:state.selectedPath,type_index:external?null:Number(selectedRow.dataset.typeIndex),external_path:external?selectedRow.dataset.path:null};try{const result=await api("/api/v51/subtitle-cleanup",{method:"POST",body:JSON.stringify(body)});toast("Subtitle HTML tags removed");previewDialog.close();await openEditor(result.path,$("#selected-file").textContent);document.dispatchEvent(new CustomEvent("media-properties-applied",{detail:{path:result.path}}))}catch(error){toast(error.message,true)}};
+})();

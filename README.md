@@ -101,6 +101,8 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) and [docs/ARCHITECTURE.md](docs/ARCHITECT
 
 For the optional standalone spoken-language checker, see [docs/AUDIO_LANGUAGE_AUDIT.md](docs/AUDIO_LANGUAGE_AUDIT.md).
 
+For the standalone damaged-text subtitle scanner, see [docs/SUBTITLE_CORRUPTION_AUDIT.md](docs/SUBTITLE_CORRUPTION_AUDIT.md).
+
 ## License
 
 No open-source license has been selected yet. All rights are reserved; choose and add an explicit license before accepting outside contributions or presenting the project as open source.

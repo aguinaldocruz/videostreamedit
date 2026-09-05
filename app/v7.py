@@ -104,6 +104,46 @@ def key_for(item: OrderItem) -> str:
     return f"embedded:{item.codec_type}:{item.type_index}" if item.source == "embedded" else f"external:{item.path}"
 
 
+def persist_remux_language_tags(
+    media: Path,
+    request: ReorderEditRequest,
+    ordered: dict[str, list[tuple[str, int | str, dict | None]]],
+    external_by_path: dict[str, tuple[ExternalSubtitleChange, Path]],
+) -> None:
+    """Write exact BCP-47 tags after FFmpeg remuxes a Matroska file."""
+    if media.suffix.lower() not in {".mkv", ".mka", ".mks", ".mk3d"}:
+        return
+    requested = {(item.codec_type, item.type_index): item for item in request.tracks}
+    command = ["mkvpropedit", str(media)]
+    edits = 0
+    for codec_type in ("audio", "subtitle"):
+        short = "a" if codec_type == "audio" else "s"
+        for output_index, (source_kind, identity, _) in enumerate(ordered[codec_type]):
+            language = region = None
+            if source_kind == "embedded":
+                update = requested.get((codec_type, identity))
+                if update is not None and (update.language is not None or update.region is not None):
+                    language, region = update.language, update.region
+            elif codec_type == "subtitle":
+                external = external_by_path[str(identity)][0]
+                language, region = external.language, external.region
+            if language is None and region is None:
+                continue
+            ietf = make_language(language, region)
+            command += ["--edit", f"track:{short}{output_index + 1}"]
+            command += ["--set", f"language={language.strip() if language else 'und'}"]
+            command += (["--set", f"language-ietf={ietf}"] if ietf else ["--delete", "language-ietf"])
+            edits += 1
+    if not edits:
+        return
+    try:
+        subprocess.run(command, capture_output=True, text=True, timeout=600, check=True)
+    except FileNotFoundError as exc:
+        raise HTTPException(503, "mkvpropedit is not installed") from exc
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        raise HTTPException(422, (getattr(exc, "stderr", None) or "Matroska language metadata edit failed")[-2000:]) from exc
+
+
 @app.post("/api/v7/media/edit")
 def reorder_edit(request: ReorderEditRequest) -> dict:
     source = authorized_file(request.path)
@@ -204,9 +244,13 @@ def reorder_edit(request: ReorderEditRequest) -> dict:
     command.append(str(temporary))
     try:
         subprocess.run(command, capture_output=True, text=True, timeout=3600, check=True)
+        persist_remux_language_tags(temporary, request, ordered, external_by_path)
         os.chmod(temporary, original.st_mode)
         os.utime(temporary, ns=(original.st_atime_ns, original.st_mtime_ns))
         os.replace(temporary, source)
+    except HTTPException:
+        temporary.unlink(missing_ok=True)
+        raise
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
         temporary.unlink(missing_ok=True)
         raise HTTPException(422, (getattr(exc, "stderr", None) or "Media edit failed")[-2000:]) from exc

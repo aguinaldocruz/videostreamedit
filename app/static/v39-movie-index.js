@@ -43,9 +43,12 @@
     const query = search.value;
     return state.movies.filter(file => {
       if (!matches([movieTitle(file), ...(file.alternative_titles || [])].join(' '), query)) return false;
-      return allowedPaths === null || allowedPaths.has(file.path);
+      const headerPaths = window.movieHeaderAllowedPaths;
+      return (allowedPaths === null || allowedPaths.has(file.path)) &&
+        (!(headerPaths instanceof Set) || headerPaths.has(file.path));
     });
   }
+  window.currentFilteredMovies = filteredMovies;
 
   renderMovies = function () {
     const files = filteredMovies();
@@ -102,6 +105,7 @@
   }
 
   async function loadIndexStatus() {
+    if (document.querySelector("#setup").classList.contains("hidden")) return;
     if (indexTimer) { clearTimeout(indexTimer); indexTimer = null; }
     try { showIndexStatus(await api('/api/v39/setup/movie-index/status')); }
     catch (error) { $('#movie-index-progress').textContent = error.message; }
@@ -122,7 +126,7 @@
 
   document.addEventListener('media-properties-applied', async event => {
     try {
-      const result = await api('/api/v39/movies/stream-filter-refresh', {method: 'POST', body: JSON.stringify({path: event.detail.path})});
+      const result = await api('/api/v39/movies/stream-filter-refresh', {method: 'POST', body: JSON.stringify({path: event.detail.path,indexes:event.detail.indexes})});
       if (result.indexed) { await loadSavedFilterValues(); await applyStreamFilters(); }
     } catch (error) { console.warn('Could not refresh the edited movie in the stream filter index', error); }
   });

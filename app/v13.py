@@ -60,13 +60,20 @@ def media_details_with_ietf(path: str) -> dict:
         tags = stream.get("tags") or {}
         language, legacy_region = split_tag(tags.get("language") or "")
         properties = mkv[codec_type][type_index] if type_index < len(mkv[codec_type]) else {}
+        if not language:
+            language, legacy_region = split_tag(properties.get("language") or "")
         ietf_language, ietf_region = split_tag(properties.get("language_ietf") or "")
+        # FFmpeg's Matroska muxer can store a BCP-47 region as
+        # tag_language_variant instead of LanguageIETF. Treat it as the
+        # region of the legacy language so older remuxes do not repeatedly
+        # offer the same automatic region correction.
+        variant_region = str(properties.get("tag_language_variant") or "").strip().upper()
         if ietf_language:
             language = ietf_language
         streams.append({
             "codec_type": codec_type, "type_index": type_index,
             "codec": stream.get("codec_name") or "unknown",
-            "language": language, "region": ietf_region or legacy_region,
+            "language": language, "region": ietf_region or variant_region or legacy_region,
             "title": tags.get("title") or properties.get("track_name") or "",
             "default": bool((stream.get("disposition") or {}).get("default")),
             "forced": bool((stream.get("disposition") or {}).get("forced")),

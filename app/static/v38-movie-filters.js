@@ -91,7 +91,7 @@
   search.oninput = renderMovies;
   document.addEventListener('media-properties-applied', async event => {
     try {
-      await api('/api/v38/movies/stream-filter-invalidate', {method: 'POST', body: JSON.stringify({path: event.detail.path})});
+      await api('/api/v38/movies/stream-filter-invalidate', {method: 'POST', body: JSON.stringify({path: event.detail.path,indexes:event.detail.indexes})});
       await loadValues();
     } catch (error) { console.warn('Could not refresh movie stream filter cache', error); }
   });

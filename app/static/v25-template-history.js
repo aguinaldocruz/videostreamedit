@@ -61,6 +61,11 @@ updateCloneButton = function () {
 document.addEventListener('media-properties-applied', event => {
   const template = readLastChange();
   if (!template) return;
+  if (window.templateSavePromptsEnabled === false) {
+    updateCloneButton();
+    scheduleBulkCloneInspection();
+    return;
+  }
   const summary = templateSummary(template);
   const saveTemplate = window.confirm(`Save this change template to history?
 

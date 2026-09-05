@@ -2,7 +2,12 @@
   const dismissed = new Set();
 
   function suggestionKey(item) {
-    return `${item.stream_type}\n${item.old_value}\n${item.new_value}`;
+    return `${item.stream_type}\n${item.track_language || ""}\n${item.old_value}\n${item.new_value}`;
+  }
+
+  function rowTrackLanguage(row) {
+    const value = row.querySelector("[name=language]").value.trim().toLowerCase().replace("_", "-").split("-", 1)[0];
+    return ({por: "pt", eng: "en"})[value] || value;
   }
 
   function renderTrackNameSuggestions(items) {
@@ -15,7 +20,7 @@
     }).join('');
     const panel = document.createElement('div');
     panel.className = 'track-name-suggestion';
-    panel.innerHTML = `<div><strong>Common track-name correction available</strong><p>This only fills matching fields. Review them and use Apply changes when ready.</p><ul>${descriptions}</ul></div><div><button type="button" data-dismiss-suggestion>Not now</button><button type="button" class="primary" data-use-suggestion>Use suggestions</button></div>`;
+    panel.innerHTML = `<div><strong>Common track-name correction available</strong><p>This only fills matching fields. Review them and use Apply changes when ready.</p><ul>${descriptions}</ul></div><div><button type="button" data-dismiss-suggestion>Not now</button><button type="button" class="primary" data-use-suggestion title="Use suggestions (F10)">Use suggestions · F10</button></div>`;
     $('#stream-content').prepend(panel);
     panel.querySelector('[data-dismiss-suggestion]').onclick = () => {
       suggestions.forEach(item => dismissed.add(suggestionKey(item)));
@@ -27,7 +32,7 @@
       const active = document.activeElement;
       document.querySelectorAll('#stream-content .stream-row').forEach(row => {
         const input = row.querySelector('[name=title]');
-        const suggestion = suggestions.find(item => item.stream_type === row.dataset.codecType && item.old_value === input.value.trim());
+        const suggestion = suggestions.find(item => item.stream_type === row.dataset.codecType && item.track_language === rowTrackLanguage(row) && item.old_value === input.value.trim());
         if (!suggestion || row.querySelector('[name=remove]')?.checked) return;
         input.value = suggestion.new_value;
         input.dataset.dirty = 'true';
@@ -44,11 +49,12 @@
   }
 
   async function loadTrackNameSuggestions() {
+    if (window.trackNameCorrectionPromptsEnabled === false) return;
     const rows = [...document.querySelectorAll('#stream-content .stream-row')];
     if (!rows.length) return;
-    const values = rows.map(row => ({stream_type: row.dataset.codecType, value: row.querySelector('[name=title]').value.trim()}));
+    const values = rows.map(row => ({stream_type: row.dataset.codecType, language: rowTrackLanguage(row), value: row.querySelector("[name=title]").value.trim()}));
     try {
-      const result = await api('/api/v40/track-name-suggestions', {method: 'POST', body: JSON.stringify({values})});
+      const result = await api('/api/v59/track-name-suggestions', {method: 'POST', body: JSON.stringify({values})});
       renderTrackNameSuggestions(result.suggestions);
       closeSavedValueMenu();
       $('#stream-dialog')?.focus({preventScroll: true});

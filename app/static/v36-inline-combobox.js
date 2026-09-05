@@ -84,14 +84,14 @@ showSavedValueMenu = function (input, filter = false) {
     option.onclick = () => chooseSavedComboboxValue(input, value);
     menu.append(option);
   });
-  $('#stream-dialog').append(menu);
+  (input.closest('dialog') || document.body).append(menu);
   openSavedValueMenu = menu;
   savedComboboxInput = input;
   positionSavedCombobox(menu, input);
 };
 
 installSavedValuePopups = function (root = document) {
-  root.querySelectorAll('.stream-row input[type="text"][name]').forEach(input => {
+  root.querySelectorAll('.stream-row input[type="text"][name],input.season-bulk-value[data-saved-field],input.movie-header-bulk-value[data-saved-field]').forEach(input => {
     if (input.dataset.inlineComboboxReady === 'true') return;
     if (!(v8Saved[input.dataset.savedField || input.name] || []).length) return;
     input.dataset.inlineComboboxReady = 'true';

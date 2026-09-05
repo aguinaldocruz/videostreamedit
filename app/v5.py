@@ -15,6 +15,26 @@ from app.v2 import TYPE_SPECIFIER, app, authorized_file, make_language, probe
 
 STATIC_DIR = Path(__file__).parent / "static"
 SUBTITLE_EXTENSIONS = {".srt", ".ass", ".ssa", ".vtt", ".sub"}
+LANGUAGE_ALIASES = {
+    "pt": "pt", "por": "por", "pob": "pt", "en": "en", "eng": "eng",
+    "es": "es", "spa": "spa", "fr": "fr", "fra": "fra", "fre": "fre",
+    "de": "de", "deu": "deu", "ger": "ger", "it": "it", "ita": "ita",
+    "ja": "ja", "jpn": "jpn", "ko": "ko", "kor": "kor", "zh": "zh",
+    "zho": "zho", "chi": "chi", "ru": "ru", "rus": "rus", "ar": "ar",
+    "ara": "ara", "nl": "nl", "nld": "nld", "dut": "dut", "pl": "pl",
+    "pol": "pol", "tr": "tr", "tur": "tur", "sv": "sv", "swe": "swe",
+    "no": "no", "nor": "nor", "da": "da", "dan": "dan", "fi": "fi",
+    "fin": "fin", "el": "el", "ell": "ell", "gre": "gre", "he": "he",
+    "heb": "heb", "hi": "hi", "hin": "hin",
+}
+REGION_CODES = {"BR", "PT", "US", "GB", "CA", "AU", "NZ", "MX", "ES", "FR", "DE", "IT", "JP", "KR", "CN", "TW", "HK", "RU", "IN"}
+SUBTITLE_FILENAME_MARKERS = {
+    "forced": "Forced", "force": "Forced", "foreign": "Forced",
+    "default": "Default", "sdh": "SDH", "cc": "CC",
+    "hearingimpaired": "Hearing impaired", "hearing-impaired": "Hearing impaired",
+    "signs": "Signs", "sign": "Signs", "songs": "Songs",
+    "commentary": "Commentary", "comment": "Commentary",
+}
 
 
 class TrackChange(BaseModel):
@@ -62,6 +82,28 @@ def split_tag(value: str) -> tuple[str, str]:
     return (match.group(1).lower(), (match.group(2) or "").upper()) if match else (value.strip(), "")
 
 
+def external_filename_metadata(suffix: str) -> tuple[str, str, list[str]]:
+    chunks = [value for value in re.split(r"[. _]+", suffix) if value]
+    language = region = ""
+    labels: list[str] = []
+    for index, chunk in enumerate(chunks):
+        lowered = chunk.casefold()
+        combined = re.fullmatch(r"([a-z]{2,3})-([a-z]{2}|\d{3})", lowered)
+        candidate = combined.group(1) if combined else lowered
+        hearing_impaired = chunk == "HI"
+        if not language and not hearing_impaired and candidate in LANGUAGE_ALIASES:
+            language = LANGUAGE_ALIASES[candidate]
+            if combined:
+                region = combined.group(2).upper()
+            elif index + 1 < len(chunks) and chunks[index + 1].upper() in REGION_CODES:
+                region = chunks[index + 1].upper()
+            labels.append(f"{language}-{region}" if region else language)
+        marker = "Hearing impaired" if hearing_impaired else SUBTITLE_FILENAME_MARKERS.get(lowered.replace("_", ""))
+        if marker and marker not in labels:
+            labels.append(marker)
+    return language, region, labels
+
+
 def external_subtitles(media: Path) -> list[dict]:
     found = []
     prefix = media.stem.casefold()
@@ -72,17 +114,9 @@ def external_subtitles(media: Path) -> list[dict]:
         if candidate_stem.casefold() != prefix and not candidate_stem.casefold().startswith(prefix + "."):
             continue
         suffix = candidate_stem[len(media.stem):].lstrip(".")
-        tokens = [token for token in re.split(r"[._ -]+", suffix) if token]
-        forced = any(token.casefold() == "forced" for token in tokens)
-        language, region = "", ""
-        for token in tokens:
-            if token.casefold() == "forced":
-                continue
-            parsed_language, parsed_region = split_tag(token)
-            if re.match(r"^[a-z]{2,3}$", parsed_language):
-                language, region = parsed_language, parsed_region
-                break
-        found.append({"path": str(candidate.resolve()), "name": candidate.name, "codec_type": "subtitle", "codec": candidate.suffix.lower().lstrip("."), "language": language, "region": region, "title": "", "forced": forced, "external": True})
+        language, region, filename_tags = external_filename_metadata(suffix)
+        forced = "Forced" in filename_tags
+        found.append({"path": str(candidate.resolve()), "name": candidate.name, "codec_type": "subtitle", "codec": candidate.suffix.lower().lstrip("."), "language": language, "region": region, "title": "", "forced": forced, "external": True, "filename_tags": filename_tags})
     return found
 
 

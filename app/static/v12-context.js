@@ -21,7 +21,7 @@ wireEditors=function(){
   document.querySelectorAll('.edit-file').forEach(button=>button.onclick=()=>{
     const isEpisode=Boolean(button.closest('#episode-list')),container=isEpisode?'#episode-list':'#movie-list';
     mediaNavigationKind=isEpisode?'episode':'movie';currentShowContext=isEpisode?clean(state.currentShow?.name||''):'';
-    mediaNavigation=[...document.querySelectorAll(`${container} .edit-file`)].map(item=>({path:item.dataset.path,label:item.dataset.label,showTitle:currentShowContext}));
+    mediaNavigation=[...document.querySelectorAll(`${container} .edit-file`)].filter(item=>{const row=item.closest("tr");return !row?.classList.contains("season-stream-filtered-out")&&!row?.classList.contains("movie-header-stream-filtered-out")}).map(item=>({path:item.dataset.path,label:item.dataset.label,showTitle:currentShowContext}));
     mediaNavigationIndex=mediaNavigation.findIndex(item=>item.path===button.dataset.path);openEditor(button.dataset.path,button.dataset.label);
   });
 };

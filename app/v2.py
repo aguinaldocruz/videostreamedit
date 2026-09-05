@@ -48,14 +48,17 @@ class EditRequest(BaseModel):
 
 
 def connection() -> sqlite3.Connection:
-    db = sqlite3.connect(DB_PATH)
+    db = sqlite3.connect(DB_PATH, timeout=30)
     db.row_factory = sqlite3.Row
+    db.execute("PRAGMA busy_timeout=30000")
     return db
 
 
 def initialize() -> None:
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     with connection() as db:
+        db.execute("PRAGMA journal_mode=WAL")
+        db.execute("PRAGMA synchronous=NORMAL")
         db.execute("""
             CREATE TABLE IF NOT EXISTS library_roots (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
