@@ -16,6 +16,19 @@ from app.v40 import app, record_track_name_corrections
 logger = logging.getLogger("videostreamedit")
 _remux_edit = media_editor.reorder_edit
 MATROSKA_EXTENSIONS = {".mkv", ".mka", ".mks", ".mk3d"}
+LEGACY_LANGUAGE_CODES = {
+    "pt": "por", "en": "eng", "es": "spa", "fr": "fra", "de": "deu",
+    "it": "ita", "nl": "nld", "pl": "pol", "ru": "rus", "ja": "jpn",
+    "ko": "kor", "zh": "zho", "ar": "ara", "he": "heb", "hi": "hin",
+    "tr": "tur", "sv": "swe", "da": "dan", "no": "nor", "fi": "fin",
+    "el": "ell", "cs": "ces", "hu": "hun", "ro": "ron", "uk": "ukr",
+    "und": "und",
+}
+
+
+def legacy_language_code(value: str | None) -> str:
+    code = str(value or "").strip().lower()
+    return LEGACY_LANGUAGE_CODES.get(code, code)
 
 
 def typed_streams(data: dict) -> dict[str, list[dict]]:
@@ -73,7 +86,7 @@ def matroska_metadata_command(source: Path, request: media_editor.ReorderEditReq
         properties: list[str] = []
         if update.language is not None or update.region is not None:
             ietf = make_language(update.language, update.region)
-            properties += ["--set", f"language={update.language.strip() if update.language else 'und'}"]
+            properties += ["--set", f"language={legacy_language_code(update.language)}"]
             properties += (["--set", f"language-ietf={ietf}"] if ietf else ["--delete", "language-ietf"])
         if update.title is not None:
             properties += ["--set", f"name={update.title.strip()}"]
@@ -85,13 +98,20 @@ def matroska_metadata_command(source: Path, request: media_editor.ReorderEditReq
         for index, stream in enumerate(streams):
             identifier = f"embedded:{stream_type}:{index}"
             current = stream.get("disposition") or {}
-            wanted_default = identifier == desired_tag(request, stream_type, "default")
-            wanted_forced = identifier == desired_tag(request, stream_type, "forced")
+            desired_default = desired_tag(request, stream_type, "default")
+            desired_forced = desired_tag(request, stream_type, "forced")
+            # Bulk operations can target one stream type. Preserve each
+            # unrelated flag independently; otherwise a subtitle operation
+            # would clear the existing audio default (or vice versa).
             properties = []
-            if bool(current.get("default")) != wanted_default:
-                properties += ["--set", f"flag-default={int(wanted_default)}"]
-            if bool(current.get("forced")) != wanted_forced:
-                properties += ["--set", f"flag-forced={int(wanted_forced)}"]
+            if desired_default != "__preserve__":
+                wanted_default = identifier == desired_default
+                if bool(current.get("default")) != wanted_default:
+                    properties += ["--set", f"flag-default={int(wanted_default)}"]
+            if desired_forced != "__preserve__":
+                wanted_forced = identifier == desired_forced
+                if bool(current.get("forced")) != wanted_forced:
+                    properties += ["--set", f"flag-forced={int(wanted_forced)}"]
             if properties:
                 command += ["--edit", f"track:{short}{index + 1}", *properties]
                 edits += 1

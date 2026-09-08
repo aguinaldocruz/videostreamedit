@@ -212,10 +212,12 @@ def process_plex_sync(task_id: int, payload: dict) -> dict:
             if changed_records:
                 from app.v80 import request_media_indexes
                 for record in changed_records:
-                    request_media_indexes(str(record[0]), ["core", "subtitles", "previews"], "Plex catalog media added or changed")
+                    request_media_indexes(str(record[0]), ["core"], "Plex catalog media added or changed")
             changed += len(changed_records)
             catalog_records += len(records)
             logger.info("plex_sync event=library_processed mode=%s library=%s items=%d media=%d file_changes=%d step=%d total=%d", "rebuild" if rebuild else "incremental", library["title"].replace("\n", "\\n"), len(items), len(records), len(changed_records), number, len(libraries))
+        from app.v80 import prune_orphaned_index_entries
+        prune_orphaned_index_entries()
         with plex.connection() as db:
             db.execute("UPDATE plex_config SET last_sync=datetime('now') WHERE id=1")
             total = db.execute("SELECT count(*) FROM plex_media").fetchone()[0]

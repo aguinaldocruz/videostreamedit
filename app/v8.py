@@ -65,8 +65,8 @@ async def v8_assets(request: Request, call_next):
 
 
 @app.get("/api/v8/saved-values")
-def saved_values() -> dict[str, list[str]]:
-    result = {"language": [], "region": [], "title_audio": [], "title_subtitle": []}
+def saved_values() -> dict:
+    result = {"language": [], "region": [], "title_audio": [], "title_subtitle": [], "language_region_usage": {}}
     with connection() as db:
         rows = db.execute(
             """SELECT field, value
@@ -74,8 +74,15 @@ def saved_values() -> dict[str, list[str]]:
                WHERE saved = 1
                ORDER BY field, use_count DESC, value COLLATE NOCASE"""
         ).fetchall()
+        usage_table = db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='language_region_selection_usage'"
+        ).fetchone()
+        usage_rows = db.execute(
+            "SELECT value, use_count FROM language_region_selection_usage"
+        ).fetchall() if usage_table else []
     for row in rows:
         result[row["field"]].append(row["value"])
+    result["language_region_usage"] = {row["value"]: row["use_count"] for row in usage_rows}
     return result
 
 

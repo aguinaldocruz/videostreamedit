@@ -10,6 +10,7 @@ from typing import Any, Literal
 
 from fastapi import HTTPException
 from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field
 
 import app.v54 as indexes
 from app.v7 import ReorderEditRequest
@@ -32,6 +33,10 @@ class QueueRequest(BaseModel):
 
 class QueueAction(BaseModel):
     action: Literal["pause", "resume"]
+
+
+class QueueStatusRequest(BaseModel):
+    task_ids: list[int] = Field(min_length=1, max_length=30000)
 
 
 def utc_now() -> str:
@@ -250,6 +255,20 @@ def list_queue(limit: int = 200) -> dict:
         item.pop("result_json", None)
         items.append(item)
     return {"paused": queue_paused(), "counts": counts, "items": items}
+
+
+@app.post("/api/v65/queue/status")
+def queue_status(request: QueueStatusRequest) -> dict:
+    items = []
+    with connection() as db:
+        for start in range(0, len(request.task_ids), 800):
+            group = request.task_ids[start:start + 800]
+            rows = db.execute(
+                f"SELECT id,label,status,progress_current,progress_total,progress_message,error FROM task_queue WHERE id IN ({','.join('?' for _ in group)})",
+                group,
+            ).fetchall()
+            items.extend(dict(row) for row in rows)
+    return {"items": items}
 
 
 @app.put("/api/v65/queue/control")

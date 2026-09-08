@@ -9,7 +9,7 @@ from fastapi import Query
 from pydantic import BaseModel
 
 from app.v2 import probe
-from app.v5 import external_subtitles, split_tag
+from app.v5 import canonical_language, external_subtitles, split_tag
 from app.v11 import connection
 from app.v37 import app
 
@@ -40,6 +40,11 @@ def initialize_movie_stream_filter_index() -> None:
             CREATE INDEX IF NOT EXISTS movie_stream_value_filter
                 ON movie_stream_index_value(stream_type, language, track_name);
         """)
+        rows = db.execute("SELECT DISTINCT language FROM movie_stream_index_value WHERE language != ''").fetchall()
+        for row in rows:
+            canonical = canonical_language(row["language"])
+            if canonical != row["language"]:
+                db.execute("UPDATE movie_stream_index_value SET language=? WHERE language=?", (canonical, row["language"]))
 
 
 def _pending_movies() -> list[dict]:
@@ -65,9 +70,9 @@ def _inspect_movie(path: Path) -> list[tuple[str, str, str]]:
             continue
         tags = stream.get("tags") or {}
         language, _ = split_tag(str(tags.get("language") or ""))
-        values.append((stream_type, language.strip(), str(tags.get("title") or "").strip()))
+        values.append((stream_type, canonical_language(language), str(tags.get("title") or "").strip()))
     for stream in external_subtitles(path):
-        values.append(("subtitle", str(stream.get("language") or "").strip(), str(stream.get("title") or "").strip()))
+        values.append(("subtitle", canonical_language(stream.get("language") or ""), str(stream.get("title") or "").strip()))
     return values
 
 

@@ -39,7 +39,7 @@ def ensure_unified_index() -> None:
             CREATE INDEX IF NOT EXISTS media_stream_index_path ON media_stream_index(path);
             CREATE TABLE IF NOT EXISTS media_stream_index_state (
                 path TEXT PRIMARY KEY, modified_ns INTEGER NOT NULL, size INTEGER NOT NULL,
-                schema_version INTEGER NOT NULL DEFAULT 1, indexed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                schema_version INTEGER NOT NULL DEFAULT 2, indexed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
             CREATE TABLE IF NOT EXISTS performance_metric (
                 name TEXT PRIMARY KEY, count INTEGER NOT NULL DEFAULT 0,
@@ -54,6 +54,7 @@ def fast_streams(path: Path) -> list[dict]:
         try:
             result = subprocess.run(["mkvmerge", "-J", str(path)], capture_output=True, text=True, timeout=90, check=True)
             counters = {"audio": 0, "subtitle": 0}
+            detailed_streams = None
             for track in json.loads(result.stdout).get("tracks", []):
                 kind = "subtitle" if track.get("type") == "subtitles" else track.get("type")
                 if kind not in counters:
@@ -61,12 +62,26 @@ def fast_streams(path: Path) -> list[dict]:
                 properties = track.get("properties") or {}
                 language, region = split_tag(str(properties.get("language_ietf") or properties.get("language") or ""))
                 if language == "por":
-                    language, region = "pt", region or "BR"
-                elif language == "pt":
-                    region = region or "BR"
+                    language = "pt"
                 elif language == "eng":
                     language = "en"
-                streams.append({"source": "embedded", "stream_type": kind, "type_index": counters[kind], "external_path": "", "codec": str(track.get("codec") or properties.get("codec_id") or "unknown"), "language": language, "region": region, "track_name": str(properties.get("track_name") or ""), "default": bool(properties.get("default_track")), "forced": bool(properties.get("forced_track")), "filename_tags": []})
+                type_index = counters[kind]
+                language = tv_bulk.comparable_language(language)
+                # mkvmerge may expose only the legacy ISO-639 code (for example
+                # ``por``), while the editor also reads the BCP-47 region from
+                # FFmpeg tags.  Reconcile Portuguese tracks lazily so filters
+                # and the editor always use the same language/region pair.
+                if language == "pt" and not region:
+                    try:
+                        if detailed_streams is None:
+                            detailed_streams = media_details_with_ietf(str(path)).get("streams", [])
+                        match = next((item for item in detailed_streams if item.get("codec_type") == kind and int(item.get("type_index", -1)) == type_index), None)
+                        if match:
+                            language = tv_bulk.comparable_language(match.get("language") or language)
+                            region = str(match.get("region") or "").strip().upper()
+                    except Exception:
+                        pass
+                streams.append({"source": "embedded", "stream_type": kind, "type_index": type_index, "external_path": "", "codec": str(track.get("codec") or properties.get("codec_id") or "unknown"), "language": language, "region": region, "track_name": str(properties.get("track_name") or ""), "default": bool(properties.get("default_track")), "forced": bool(properties.get("forced_track")), "filename_tags": []})
                 counters[kind] += 1
         except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
             streams = []
@@ -87,7 +102,7 @@ def unified_core_index(item: dict) -> None:
         kind = db.execute("SELECT kind FROM plex_media WHERE path=?", (str(path),)).fetchone()
         db.execute("DELETE FROM media_stream_index WHERE path=?", (str(path),))
         db.executemany("INSERT INTO media_stream_index(path,source,stream_type,type_index,external_path,codec,language,region,track_name,is_default,is_forced,filename_tags) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", [(str(path), value["source"], value["stream_type"], value["type_index"], value["external_path"], value["codec"], value["language"], value["region"], value["track_name"], int(value["default"]), int(value["forced"]), json.dumps(value["filename_tags"], ensure_ascii=False)) for value in values])
-        db.execute("INSERT OR REPLACE INTO media_stream_index_state(path,modified_ns,size,schema_version,indexed_at) VALUES(?,?,?,1,CURRENT_TIMESTAMP)", (str(path), stat.st_mtime_ns, stat.st_size))
+        db.execute("INSERT OR REPLACE INTO media_stream_index_state(path,modified_ns,size,schema_version,indexed_at) VALUES(?,?,?,2,CURRENT_TIMESTAMP)", (str(path), stat.st_mtime_ns, stat.st_size))
         if kind and kind["kind"] == "movie":
             db.execute("DELETE FROM movie_stream_index_value WHERE path=?", (str(path),))
             db.executemany("INSERT INTO movie_stream_index_value(path,stream_type,language,track_name) VALUES(?,?,?,?)", [(str(path), "subtitle" if value["stream_type"] == "external" else value["stream_type"], value["language"], value["track_name"]) for value in values])
@@ -115,6 +130,35 @@ def initialize_unified_stream_index() -> None:
                 SELECT 'core',path,'Unified stream index migration','pending',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP FROM plex_media""")
             db.execute("INSERT INTO feature_migrations(name) VALUES('unified_stream_index_v1')")
             logger.info("core_index event=unified_migration_queued")
+        migrated_parser = db.execute("SELECT 1 FROM feature_migrations WHERE name='unified_stream_index_parser_v2'").fetchone()
+        if not migrated_parser:
+            db.execute("DELETE FROM media_stream_index")
+            db.execute("DELETE FROM media_stream_index_state")
+            db.execute("UPDATE index_task_queue SET status='cancelled',finished_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE job='core' AND status IN ('pending','running')")
+            db.execute("INSERT OR IGNORE INTO index_task_queue(job,path,reason,status,created_at,updated_at) SELECT 'core',path,'Unified parser v2 migration','pending',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP FROM plex_media")
+            db.execute("INSERT INTO feature_migrations(name) VALUES('unified_stream_index_parser_v2')")
+            logger.info("core_index event=parser_migration_queued version=2")
+        canonical = db.execute("SELECT 1 FROM feature_migrations WHERE name='canonical_index_design_v3'").fetchone()
+        if not canonical:
+            # Keep Plex configuration/catalog and all learning/saved-property
+            # data, but discard historical jobs, duplicate index contents,
+            # preview files, and stale synchronization markers.  The unified
+            # core index is then rebuilt from the current catalog below.
+            for table in (
+                "index_task_queue", "task_queue", "media_change_request",
+                "media_stream_index", "media_stream_index_state",
+                "movie_stream_index", "movie_stream_index_value",
+                "tv_stream_index_value", "tv_stream_index_media",
+                "external_subtitle_index", "external_sidecar_index_state",
+                "subtitle_extended_index", "subtitle_extended_media",
+                "preview_cache_index", "preview_cache_files",
+            ):
+                db.execute(f"DELETE FROM {table}")
+            db.execute("UPDATE plex_config SET last_sync=NULL WHERE id=1")
+            db.execute("DELETE FROM plex_sync_state")
+            db.execute("INSERT INTO feature_migrations(name) VALUES('canonical_index_design_v3')")
+            db.execute("INSERT INTO index_task_queue(job,path,reason,status,created_at,updated_at) SELECT 'core',path,'Canonical index design v3 migration','pending',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP FROM plex_media")
+            logger.info("core_index event=canonical_migration_queued version=3")
 
 
 def selected_movies(paths: list[str]) -> list[dict]:
@@ -144,6 +188,7 @@ def movie_stream_values(request: MovieStreamRequest) -> dict:
             rows = db.execute(f"SELECT path,stream_type,language,region,track_name,filename_tags FROM media_stream_index WHERE path IN ({','.join('?' for _ in group)})", group).fetchall()
             for row in rows:
                 value = dict(row)
+                value["language"] = tv_bulk.comparable_language(value["language"])
                 try:
                     value["filename_tags"] = json.loads(value["filename_tags"] or "[]")
                 except (TypeError, json.JSONDecodeError):
@@ -166,26 +211,32 @@ def process_filtered_stream_edit(task_id: int, payload: dict) -> dict:
     request_data["paths"] = [path]
     request_data["mode"] = "now"
     request = tv_bulk.SeasonStreamBulkEdit.model_validate(request_data)
-    tasks.update_progress(task_id, 0, 2, "Checking current streams")
+    episode = (re.search(r"(?:^|[^A-Za-z])(S\d{1,2}E\d{1,2})(?:[^A-Za-z]|$)", path, re.I) or [None, ""])[1].upper()
+    prefix = f"Processing episode {episode} · " if episode else "Processing media · "
+    tasks.update_progress(task_id, 0, 2, prefix + "Checking current streams")
     edit, matched = tv_bulk.episode_bulk_edit(path, request)
     if not matched:
         raise RuntimeError("No current stream matches the queued filter")
-    tasks.update_progress(task_id, 1, 2, f"Applying changes to {matched} matching stream(s)")
+    tasks.update_progress(task_id, 1, 2, prefix + f"Applying changes to {matched} matching stream(s)")
     result = optimized_media_edit(ReorderEditRequest.model_validate(edit))
     reindex = ["core", "previews"] if request.filters.stream_type == "external" or request.remove else ["core"]
     queues.request_media_indexes(path, reindex, "Queued filtered movie edit completed")
-    tasks.update_progress(task_id, 2, 2, "Stream changes applied")
+    tasks.update_progress(task_id, 2, 2, prefix + "Stream changes applied")
     return {**result, "path": path, "streams": matched}
 
 
 def enqueue_filtered_movie_edits(paths: list[str], request: MovieStreamBulkEdit) -> tuple[int, list[int]]:
     template = request.model_dump(exclude={"paths", "mode"})
+    targets = tv_bulk.indexed_target_keys(paths, request.filters)
     now = tasks.utc_now()
     queued = 0
     task_ids: list[int] = []
     with connection() as db:
         for path in paths:
-            payload = json.dumps({"path": path, "request": template}, ensure_ascii=False, separators=(",", ":"))
+            if not targets[path]:
+                continue
+            per_media = {**template, "target_keys": targets[path]}
+            payload = json.dumps({"path": path, "request": per_media}, ensure_ascii=False, separators=(",", ":"))
             cursor = db.execute(
                 "INSERT INTO task_queue(task_type,label,payload_json,status,progress_message,created_at,updated_at) VALUES('filtered_stream_edit',?,?,'pending','Waiting',?,?)",
                 (f"Movie filtered stream edit · {Path(path).name}", payload, now, now),
@@ -217,32 +268,20 @@ def movie_stream_bulk_edit(request: MovieStreamBulkEdit) -> dict:
         raise HTTPException(400, "Integrate is available only for external subtitles")
     if request.remove and changed.intersection({"language", "region", "track_name"}):
         raise HTTPException(400, "Remove cannot be combined with metadata changes")
+    if "track_name" in changed and request.filters.language is None and not request.filters.language_regions:
+        raise HTTPException(400, "Select a language and region before changing track names in bulk")
     if request.mode == "queue":
         queued, task_ids = enqueue_filtered_movie_edits(request.paths, request)
+        if not queued:
+            raise HTTPException(409, "No indexed streams match the selected values; refresh the filters")
         return {"mode": "queue", "queued": queued, "task_ids": task_ids, "applied": 0, "streams": 0, "skipped": [], "failed": []}
-    queued = applied = streams = 0
-    skipped, failed = [], []
-    for path in request.paths:
-        try:
-            edit, matched = tv_bulk.episode_bulk_edit(path, request)
-            if not matched:
-                skipped.append({"path": path, "reason": "No current stream matches"})
-                continue
-            reindex = ["core", "previews"] if request.filters.stream_type == "external" or request.remove else ["core"]
-            if request.mode == "queue":
-                tasks.enqueue("media_edit", {"edit": edit, "reindex_indexes": reindex}, f"Movie filtered stream edit · {Path(path).name}")
-                queued += 1
-            else:
-                optimized_media_edit(ReorderEditRequest.model_validate(edit))
-                queues.request_media_indexes(path, reindex, "Movie filtered stream edit completed")
-                applied += 1
-            streams += matched
-        except Exception as exc:
-            failed.append({"path": path, "error": str(getattr(exc, "detail", exc))[-1000:]})
-    if not queued and not applied:
-        raise HTTPException(409, failed[0]["error"] if failed else "No movie streams match the selected values")
-    logger.info("movie_stream_bulk_edit event=completed mode=%s media=%d streams=%d skipped=%d failed=%d", request.mode, queued + applied, streams, len(skipped), len(failed))
-    return {"mode": request.mode, "queued": queued, "applied": applied, "streams": streams, "skipped": skipped, "failed": failed}
+    # Immediate bulk edits use the same per-media workers as queued edits so the
+    # splash can report the actual episode and aggregate percentage.
+    queued, task_ids = enqueue_filtered_movie_edits(request.paths, request)
+    if not queued:
+        raise HTTPException(409, "No indexed streams match the selected values; refresh the filters")
+    return {"mode": "now", "queued": queued, "task_ids": task_ids, "applied": 0, "streams": 0, "skipped": [], "failed": []}
+
 
 
 @app.post("/api/v82/movies/bulk-task-status")
@@ -275,7 +314,7 @@ def unified_pending_index_items(job: str) -> list[dict]:
     for item in rows:
         try:
             stat = Path(item["path"]).stat()
-            if item["modified_ns"] != stat.st_mtime_ns or item["indexed_size"] != stat.st_size or item["schema_version"] != 1:
+            if item["modified_ns"] != stat.st_mtime_ns or item["indexed_size"] != stat.st_size or item["schema_version"] != 2:
                 pending[item["path"]] = {"path": item["path"], "title": item["title"], "modified": int(stat.st_mtime), "size": stat.st_size}
         except OSError:
             pending[item["path"]] = {"path": item["path"], "title": item["title"], "modified": 0, "size": 0}

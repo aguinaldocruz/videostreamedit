@@ -210,7 +210,7 @@ def reorder_edit(request: ReorderEditRequest) -> dict:
                 continue
             properties = matroska[codec_type][identity] if identity < len(matroska[codec_type]) else {}
             tags = (stream or {}).get("tags") or {}
-            language = properties.get("language_ietf") or properties.get("language") or tags.get("language") or ""
+            language = properties.get("language_ietf") or tags.get("language") or properties.get("language") or ""
             title = properties.get("track_name") if "track_name" in properties else tags.get("title")
             if language:
                 command += [f"-metadata:s:{short}:{output_index}", f"language={language}"]

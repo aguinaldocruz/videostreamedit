@@ -18,7 +18,7 @@ function listedEpisodeLabels() {
 
 async function inspectBulkCloneCandidates() {
   ensureBulkCloneUi();
-  const button = $('#bulk-clone-button'), saved = readLastChange(), paths = listedEpisodePaths(), generation = ++bulkCloneGeneration;
+  const button = $("#bulk-clone-button");
   bulkCloneInspection = null;
   button.classList.add('hidden');
   if (!state.currentShow || !saved?.before || !paths.length) return;
@@ -40,7 +40,13 @@ async function inspectBulkCloneCandidates() {
 
 function scheduleBulkCloneInspection() {
   clearTimeout(bulkCloneTimer);
-  bulkCloneTimer = setTimeout(inspectBulkCloneCandidates, 400);
+  bulkCloneTimer = null;
+  bulkCloneInspection = null;
+  const button = $("#bulk-clone-button");
+  if (button) {
+    button.classList.add("hidden");
+    button.disabled = true;
+  }
 }
 
 const bulkCloneRenderEpisodes = renderEpisodes;

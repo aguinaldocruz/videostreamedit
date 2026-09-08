@@ -16,7 +16,7 @@ from app.v2 import TYPE_SPECIFIER, app, authorized_file, make_language, probe
 STATIC_DIR = Path(__file__).parent / "static"
 SUBTITLE_EXTENSIONS = {".srt", ".ass", ".ssa", ".vtt", ".sub"}
 LANGUAGE_ALIASES = {
-    "pt": "pt", "por": "por", "pob": "pt", "en": "en", "eng": "eng",
+    "pt": "pt", "por": "por", "pob": "pt", "ptbr": "pt", "ptbrasil": "pt", "en": "en", "eng": "eng",
     "es": "es", "spa": "spa", "fr": "fr", "fra": "fra", "fre": "fre",
     "de": "de", "deu": "deu", "ger": "ger", "it": "it", "ita": "ita",
     "ja": "ja", "jpn": "jpn", "ko": "ko", "kor": "kor", "zh": "zh",
@@ -27,6 +27,23 @@ LANGUAGE_ALIASES = {
     "fin": "fin", "el": "el", "ell": "ell", "gre": "gre", "he": "he",
     "heb": "heb", "hi": "hi", "hin": "hin",
 }
+ISO_639_TO_1 = {
+    "ara": "ar", "bul": "bg", "ces": "cs", "cze": "cs", "chi": "zh", "zho": "zh",
+    "dan": "da", "deu": "de", "ger": "de", "dut": "nl", "nld": "nl", "ell": "el",
+    "gre": "el", "eng": "en", "fin": "fi", "fra": "fr", "fre": "fr", "heb": "he",
+    "hin": "hi", "hrv": "hr", "hun": "hu", "ind": "id", "ita": "it", "jpn": "ja",
+    "kor": "ko", "lat": "la", "lim": "li", "may": "ms", "msa": "ms", "nor": "no",
+    "pol": "pl", "pob": "pt", "por": "pt", "ron": "ro", "rum": "ro", "rus": "ru",
+    "slk": "sk", "slo": "sk", "slv": "sl", "spa": "es", "swa": "sw", "swe": "sv",
+    "tam": "ta", "tel": "te", "tha": "th", "tur": "tr", "ukr": "uk", "vie": "vi",
+}
+
+
+def canonical_language(value: str) -> str:
+    normalized = str(value or "").strip().lower()
+    return ISO_639_TO_1.get(normalized, normalized)
+
+
 REGION_CODES = {"BR", "PT", "US", "GB", "CA", "AU", "NZ", "MX", "ES", "FR", "DE", "IT", "JP", "KR", "CN", "TW", "HK", "RU", "IN"}
 SUBTITLE_FILENAME_MARKERS = {
     "forced": "Forced", "force": "Forced", "foreign": "Forced",
@@ -83,21 +100,27 @@ def split_tag(value: str) -> tuple[str, str]:
 
 
 def external_filename_metadata(suffix: str) -> tuple[str, str, list[str]]:
-    chunks = [value for value in re.split(r"[. _]+", suffix) if value]
+    # Subtitle names commonly use pt-BR, pt_BR, ptbr, pob, or bracketed tags.
+    chunks = [value.strip("[](){}") for value in re.split(r"[. _]+", suffix) if value.strip("[](){}")]
     language = region = ""
     labels: list[str] = []
     for index, chunk in enumerate(chunks):
         lowered = chunk.casefold()
-        combined = re.fullmatch(r"([a-z]{2,3})-([a-z]{2}|\d{3})", lowered)
+        compact = re.sub(r"[-_]", "", lowered)
+        combined = re.fullmatch(r"([a-z]{2,3})[-_](br|pt|us|gb|ca|au|nz|mx|es|fr|de|it|jp|kr|cn|tw|hk|ru|in|\d{3})", lowered)
         candidate = combined.group(1) if combined else lowered
-        hearing_impaired = chunk == "HI"
-        if not language and not hearing_impaired and candidate in LANGUAGE_ALIASES:
-            language = LANGUAGE_ALIASES[candidate]
-            if combined:
-                region = combined.group(2).upper()
-            elif index + 1 < len(chunks) and chunks[index + 1].upper() in REGION_CODES:
-                region = chunks[index + 1].upper()
-            labels.append(f"{language}-{region}" if region else language)
+        hearing_impaired = chunk.casefold() in {"hi", "hearing-impaired", "hearingimpaired"}
+        if not language and not hearing_impaired:
+            if compact in {"pob", "ptbr", "ptbrasil"}:
+                language, region = "pt", "BR"
+            elif combined and candidate in LANGUAGE_ALIASES:
+                language, region = LANGUAGE_ALIASES[candidate], combined.group(2).upper()
+            elif candidate in LANGUAGE_ALIASES:
+                language = LANGUAGE_ALIASES[candidate]
+                if index + 1 < len(chunks) and chunks[index + 1].upper() in REGION_CODES:
+                    region = chunks[index + 1].upper()
+            if language:
+                labels.append(f"{language}-{region}" if region else language)
         marker = "Hearing impaired" if hearing_impaired else SUBTITLE_FILENAME_MARKERS.get(lowered.replace("_", ""))
         if marker and marker not in labels:
             labels.append(marker)

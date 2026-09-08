@@ -18,8 +18,8 @@ from app.v79 import app
 logger = logging.getLogger("uvicorn.error")
 JOBS = ("core", "subtitles", "previews")
 conditions = {job: threading.Condition() for job in JOBS}
-threads: dict[str, threading.Thread] = {}
-_legacy_status = legacy.status
+threads: dict[str, list[threading.Thread]] = {}
+WORKER_COUNTS = {"core": 2, "subtitles": 1, "previews": 1}
 
 
 class IndexRequest(BaseModel):
@@ -61,7 +61,7 @@ def enqueue(job: str, path: str, reason: str = "Media changed") -> bool:
         if existing:
             return False
         db.execute(
-            "INSERT INTO index_task_queue(job,path,reason,status,created_at,updated_at) VALUES(?,?,?,'pending',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+            "INSERT OR IGNORE INTO index_task_queue(job,path,reason,status,created_at,updated_at) VALUES(?,?,?,'pending',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
             (job, path, reason[:300]),
         )
     logger.info("index_queue=%s event=added file=%s reason=%s", job, path.replace("\n", "\\n"), reason.replace("\n", " ")[:200])
@@ -76,7 +76,7 @@ def enqueue_many(job: str, items: list[dict], reason: str) -> int:
     with connection() as db:
         before = db.total_changes
         db.executemany(
-            """INSERT INTO index_task_queue(job,path,reason,status,created_at,updated_at)
+            """INSERT OR IGNORE INTO index_task_queue(job,path,reason,status,created_at,updated_at)
                SELECT ?,?,?,'pending',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP
                WHERE NOT EXISTS (
                  SELECT 1 FROM index_task_queue
@@ -127,6 +127,27 @@ def pending_index_items(job: str) -> list[dict]:
         ordinary.extend(tv_index.pending_episode_rows())
     sidecars = tv_index.pending_external_sidecars(job)
     return list({str(item["path"]): item for item in [*ordinary, *sidecars]}.values())
+
+
+def prune_orphaned_index_entries() -> dict[str, int]:
+    """Remove queue/index records for media no longer present in Plex catalog."""
+    with connection() as db:
+        queue = db.execute("UPDATE index_task_queue SET status='cancelled',error='Removed from Plex catalog',finished_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE status IN ('pending','failed') AND path NOT IN (SELECT path FROM plex_media)").rowcount
+        tables = (
+            "media_stream_index", "media_stream_index_state", "movie_stream_index",
+            "movie_stream_index_value", "tv_stream_index_value", "tv_stream_index_media",
+            "external_subtitle_index", "external_sidecar_index_state",
+            "subtitle_extended_index", "subtitle_extended_media",
+            "preview_cache_index", "preview_cache_files",
+        )
+        removed = 0
+        for table in tables:
+            column = 'media_path' if table in {'external_subtitle_index'} else 'path'
+            if table == 'external_sidecar_index_state': column = 'path'
+            removed += db.execute(f"DELETE FROM {table} WHERE {column} NOT IN (SELECT path FROM plex_media)").rowcount
+    if queue or removed:
+        logger.info("plex_sync event=orphaned_index_entries_pruned queue=%d index_rows=%d", queue, removed)
+    return {"queue": queue, "index_rows": removed}
 
 
 def migrate_index_paths(changes: dict[str, str], reason: str = "Plex media path changed") -> int:
@@ -221,6 +242,17 @@ def deduplicate_active_index_paths() -> int:
     if cancelled:
         logger.info("index_queue event=duplicate_requests_cancelled count=%d", cancelled)
     return cancelled
+
+
+def ensure_active_unique_index() -> None:
+    """Make active queue deduplication atomic after historical duplicates are cleaned."""
+    try:
+        with connection() as db:
+            db.execute("""CREATE UNIQUE INDEX IF NOT EXISTS index_task_queue_active_unique
+                         ON index_task_queue(job,path)
+                         WHERE status IN ('pending','running')""")
+    except Exception as exc:
+        logger.warning("index_queue event=active_unique_index_unavailable error=%s", str(exc).replace("\n", " ")[:500])
 
 
 def resolve_moved_plex_path(stale_path: str) -> str | None:
@@ -339,7 +371,12 @@ def request_media_indexes(path: str, names: list[str], reason: str) -> int:
             db.execute("DELETE FROM preview_cache_files WHERE path=?", (path,))
             db.execute("DELETE FROM preview_cache_index WHERE path=?", (path,))
         logger.info("preview_cache event=media_invalidated file=%s reason=%s", path.replace("\n", "\\n"), reason.replace("\n", " ")[:200])
-    return enqueue("core", path, reason) if "core" in requested else 0
+    added = 0
+    for job in requested:
+        if enqueue(job, path, reason):
+            added += 1
+    logger.info("index_queue event=media_indexes_requested file=%s indexes=%s added=%d reason=%s", path.replace("\n", "\\n"), ",".join(requested), added, reason.replace("\n", " ")[:200])
+    return added
 
 
 def queue_state(job: str) -> dict:
@@ -350,9 +387,20 @@ def queue_state(job: str) -> dict:
             "SELECT id,path,reason,status,attempts,error,created_at,started_at FROM index_task_queue WHERE job=? AND status IN ('running','pending','failed') ORDER BY CASE status WHEN 'running' THEN 0 WHEN 'pending' THEN 1 ELSE 2 END,id DESC LIMIT 20",
             (job,),
         )]
-    base = _legacy_status(job)
+    # Keep status polling O(1) over the queue.  The legacy status routine
+    # rescans the entire media catalog and filesystem on every refresh, which
+    # made the setup screen appear frozen during large rebuilds.
     running = counts.get("running", 0) > 0
-    return {**base, "running": running, "paused": bool(setting["paused"]), "queued": counts.get("pending", 0), "failed": counts.get("failed", 0), "completed": counts.get("succeeded", 0), "total": counts.get("pending", 0) + counts.get("running", 0), "current": "Index queue", "items": items, "queue": True}
+    # Keep the displayed indexed count cheap while preserving the setup UI
+    # contract.  The unified core table covers both movies and episodes.
+    index_table = {"core": "media_stream_index_state", "subtitles": "subtitle_extended_media", "previews": "preview_cache_index"}[job]
+    with connection() as db:
+        indexed = int(db.execute(f"SELECT count(*) FROM {index_table}").fetchone()[0])
+    return {"running": running, "paused": bool(setting["paused"]),
+            "queued": counts.get("pending", 0), "failed": counts.get("failed", 0),
+            "completed": counts.get("succeeded", 0), "indexed": indexed,
+            "total": counts.get("pending", 0) + counts.get("running", 0),
+            "current": "Index queue", "items": items, "queue": True}
 
 
 def worker(job: str) -> None:
@@ -365,7 +413,7 @@ def worker(job: str) -> None:
                 db.execute("UPDATE index_task_queue SET status='cancelled',updated_at=CURRENT_TIMESTAMP WHERE job=? AND status='pending'", (job,))
                 db.execute("UPDATE index_queue_settings SET stop_requested=0,paused=1 WHERE job=?", (job,))
                 setting = {"paused": 1}
-            foreground = db.execute("SELECT 1 FROM task_queue WHERE status='running' LIMIT 1").fetchone() if job == "core" else None
+            foreground = db.execute("SELECT 1 FROM task_queue WHERE status='running' AND task_type='index_rebuild_prepare' LIMIT 1").fetchone() if job == "core" else None
             row = None if setting["paused"] or foreground else db.execute("SELECT * FROM index_task_queue WHERE job=? AND status='pending' ORDER BY id LIMIT 1", (job,)).fetchone()
             claimed = db.execute("UPDATE index_task_queue SET status='running',started_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP,attempts=attempts+1 WHERE id=? AND status='pending'", (row["id"],)).rowcount if row else 0
         if not row or not claimed:
@@ -395,9 +443,18 @@ def worker(job: str) -> None:
             if processed == 1 or processed % 25 == 0:
                 logger.info("index_queue=%s event=progress processed=%d last_id=%d seconds=%.2f", job, processed, row["id"], time.monotonic()-started)
         except Exception as exc:
+            message = str(getattr(exc, "detail", exc))[-3000:]
+            # Retry transient filesystem/tool/Plex-path failures a bounded
+            # number of times.  This prevents a temporary outage from losing
+            # the index request while guaranteeing that bad media cannot loop
+            # forever; terminal failures remain visible for manual retry.
+            retry = int(row["attempts"]) < 3 and "Not Found" not in message and "404" not in message
             with connection() as db:
-                db.execute("UPDATE index_task_queue SET status='failed',error=?,finished_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE id=?", (str(getattr(exc, "detail", exc))[-3000:], row["id"]))
-            logger.exception("index_queue=%s event=item_failed id=%d seconds=%.2f file=%s", job, row["id"], time.monotonic()-started, path.replace("\n", "\\n"))
+                if retry:
+                    db.execute("UPDATE index_task_queue SET status='pending',error=?,started_at=NULL,updated_at=CURRENT_TIMESTAMP WHERE id=?", (f"Retry {row['attempts']}/3: {message}", row["id"]))
+                else:
+                    db.execute("UPDATE index_task_queue SET status='failed',error=?,finished_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE id=?", (message, row["id"]))
+            logger.warning("index_queue=%s event=item_%s id=%d attempt=%d error=%s file=%s", job, "retry" if retry else "failed", row["id"], row["attempts"], message.replace("\n", " ")[-500:], path.replace("\n", "\\n"))
 
 
 @app.on_event("startup")
@@ -407,6 +464,7 @@ def initialize_index_queues() -> None:
         db.execute("UPDATE index_task_queue SET status='pending',started_at=NULL WHERE status='running'")
         old = db.execute("SELECT id,payload_json FROM task_queue WHERE task_type='media_reindex' AND status IN ('pending','running','failed')").fetchall()
     deduplicate_active_index_paths()
+    ensure_active_unique_index()
     discard_unchanged_plex_index_requests()
     for item in old:
         payload = json.loads(item["payload_json"]); path = str(payload.get("path") or "")
@@ -419,10 +477,21 @@ def initialize_index_queues() -> None:
 
 
 def start_index_queue_workers() -> None:
+    # Core indexing is dominated by one mkvmerge process per media file. Two
+    # bounded workers improve throughput without turning the storage into an
+    # uncontrolled process farm; the subtitle/preview jobs remain serialized.
     for job in JOBS:
-        if job not in threads or not threads[job].is_alive():
-            threads[job] = threading.Thread(target=worker, args=(job,), name=f"vse-index-queue-{job}", daemon=True)
-            threads[job].start()
+        active = [thread for thread in threads.get(job, []) if thread.is_alive()]
+        for number in range(len(active), WORKER_COUNTS.get(job, 1)):
+            thread = threading.Thread(
+                target=worker,
+                args=(job,),
+                name=f"vse-index-queue-{job}-{number + 1}",
+                daemon=True,
+            )
+            thread.start()
+            active.append(thread)
+        threads[job] = active
 
 
 @app.post("/api/v80/index/request")

@@ -8,7 +8,7 @@ from fastapi import HTTPException
 from pydantic import BaseModel, Field
 
 import app.v65 as tasks
-from app.v5 import split_tag
+from app.v5 import canonical_language, split_tag
 from app.v11 import connection
 from app.v76 import app
 from app.v7 import probe
@@ -72,7 +72,7 @@ def queued_edit(path: str, request: BulkMovieTrackNameRequest) -> tuple[dict, in
         tags = stream.get("tags") or {}
         language, _ = split_tag(str(tags.get("language") or ""))
         title = str(tags.get("title") or "").strip()
-        if language.strip() == request.language and title == request.track_name:
+        if canonical_language(language) == request.language and title == request.track_name:
             tracks.append({"codec_type": stream_type, "type_index": type_index, "title": request.new_track_name.strip()})
             changed += 1
     return {
@@ -87,7 +87,7 @@ def queued_edit(path: str, request: BulkMovieTrackNameRequest) -> tuple[dict, in
 
 @app.post("/api/v77/movies/bulk-track-name")
 def bulk_movie_track_name(request: BulkMovieTrackNameRequest) -> dict:
-    request.language = request.language.strip()
+    request.language = canonical_language(request.language)
     request.track_name = request.track_name.strip()
     request.new_track_name = request.new_track_name.strip()
     if not request.language or not request.track_name or not request.new_track_name:

@@ -29,3 +29,59 @@ body.app-busy::after {
   font-weight: 700;
   white-space: nowrap;
 }
+
+body.app-busy::after { display:none; }
+#global-busy-overlay { position:fixed; inset:0; z-index:2147483646; display:grid; place-items:center; background:rgba(4,8,12,.62); backdrop-filter:blur(1px); }
+#global-busy-overlay .busy-card { width:min(360px,82vw); padding:22px 24px; border:1px solid color-mix(in srgb,var(--accent) 48%,var(--line)); border-radius:14px; background:#111820f5; color:var(--text); text-align:center; box-shadow:0 12px 40px #000b; }
+#global-busy-overlay .busy-ring { --busy-progress:18%; width:92px; height:92px; margin:0 auto 14px; border-radius:50%; display:grid; place-items:center; background:conic-gradient(var(--accent) var(--busy-progress),#2a343d 0); position:relative; }
+#global-busy-overlay .busy-ring::before { content:''; position:absolute; inset:8px; border-radius:50%; background:#111820; }
+#global-busy-overlay .busy-ring span { position:relative; z-index:1; font-weight:800; color:var(--accent); }
+#global-busy-overlay .busy-ring.indeterminate { animation:busy-spin 1.1s linear infinite; }
+#global-busy-overlay .busy-card strong { display:block; font-size:14px; }
+#global-busy-overlay .busy-card p { margin:7px 0 0; color:var(--muted); font-size:12px; line-height:1.35; }
+@keyframes busy-spin { to { transform:rotate(360deg); } }
+/* Visual-only replacement for the processing banner; request locking remains unchanged. */
+body.app-busy::before { content:''; position:fixed; inset:0; z-index:2147483646; background:rgba(4,8,12,.55); backdrop-filter:blur(1px); }
+body.app-busy::after { content:'Processing… please wait'; position:fixed; z-index:2147483647; left:50%; top:50%; transform:translate(-50%,-50%); width:min(300px,80vw); padding:70px 18px 16px; border:1px solid color-mix(in srgb,var(--accent) 55%,var(--line)); border-radius:14px; background:#111820f5; color:var(--accent); box-shadow:0 8px 28px #000a; font-size:13px; font-weight:700; text-align:center; white-space:nowrap; }
+body.app-busy::after { animation: busy-static-pulse 1.2s ease-in-out infinite; }
+@keyframes busy-static-pulse { 50% { box-shadow:0 8px 28px #000a,0 0 0 8px #72d6c422; } }
+body.app-busy::after { display:block; }
+body.app-busy-overlay::before,
+body.app-busy-overlay::after { display:none !important; }
+@property --busy-angle { syntax: '<angle>'; inherits: false; initial-value: 0deg; }
+/* Compact indeterminate ring: a calm track with one smooth travelling accent. */
+body.app-busy::after { --busy-angle:0deg; background: radial-gradient(circle at 50% 33px,#111820 0 24px,transparent 25px), conic-gradient(from var(--busy-angle) at 50% 33px,var(--accent) 0 72deg,#33404a 72deg 360deg), #111820f5; animation:busy-static-pulse 1.2s ease-in-out infinite,busy-static-spin 1.15s linear infinite; }
+@keyframes busy-static-spin { to { --busy-angle:360deg; } }
+
+/* Keep the live task message from resizing the splash while its text changes. */
+#global-busy-overlay .busy-card {
+  min-height: 210px;
+  box-sizing: border-box;
+}
+#global-busy-overlay .busy-card strong {
+  min-height: 19px;
+  line-height: 19px;
+}
+#global-busy-overlay .busy-card p {
+  height: 34px;
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  overflow-wrap: anywhere;
+}
+
+/* The outer ring shows aggregate completion while the original inner ring keeps rotating. */
+#global-busy-overlay .busy-ring::after {
+  content: '';
+  position: absolute;
+  inset: -9px;
+  border-radius: 50%;
+  background: conic-gradient(from -90deg, var(--accent) 0 var(--busy-progress), #33404a var(--busy-progress) 100%);
+  -webkit-mask: radial-gradient(farthest-side, transparent calc(100% - 5px), #000 calc(100% - 4px));
+  mask: radial-gradient(farthest-side, transparent calc(100% - 5px), #000 calc(100% - 4px));
+  animation: busy-spin-reverse 1.1s linear infinite;
+  pointer-events: none;
+}
+@keyframes busy-spin-reverse { to { transform: rotate(-360deg); } }

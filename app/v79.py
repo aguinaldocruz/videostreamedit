@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 from pathlib import Path
 from typing import Literal
 
@@ -14,7 +15,7 @@ import app.v65 as tasks
 from app.v11 import connection
 from app.v13 import media_details_with_ietf
 from app.v43 import optimized_media_edit
-from app.v5 import SUBTITLE_EXTENSIONS, external_filename_metadata, external_subtitles
+from app.v5 import SUBTITLE_EXTENSIONS, canonical_language, external_filename_metadata, external_subtitles
 from app.v78 import app
 from app.v7 import ReorderEditRequest
 
@@ -28,9 +29,11 @@ class SeasonStreamRequest(BaseModel):
 
 
 class SeasonStreamFilter(BaseModel):
+    presence: Literal["have", "not_have"] = "have"
     stream_type: Literal["audio", "subtitle", "external"] | None = None
     language: str | None = None
     region: str | None = None
+    language_regions: list[str] | None = None
     track_name: str | None = None
     filename_tag: str | None = None
 
@@ -38,12 +41,15 @@ class SeasonStreamFilter(BaseModel):
 class SeasonStreamBulkEdit(BaseModel):
     paths: list[str] = Field(min_length=1, max_length=2000)
     filters: SeasonStreamFilter
-    changed_fields: list[Literal["language", "region", "track_name", "integrate", "remove"]] = Field(min_length=1)
+    changed_fields: list[Literal["language", "region", "track_name", "default", "forced", "integrate", "remove"]] = Field(min_length=1)
     language: str = Field(default="", max_length=64)
     region: str = Field(default="", max_length=64)
     track_name: str = Field(default="", max_length=512)
     integrate: bool = False
     remove: bool = False
+    default_action: Literal["unchanged", "set", "clear"] = "unchanged"
+    forced_action: Literal["unchanged", "set", "clear"] = "unchanged"
+    target_keys: list[str] | None = None
     mode: Literal["now", "queue"]
 
 
@@ -287,17 +293,25 @@ def season_stream_values(request: SeasonStreamRequest) -> dict:
     ensure_tv_stream_index()
     items = selected_episode_rows(request.paths)
     pending = []
+    # Use the unified index fingerprint (filesystem mtime/size).  The legacy
+    # TV table stores Plex catalog timestamps, which do not change when stream
+    # metadata is edited and caused every season expansion to re-scan its files.
     with connection() as db:
         cached = {
             row["path"]: row for start in range(0, len(items), 800)
             for row in db.execute(
-                f"SELECT path,modified,size FROM tv_stream_index_media WHERE path IN ({','.join('?' for _ in items[start:start + 800])})",
+                f"SELECT path,modified_ns,size FROM media_stream_index_state WHERE path IN ({','.join('?' for _ in items[start:start + 800])})",
                 [item["path"] for item in items[start:start + 800]],
             ).fetchall()
         }
     for item in items:
         old = cached.get(item["path"])
-        if not old or int(old["modified"]) != int(item["modified"]) or int(old["size"]) != int(item["size"]):
+        try:
+            stat = Path(item["path"]).stat()
+            current = (int(stat.st_mtime_ns), int(stat.st_size))
+        except OSError:
+            current = None
+        if not old or current is None or (int(old["modified_ns"]), int(old["size"])) != current:
             pending.append(item)
     errors = []
     for number, item in enumerate(pending, 1):
@@ -318,6 +332,7 @@ def season_stream_values(request: SeasonStreamRequest) -> dict:
             ).fetchall()
             for row in rows:
                 value = dict(row)
+                value["language"] = comparable_language(value["language"])
                 try:
                     value["filename_tags"] = json.loads(value["filename_tags"] or "[]")
                 except (TypeError, json.JSONDecodeError):
@@ -329,7 +344,7 @@ def season_stream_values(request: SeasonStreamRequest) -> dict:
 
 def comparable_language(value: str) -> str:
     normalized = str(value or "").strip().lower()
-    return {"por": "pt", "pob": "pt", "eng": "en"}.get(normalized, normalized)
+    return canonical_language(normalized)
 
 
 def region_matches(stream: dict, expected: str | None) -> bool:
@@ -337,16 +352,21 @@ def region_matches(stream: dict, expected: str | None) -> bool:
         return True
     actual = str(stream.get("region") or "").strip().upper()
     wanted = str(expected).strip().upper()
-    if actual == wanted:
-        return True
-    return wanted == "BR" and not actual and comparable_language(stream.get("language")) == "pt"
+    return actual == wanted
 
 
 def filter_matches(stream: dict, filters: SeasonStreamFilter) -> bool:
+    language_region = f"{comparable_language(stream.get('language'))}|{str(stream.get('region') or '').strip().upper()}"
+    selected_pairs = filters.language_regions
+    pair_match = not selected_pairs or language_region in {
+        f"{comparable_language(value.split('|', 1)[0])}|{value.split('|', 1)[1].strip().upper()}"
+        for value in selected_pairs if '|' in value
+    }
     return (
         (filters.stream_type is None or stream.get("codec_type") == filters.stream_type)
-        and (filters.language is None or comparable_language(stream.get("language")) == comparable_language(filters.language))
-        and region_matches(stream, filters.region)
+        and pair_match
+        and (filters.language_regions is not None or filters.language is None or comparable_language(stream.get("language")) == comparable_language(filters.language))
+        and (filters.language_regions is not None or region_matches(stream, filters.region))
         and (filters.track_name is None or str(stream.get("title") or "").strip() == filters.track_name)
         and (filters.filename_tag is None or filters.filename_tag in (stream.get("filename_tags") or []))
     )
@@ -357,7 +377,9 @@ def episode_bulk_edit(path: str, request: SeasonStreamBulkEdit) -> tuple[dict, i
     tracks, external_changes, order, remove = [], [], [], []
     tags = {"default_audio": None, "forced_audio": None, "default_subtitle": None, "forced_subtitle": None}
     matches = 0
+    matched_keys: list[str] = []
     changed = set(request.changed_fields)
+    targets = set(request.target_keys) if request.target_keys is not None else None
     for stream in details["streams"]:
         stream_type = stream["codec_type"]
         type_index = int(stream["type_index"])
@@ -367,8 +389,11 @@ def episode_bulk_edit(path: str, request: SeasonStreamBulkEdit) -> tuple[dict, i
             tags[f"default_{stream_type}"] = key
         if stream.get("forced"):
             tags[f"forced_{stream_type}"] = key
-        if not filter_matches(stream, request.filters):
+        if targets is not None and key not in targets:
             continue
+        if targets is None and not filter_matches(stream, request.filters):
+            continue
+        matched_keys.append(key)
         if request.remove:
             remove.append(key)
             matches += 1
@@ -386,7 +411,9 @@ def episode_bulk_edit(path: str, request: SeasonStreamBulkEdit) -> tuple[dict, i
         key = f"external:{external_path}"
         order.append({"source": "external", "codec_type": "subtitle", "path": external_path})
         comparable = {**stream, "codec_type": "external"}
-        if not filter_matches(comparable, request.filters):
+        if targets is not None and key not in targets:
+            continue
+        if targets is None and not filter_matches(comparable, request.filters):
             continue
         if request.remove:
             remove.append(key)
@@ -406,6 +433,20 @@ def episode_bulk_edit(path: str, request: SeasonStreamBulkEdit) -> tuple[dict, i
                 "forced": bool(stream.get("forced")),
             })
         matches += 1
+    # For set/clear requests, the last matching stream of each type wins,
+    # matching the stream-edit ordering rule.
+    if request.default_action != "unchanged":
+        for stream_type in ("audio", "subtitle"):
+            matches_for_type = [key for key in matched_keys if key.startswith(f"embedded:{stream_type}:")]
+            tags[f"default_{stream_type}"] = (f"embedded:{stream_type}:{matches_for_type[-1].rsplit(":", 1)[-1]}" if request.default_action == "set" and matches_for_type else None)
+        if request.filters.stream_type in {"audio", "subtitle"}:
+            tags[f"default_{"subtitle" if request.filters.stream_type == "audio" else "audio"}"] = "__preserve__"
+    if request.forced_action != "unchanged":
+        for stream_type in ("audio", "subtitle"):
+            matches_for_type = [key for key in matched_keys if key.startswith(f"embedded:{stream_type}:")]
+            tags[f"forced_{stream_type}"] = (f"embedded:{stream_type}:{matches_for_type[-1].rsplit(":", 1)[-1]}" if request.forced_action == "set" and matches_for_type else None)
+        if request.filters.stream_type in {"audio", "subtitle"}:
+            tags[f"forced_{"subtitle" if request.filters.stream_type == "audio" else "audio"}"] = "__preserve__"
     return {"path": path, "tracks": tracks, "external_subtitles": external_changes, "order": order, **tags, "remove": remove}, matches
 
 
@@ -415,27 +456,55 @@ def process_tv_filtered_stream_edit(task_id: int, payload: dict) -> dict:
     request_data["paths"] = [path]
     request_data["mode"] = "now"
     request = SeasonStreamBulkEdit.model_validate(request_data)
-    tasks.update_progress(task_id, 0, 2, "Checking current streams")
+    episode = (re.search(r"(?:^|[^A-Za-z])(S\d{1,2}E\d{1,2})(?:[^A-Za-z]|$)", path, re.I) or [None, ""])[1].upper()
+    prefix = f"Processing episode {episode} · " if episode else "Processing media · "
+    tasks.update_progress(task_id, 0, 2, prefix + "Checking current streams")
     edit, matched = episode_bulk_edit(path, request)
     if not matched:
-        tasks.update_progress(task_id, 2, 2, "Skipped; no current stream matches the filter")
-        return {"path": path, "streams": 0, "skipped": True, "reason": "No current stream matches the queued filter"}
-    tasks.update_progress(task_id, 1, 2, f"Applying changes to {matched} matching stream(s)")
+        raise RuntimeError("No current stream matches the queued filter; refresh the filters and try again")
+    tasks.update_progress(task_id, 1, 2, prefix + f"Applying changes to {matched} matching stream(s)")
     result = optimized_media_edit(ReorderEditRequest.model_validate(edit))
     from app.v80 import request_media_indexes
     reindex = ["core", "previews"] if request.filters.stream_type == "external" or request.remove else ["core"]
     request_media_indexes(path, reindex, "Queued TV filtered stream edit completed")
-    tasks.update_progress(task_id, 2, 2, "Stream changes applied")
+    tasks.update_progress(task_id, 2, 2, prefix + "Stream changes applied")
     return {**result, "path": path, "streams": matched}
+
+
+def indexed_target_keys(paths: list[str], filters: SeasonStreamFilter) -> dict[str, list[str]]:
+    result = {path: [] for path in paths}
+    with connection() as db:
+        for start in range(0, len(paths), 800):
+            group = paths[start:start + 800]
+            rows = db.execute(
+                f"SELECT path,source,stream_type,type_index,external_path,language,region,track_name,filename_tags FROM media_stream_index WHERE path IN ({', '.join('?' for _ in group)})",
+                group,
+            ).fetchall()
+            for row in rows:
+                value = dict(row)
+                try:
+                    value["filename_tags"] = json.loads(value["filename_tags"] or "[]")
+                except (TypeError, json.JSONDecodeError):
+                    value["filename_tags"] = []
+                stream = {"codec_type": value["stream_type"], "language": value["language"], "region": value["region"], "title": value["track_name"], "filename_tags": value["filename_tags"]}
+                if not filter_matches(stream, filters):
+                    continue
+                key = f"external:{value['external_path']}" if value["source"] == "external" else f"embedded:{value['stream_type']}:{value['type_index']}"
+                result[value["path"]].append(key)
+    return result
 
 
 def enqueue_tv_filtered_edits(paths: list[str], request: SeasonStreamBulkEdit) -> tuple[int, list[int]]:
     template = request.model_dump(exclude={"paths", "mode"})
+    targets = indexed_target_keys(paths, request.filters)
     now = tasks.utc_now()
     task_ids: list[int] = []
     with connection() as db:
         for path in paths:
-            payload = json.dumps({"path": path, "request": template}, ensure_ascii=False, separators=(",", ":"))
+            if not targets[path]:
+                continue
+            per_media = {**template, "target_keys": targets[path]}
+            payload = json.dumps({"path": path, "request": per_media}, ensure_ascii=False, separators=(",", ":"))
             cursor = db.execute(
                 "INSERT INTO task_queue(task_type,label,payload_json,status,progress_message,created_at,updated_at) VALUES('tv_filtered_stream_edit',?,?,'pending','Waiting',?,?)",
                 (f"TV filtered stream edit · {Path(path).name}", payload, now, now),
@@ -465,34 +534,16 @@ def season_stream_bulk_edit(request: SeasonStreamBulkEdit) -> dict:
         raise HTTPException(400, "Integrate is available only for external subtitles")
     if request.remove and changed.intersection({"language", "region", "track_name"}):
         raise HTTPException(400, "Remove cannot be combined with metadata changes")
+    if "track_name" in changed and request.filters.language is None and not request.filters.language_regions:
+        raise HTTPException(400, "Select a language and region before changing track names in bulk")
     if request.mode == "queue":
         queued, task_ids = enqueue_tv_filtered_edits(request.paths, request)
+        if not queued:
+            raise HTTPException(409, "No indexed streams match the selected values; refresh the filters")
         return {"mode": "queue", "queued": queued, "task_ids": task_ids, "applied": 0, "streams": 0, "skipped": [], "failed": []}
-    queued = applied = streams = 0
-    skipped, failed = [], []
-    for path in request.paths:
-        try:
-            edit, matched = episode_bulk_edit(path, request)
-            if not matched:
-                skipped.append({"path": path, "reason": "No current embedded stream matches the filter"})
-                continue
-            label = Path(path).name
-            reindex = ["core", "previews"] if request.filters.stream_type == "external" or request.remove else ["core"]
-            if request.mode == "queue":
-                tasks.enqueue("media_edit", {"edit": edit, "reindex_indexes": reindex}, f"TV filtered stream edit · {label}")
-                queued += 1
-            else:
-                optimized_media_edit(ReorderEditRequest.model_validate(edit))
-                from app.v80 import request_media_indexes
-                request_media_indexes(path, reindex, "TV filtered stream edit completed")
-                applied += 1
-            streams += matched
-        except Exception as exc:
-            failed.append({"path": path, "error": str(getattr(exc, "detail", exc))[-1000:]})
-        completed = queued + applied + len(skipped) + len(failed)
-        if completed == 1 or completed == len(request.paths) or completed % 10 == 0:
-            logger.info("tv_stream_bulk_edit event=progress mode=%s completed=%d total=%d streams=%d failed=%d", request.mode, completed, len(request.paths), streams, len(failed))
-    logger.info("tv_stream_bulk_edit event=completed mode=%s media=%d streams=%d skipped=%d failed=%d", request.mode, queued + applied, streams, len(skipped), len(failed))
-    if not queued and not applied:
-        raise HTTPException(409, failed[0]["error"] if failed else "No current episode streams match the selected values")
-    return {"mode": request.mode, "queued": queued, "applied": applied, "streams": streams, "skipped": skipped, "failed": failed}
+    # Immediate bulk edits use the same per-media workers as queued edits so the
+    # splash can report the actual episode and aggregate percentage.
+    queued, task_ids = enqueue_tv_filtered_edits(request.paths, request)
+    if not queued:
+        raise HTTPException(409, "No indexed streams match the selected values; refresh the filters")
+    return {"mode": "now", "queued": queued, "task_ids": task_ids, "applied": 0, "streams": 0, "skipped": [], "failed": []}

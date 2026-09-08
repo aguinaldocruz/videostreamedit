@@ -73,5 +73,5 @@ applyLastChange = function (saved) {
 const fastDefaultsOpenEditor = openEditor;
 openEditor = async function (path, label) {
   await fastDefaultsOpenEditor(path, label);
-  if (document.querySelector('#stream-content .stream-row')) applyFastStreamDefaults();
+  // Automatic language and region filling is disabled; users choose explicitly.
 };

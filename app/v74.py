@@ -90,7 +90,7 @@ def process_plex_import_refresh(task_id: int, payload: dict) -> dict:
     item = {"path": str(target), "title": found.get("title") or target.stem, "modified": int(stat.st_mtime), "size": stat.st_size}
     tasks.update_progress(task_id, 3, 4, "Queueing media indexes")
     from app.v80 import request_media_indexes
-    request_media_indexes(str(target), ["core", "subtitles", "previews"], "Plex import discovered")
+    request_media_indexes(str(target), ["core"], "Plex import discovered")
     tasks.update_progress(task_id, 4, 4, "Plex catalog updated; indexes queued")
     logger.info("plex_sync event=post_import_completed library=%s rating_key=%s file=%s", library_key, str(found.get("ratingKey") or ""), str(target).replace("\n", "\\n"))
     return {"path": str(target), "library_key": library_key, "rating_key": str(found.get("ratingKey") or ""), "indexes": ["core", "subtitles", "previews"]}
