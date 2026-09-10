@@ -159,7 +159,16 @@ def run_queue() -> None:
                 queue_condition.wait(timeout=5)
             continue
         with connection() as db:
-            row = db.execute("SELECT * FROM task_queue WHERE status='pending' AND task_type!='media_reindex' ORDER BY id LIMIT 1").fetchone()
+            # Immediate bulk edits are submitted as individual tasks so the
+            # UI can report per-media progress. Run them ahead of unrelated
+            # backlog items; otherwise an immediate operation could remain at
+            # 0/N behind hundreds of older maintenance tasks.
+            row = db.execute("""SELECT * FROM task_queue
+                WHERE status='pending' AND task_type!='media_reindex'
+                ORDER BY CASE WHEN task_type IN ('tv_filtered_stream_edit_now','filtered_stream_edit_now') THEN 0
+                              WHEN task_type IN ('tv_filtered_stream_edit','filtered_stream_edit') THEN 1 ELSE 2 END,
+                         CASE WHEN task_type IN ('tv_filtered_stream_edit_now','filtered_stream_edit_now','tv_filtered_stream_edit','filtered_stream_edit') THEN id END DESC,
+                         id LIMIT 1""").fetchone()
             if row:
                 claimed = db.execute(
                     "UPDATE task_queue SET status='running',started_at=?,updated_at=?,attempts=attempts+1,progress_message='Starting' WHERE id=? AND status='pending'",

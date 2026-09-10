@@ -8,7 +8,7 @@ from fastapi import Request
 from fastapi.responses import HTMLResponse
 
 from app.v2 import probe
-from app.v5 import canonical_language, external_subtitles, split_tag
+from app.v5 import canonical_language, external_subtitles, split_tag, plex_language_pair
 from app.v11 import STATIC_DIR, app, asset, plex_authorized_file
 
 
@@ -70,11 +70,11 @@ def media_details_with_ietf(path: str) -> dict:
         variant_region = str(properties.get("tag_language_variant") or "").strip().upper()
         if ietf_language:
             language = ietf_language
-        language = canonical_language(language)
+        language, effective_region = plex_language_pair(language, ietf_region or variant_region or legacy_region)
         streams.append({
             "codec_type": codec_type, "type_index": type_index,
             "codec": stream.get("codec_name") or "unknown",
-            "language": language, "region": ietf_region or variant_region or legacy_region,
+            "language": language, "region": effective_region,
             "title": tags.get("title") or properties.get("track_name") or "",
             "default": bool((stream.get("disposition") or {}).get("default")),
             "forced": bool((stream.get("disposition") or {}).get("forced")),

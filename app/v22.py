@@ -56,9 +56,21 @@ def normalized_clone_state(path: str) -> dict:
     }
 
 
+def _normalize_clone_state(state: dict) -> dict:
+    import copy
+    value = copy.deepcopy(state or {})
+    for row in value.get("rows", []):
+        language = str(row.get("language") or "").strip().lower()
+        if language == "por":
+            row["language"] = "pt"
+        if str(row.get("language") or "").lower() == "pt" and not str(row.get("region") or "").strip():
+            row["region"] = "PT"
+        row["region"] = str(row.get("region") or "").strip().upper()
+    return value
+
 def inspect_clone_candidate(path: str, expected: dict) -> dict:
     try:
-        return {"path": path, "compatible": normalized_clone_state(path) == expected}
+        return {"path": path, "compatible": normalized_clone_state(path) == _normalize_clone_state(expected)}
     except Exception as exc:
         return {"path": path, "compatible": False, "error": str(exc)}
 

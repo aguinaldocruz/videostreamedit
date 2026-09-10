@@ -117,6 +117,7 @@ async function applyBulkClone(event) {
       const details = await api(`/api/v13/media/details?path=${encodeURIComponent(path)}`);
       const payload = bulkClonePayload(path, details, inspection.saved);
       await api('/api/v7/media/edit', {method: 'POST', body: JSON.stringify(payload)});
+      await api("/api/v80/index/request", {method: "POST", body: JSON.stringify({path, indexes: ["core", "subtitles", "previews"], reason: "Bulk clone completed"})});
       document.dispatchEvent(new CustomEvent('episode-session-changed', {detail: {path}}));
       completed++;
     }

@@ -16,7 +16,7 @@
   const preview=maintenance.querySelector('[data-index-job="previews"]');
   if(preview){
     preview.querySelector('h3').textContent='3. Efficient preview cache';
-    preview.querySelector('p').textContent='Pre-caches the first 25-second audio sample and internal text subtitles. Later audio samples are created only when requested.';
+    preview.querySelector('p').textContent='Caches audio samples on demand.';
     preview.querySelector('.index-maintenance-actions').insertAdjacentHTML('afterend','<label class="preview-cache-limit">Maximum cache <input type="number" min="1" max="100" step="1" data-cache-limit> GB</label>');
     const input=preview.querySelector('[data-cache-limit]');
     api('/api/v63/setup/preview-cache').then(value=>input.value=value.gigabytes).catch(()=>{});

@@ -15,7 +15,7 @@ import app.v65 as tasks
 from app.v11 import connection
 from app.v13 import media_details_with_ietf
 from app.v43 import optimized_media_edit
-from app.v5 import SUBTITLE_EXTENSIONS, canonical_language, external_filename_metadata, external_subtitles
+from app.v5 import SUBTITLE_EXTENSIONS, canonical_language, external_filename_metadata, external_subtitles, plex_language_pair
 from app.v78 import app
 from app.v7 import ReorderEditRequest
 
@@ -28,10 +28,16 @@ class SeasonStreamRequest(BaseModel):
     paths: list[str] = Field(min_length=1, max_length=2000)
 
 
+class TvShowStatusRequest(BaseModel):
+    paths: list[str] = Field(min_length=1, max_length=30000)
+
+
 class SeasonStreamFilter(BaseModel):
     presence: Literal["have", "not_have"] = "have"
     stream_type: Literal["audio", "subtitle", "external"] | None = None
+    stream_types: list[Literal["audio", "subtitle", "external"]] | None = None
     language: str | None = None
+    languages: list[str] | None = None
     region: str | None = None
     language_regions: list[str] | None = None
     track_name: str | None = None
@@ -288,6 +294,57 @@ def selected_episode_rows(paths: list[str]) -> list[dict]:
     return found
 
 
+def _queue_recoverable_stale_indexes(paths: set[str]) -> set[str]:
+    """Queue accessible stale files without retrying terminal failures forever."""
+    if not paths:
+        return set()
+    from app.v80 import enqueue
+    with connection() as db:
+        active = {row["path"] for row in db.execute("SELECT path FROM index_task_queue WHERE job=\"core\" AND status IN (\"pending\",\"running\")").fetchall()}
+        failed = {row["path"] for row in db.execute("SELECT path FROM index_task_queue WHERE job=\"core\" AND status=\"failed\"").fetchall()}
+    queued = set()
+    for path in paths:
+        if path in active or path in failed or not Path(path).is_file():
+            continue
+        if enqueue("core", path, "Automatic stale fingerprint reconciliation"):
+            queued.add(path)
+    return queued
+
+@app.post("/api/v79/tv/show-status")
+def tv_show_status(request: TvShowStatusRequest) -> dict:
+    paths = list(dict.fromkeys(request.paths))
+    placeholders = ",".join("?" for _ in paths)
+    change_paths: set[str] = set()
+    index_paths: set[str] = set()
+    with connection() as db:
+        change_paths = {row["path"] for row in db.execute(
+            f"SELECT marker.path FROM media_change_request marker JOIN task_queue task ON task.id=marker.task_id WHERE marker.path IN ({placeholders}) AND task.status IN ('pending','running')", paths
+        ).fetchall()}
+        index_paths = {row["path"] for row in db.execute(
+            f"SELECT DISTINCT path FROM index_task_queue WHERE path IN ({placeholders}) AND status IN ('pending','running','failed')", paths
+        ).fetchall()}
+        indexed = {row["path"]: (row["modified_ns"], row["size"]) for row in db.execute(
+            f"SELECT path,modified_ns,size FROM media_stream_index_state WHERE path IN ({placeholders})", paths
+        ).fetchall()}
+    stale_paths = set()
+    for path in paths:
+        try:
+            stat = Path(path).stat()
+            saved = indexed.get(path)
+            if not saved or int(saved[0] or 0) != int(stat.st_mtime_ns) or int(saved[1] or 0) != int(stat.st_size):
+                stale_paths.add(path)
+        except OSError:
+            stale_paths.add(path)
+    auto_queued = _queue_recoverable_stale_indexes(stale_paths)
+    if auto_queued:
+        index_paths.update(auto_queued)
+    reasons = []
+    if change_paths: reasons.append("changes queued or processing")
+    if index_paths: reasons.append("index update queued or processing")
+    if stale_paths: reasons.append("index needs updating")
+    return {"active": bool(reasons), "reasons": reasons, "changes": len(change_paths), "indexing": len(index_paths), "stale": len(stale_paths)}
+
+
 @app.post("/api/v79/tv/season-stream-values")
 def season_stream_values(request: SeasonStreamRequest) -> dict:
     ensure_tv_stream_index()
@@ -344,7 +401,7 @@ def season_stream_values(request: SeasonStreamRequest) -> dict:
 
 def comparable_language(value: str) -> str:
     normalized = str(value or "").strip().lower()
-    return canonical_language(normalized)
+    return plex_language_pair(normalized, "")[0]
 
 
 def region_matches(stream: dict, expected: str | None) -> bool:
@@ -363,9 +420,9 @@ def filter_matches(stream: dict, filters: SeasonStreamFilter) -> bool:
         for value in selected_pairs if '|' in value
     }
     return (
-        (filters.stream_type is None or stream.get("codec_type") == filters.stream_type)
+        ((filters.stream_types is not None and stream.get("codec_type") in filters.stream_types) or (filters.stream_types is None and (filters.stream_type is None or stream.get("codec_type") == filters.stream_type)))
         and pair_match
-        and (filters.language_regions is not None or filters.language is None or comparable_language(stream.get("language")) == comparable_language(filters.language))
+        and (filters.language_regions is not None or (filters.languages is not None and comparable_language(stream.get("language")) in {comparable_language(value) for value in filters.languages}) or (filters.languages is None and (filters.language is None or comparable_language(stream.get("language")) == comparable_language(filters.language))))
         and (filters.language_regions is not None or region_matches(stream, filters.region))
         and (filters.track_name is None or str(stream.get("title") or "").strip() == filters.track_name)
         and (filters.filename_tag is None or filters.filename_tag in (stream.get("filename_tags") or []))
@@ -505,9 +562,10 @@ def enqueue_tv_filtered_edits(paths: list[str], request: SeasonStreamBulkEdit) -
                 continue
             per_media = {**template, "target_keys": targets[path]}
             payload = json.dumps({"path": path, "request": per_media}, ensure_ascii=False, separators=(",", ":"))
+            task_type = 'tv_filtered_stream_edit_now' if request.mode == 'now' else 'tv_filtered_stream_edit'
             cursor = db.execute(
-                "INSERT INTO task_queue(task_type,label,payload_json,status,progress_message,created_at,updated_at) VALUES('tv_filtered_stream_edit',?,?,'pending','Waiting',?,?)",
-                (f"TV filtered stream edit · {Path(path).name}", payload, now, now),
+                "INSERT INTO task_queue(task_type,label,payload_json,status,progress_message,created_at,updated_at) VALUES(?,?,?,'pending','Waiting',?,?)",
+                (task_type, f"TV filtered stream edit · {Path(path).name}", payload, now, now),
             )
             db.execute("INSERT OR REPLACE INTO media_change_request(task_id,path,requested_at) VALUES(?,?,?)", (cursor.lastrowid, path, now))
             task_ids.append(int(cursor.lastrowid))
@@ -517,6 +575,7 @@ def enqueue_tv_filtered_edits(paths: list[str], request: SeasonStreamBulkEdit) -
 
 
 tasks.TASK_HANDLERS["tv_filtered_stream_edit"] = process_tv_filtered_stream_edit
+tasks.TASK_HANDLERS["tv_filtered_stream_edit_now"] = process_tv_filtered_stream_edit
 
 @app.post("/api/v79/tv/season-stream-bulk-edit")
 def season_stream_bulk_edit(request: SeasonStreamBulkEdit) -> dict:

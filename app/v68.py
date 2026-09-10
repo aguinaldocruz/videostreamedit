@@ -139,6 +139,17 @@ def existing_file_fingerprints(library_key: str) -> dict[str, tuple[int, int]]:
     return {str(row["path"]): (int(row["size"] or 0), int(row["modified"] or 0)) for row in rows}
 
 
+def catalog_paths(items: list[dict]) -> set[str]:
+    """Extract Plex's current part paths without probing files or stream data."""
+    paths: set[str] = set()
+    for item in items:
+        for media in item.get("Media", []):
+            for part in media.get("Part", []):
+                if part.get("file"):
+                    paths.add(str(part["file"]))
+    return paths
+
+
 def file_changed_records(records: list[tuple], previous: dict[str, tuple[int, int]]) -> list[tuple]:
     """Select new, moved, or content-changed files; ignore Plex-only metadata changes."""
     return [
@@ -147,7 +158,7 @@ def file_changed_records(records: list[tuple], previous: dict[str, tuple[int, in
     ]
 
 
-def persist_library(library: dict, records: list[tuple], aliases: list[tuple], watermark: int, rebuild: bool) -> None:
+def persist_library(library: dict, records: list[tuple], aliases: list[tuple], watermark: int, rebuild: bool, current_paths: set[str] | None = None) -> None:
     moved_paths: dict[str, str] = {}
     with plex.connection() as db:
         current_by_key: dict[str, list[str]] = {}
@@ -183,11 +194,50 @@ def persist_library(library: dict, records: list[tuple], aliases: list[tuple], w
             db.executemany("DELETE FROM plex_title_aliases WHERE path=?", [(path,) for path in stale_paths])
         db.executemany("INSERT OR REPLACE INTO plex_media(path,kind,rating_key,library_key,library_name,title,show_title,season_number,episode_number,size,modified,plex_added_at,plex_updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", records)
         db.executemany("INSERT OR REPLACE INTO plex_title_aliases(path,alternatives) VALUES(?,?)", aliases)
+        if current_paths is not None:
+            # Incremental timestamp queries do not return deleted Plex items.
+            # Reconcile against the lightweight full path catalog so removals
+            # disappear even when no remaining item was modified.
+            stale = db.execute("SELECT path FROM plex_media WHERE library_key=?", (library["library_key"],)).fetchall()
+            removed = [row["path"] for row in stale if str(row["path"]) not in current_paths]
+            if removed:
+                db.executemany("DELETE FROM plex_media WHERE path=?", [(path,) for path in removed])
+                db.executemany("DELETE FROM plex_title_aliases WHERE path=?", [(path,) for path in removed])
+                logger.info("plex_sync event=removed_media_reconciled library=%s removed=%d", library["title"].replace("\n", " "), len(removed))
         db.execute("INSERT INTO plex_sync_state(library_key,watermark,last_check,last_rebuild) VALUES(?,?,CURRENT_TIMESTAMP,CASE WHEN ? THEN CURRENT_TIMESTAMP ELSE NULL END) ON CONFLICT(library_key) DO UPDATE SET watermark=excluded.watermark,last_check=CURRENT_TIMESTAMP,last_rebuild=CASE WHEN ? THEN CURRENT_TIMESTAMP ELSE plex_sync_state.last_rebuild END", (library["library_key"], watermark, int(rebuild), int(rebuild)))
     if moved_paths:
         from app.v80 import migrate_index_paths
         migrated = migrate_index_paths(moved_paths)
         logger.info("plex_sync event=moved_paths_reconciled paths=%d queue_items=%d", len(moved_paths), migrated)
+
+
+def clear_reviewed_for_changed_records(records: list[tuple]) -> int:
+    """Clear collection review flags when Plex reports new or changed media.
+
+    Movie notes are keyed by their file path; episode notes are keyed by the
+    synthesized Plex show key used by the TV listing. Notes themselves remain.
+    """
+    cleared = 0
+    with plex.connection() as db:
+        for record in records:
+            kind = str(record[1] or "")
+            if kind == "movie":
+                entity_type, entity_key = "movie", str(record[0])
+            elif kind == "episode":
+                entity_type, entity_key = "tv", f"{record[3]}:{record[6] or 'Unknown show'}"
+            else:
+                continue
+            row = db.execute("SELECT reviewed,note FROM media_notes WHERE entity_type=? AND entity_key=?", (entity_type, entity_key)).fetchone()
+            if not row or not row["reviewed"]:
+                continue
+            if str(row["note"] or "").strip():
+                db.execute("UPDATE media_notes SET reviewed=0,updated_at=CURRENT_TIMESTAMP WHERE entity_type=? AND entity_key=?", (entity_type, entity_key))
+            else:
+                db.execute("DELETE FROM media_notes WHERE entity_type=? AND entity_key=?", (entity_type, entity_key))
+            cleared += 1
+    if cleared:
+        logger.info("plex_sync event=review_status_cleared changed_media=%d", cleared)
+    return cleared
 
 
 def process_plex_sync(task_id: int, payload: dict) -> dict:
@@ -204,18 +254,22 @@ def process_plex_sync(task_id: int, payload: dict) -> dict:
         for number, library in enumerate(libraries, 1):
             tasks.update_progress(task_id, number - 1, len(libraries), f"Checking {library['title']}")
             since = 0 if rebuild else initial_watermark(library["library_key"])
-            items = paged_library(library["library_key"], library["kind"]) if rebuild or not since else changed_library_items(library, since)
+            # A full, metadata-only catalog pass is required to detect Plex
+            # removals; stream/file processing remains incremental below.
+            all_items = paged_library(library["library_key"], library["kind"])
+            items = all_items if rebuild or not since else changed_library_items(library, since)
             records, aliases = rows_for_items(library, items)
             previous = existing_file_fingerprints(library["library_key"])
             changed_records = file_changed_records(records, previous)
-            persist_library(library, records, aliases, started, rebuild)
+            clear_reviewed_for_changed_records(changed_records)
+            persist_library(library, records, aliases, started, rebuild, catalog_paths(all_items))
             if changed_records:
                 from app.v80 import request_media_indexes
                 for record in changed_records:
                     request_media_indexes(str(record[0]), ["core"], "Plex catalog media added or changed")
             changed += len(changed_records)
             catalog_records += len(records)
-            logger.info("plex_sync event=library_processed mode=%s library=%s items=%d media=%d file_changes=%d step=%d total=%d", "rebuild" if rebuild else "incremental", library["title"].replace("\n", "\\n"), len(items), len(records), len(changed_records), number, len(libraries))
+            logger.info("plex_sync event=library_processed mode=%s library=%s items=%d catalog_items=%d media=%d file_changes=%d step=%d total=%d", "rebuild" if rebuild else "incremental", library["title"].replace("\n", "\\n"), len(items), len(all_items), len(records), len(changed_records), number, len(libraries))
         from app.v80 import prune_orphaned_index_entries
         prune_orphaned_index_entries()
         with plex.connection() as db:

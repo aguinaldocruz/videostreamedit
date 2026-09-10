@@ -2,11 +2,15 @@ from __future__ import annotations
 
 import json
 import logging
+import subprocess
+from pathlib import Path
 
-from fastapi import Request
+from fastapi import HTTPException, Request
 from fastapi.responses import HTMLResponse
+from pydantic import BaseModel, Field
 
-from app.v11 import connection, paged_metadata, plex_movies, plex_tv, sync_plex
+from app.v11 import connection, paged_metadata, plex_authorized_file, plex_movies, plex_tv, sync_plex
+from app.v2 import probe
 from app.v16 import STATIC_DIR, app, asset
 
 
@@ -26,6 +30,63 @@ def title_values(item: dict) -> list[str]:
         if value and value.casefold() not in {existing.casefold() for existing in values}:
             values.append(value)
     return values
+
+
+
+class VideoTitleRequest(BaseModel):
+    paths: list[str] = Field(min_length=1, max_length=30000)
+
+
+class VideoTitleEditRequest(BaseModel):
+    path: str
+    title: str = Field(default="", max_length=1000)
+
+
+def first_video_title(path: Path) -> tuple[int, str]:
+    video_index = 0
+    for stream in probe(path).get("streams", []):
+        if stream.get("codec_type") != "video":
+            continue
+        tags = stream.get("tags") or {}
+        return video_index, str(tags.get("title") or "").strip()
+    raise HTTPException(422, "Media has no video stream")
+
+
+@app.post("/api/v19/video-titles")
+def video_titles(request: VideoTitleRequest) -> dict:
+    paths = list(dict.fromkeys(request.paths))
+    if not paths:
+        return {"items": {}}
+    placeholders = ",".join("?" for _ in paths)
+    with connection() as db:
+        rows = db.execute(
+            f"SELECT path,title,video_index FROM media_video_title WHERE path IN ({placeholders})", paths
+        ).fetchall()
+    return {"items": {row["path"]: {"title": row["title"], "index": row["video_index"]} for row in rows}}
+
+
+@app.post("/api/v19/video-title/edit")
+def edit_video_title(request: VideoTitleEditRequest) -> dict:
+    path = plex_authorized_file(request.path)
+    if path.suffix.lower() not in {".mkv", ".mka", ".mks", ".mk3d"}:
+        raise HTTPException(422, "Video track title editing currently requires a Matroska file")
+    with connection() as db:
+        old = db.execute("SELECT title FROM media_video_title WHERE path=?", (str(path),)).fetchone()
+    current = str(old["title"] if old else "")
+    command = ["mkvpropedit", str(path), "--edit", "track:v1"]
+    if request.title.strip(): command += ["--set", f"name={request.title.strip()}"]
+    else: command += ["--delete", "name"]
+    try:
+        subprocess.run(command, capture_output=True, text=True, timeout=120, check=True)
+    except FileNotFoundError as exc:
+        raise HTTPException(503, "mkvpropedit is not installed") from exc
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        raise HTTPException(422, (getattr(exc, "stderr", None) or "Video track title update failed")[-2000:]) from exc
+    title = request.title.strip(); stat = path.stat()
+    with connection() as db:
+        db.execute("INSERT OR REPLACE INTO media_video_title(path,title,video_index,modified_ns,size,indexed_at) VALUES(?,?,?,?,?,CURRENT_TIMESTAMP)", (str(path), title, 0, stat.st_mtime_ns, stat.st_size))
+    logger.info("change=video_track_title file=%s from=%s to=%s", str(path).replace("\n", "\\n"), current, title)
+    return {"path": str(path), "title": title}
 
 
 @app.post("/api/v19/plex/sync")

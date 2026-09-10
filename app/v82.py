@@ -11,9 +11,10 @@ import app.v54 as indexes
 import app.v65 as tasks
 import app.v79 as tv_bulk
 import app.v80 as queues
-from app.v5 import external_subtitles, split_tag
+from app.v5 import external_subtitles, split_tag, plex_language_pair
 from app.v11 import connection
 from app.v13 import media_details_with_ietf
+from app.v2 import probe
 from app.v43 import optimized_media_edit
 from app.v7 import ReorderEditRequest
 from app.v81 import app
@@ -45,6 +46,11 @@ def ensure_unified_index() -> None:
                 name TEXT PRIMARY KEY, count INTEGER NOT NULL DEFAULT 0,
                 total REAL NOT NULL DEFAULT 0, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
+            CREATE TABLE IF NOT EXISTS media_video_title (
+                path TEXT PRIMARY KEY, title TEXT NOT NULL DEFAULT '', video_index INTEGER NOT NULL DEFAULT 0,
+                modified_ns INTEGER NOT NULL, size INTEGER NOT NULL, indexed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS media_video_title_path ON media_video_title(path);
         """)
 
 
@@ -54,9 +60,17 @@ def fast_streams(path: Path) -> list[dict]:
         try:
             result = subprocess.run(["mkvmerge", "-J", str(path)], capture_output=True, text=True, timeout=90, check=True)
             counters = {"audio": 0, "subtitle": 0}
+            video_title = ""
+            video_index = 0
             detailed_streams = None
             for track in json.loads(result.stdout).get("tracks", []):
                 kind = "subtitle" if track.get("type") == "subtitles" else track.get("type")
+                if kind == "video":
+                    properties = track.get("properties") or {}
+                    if not video_title:
+                        video_title = str(properties.get("track_name") or "").strip()
+                    video_index += 1
+                    continue
                 if kind not in counters:
                     continue
                 properties = track.get("properties") or {}
@@ -65,13 +79,14 @@ def fast_streams(path: Path) -> list[dict]:
                     language = "pt"
                 elif language == "eng":
                     language = "en"
+                language, region = plex_language_pair(language, region)
                 type_index = counters[kind]
                 language = tv_bulk.comparable_language(language)
                 # mkvmerge may expose only the legacy ISO-639 code (for example
                 # ``por``), while the editor also reads the BCP-47 region from
                 # FFmpeg tags.  Reconcile Portuguese tracks lazily so filters
                 # and the editor always use the same language/region pair.
-                if language == "pt" and not region:
+                if language in {"", "und"} or (language == "pt" and not region):
                     try:
                         if detailed_streams is None:
                             detailed_streams = media_details_with_ietf(str(path)).get("streams", [])
@@ -87,7 +102,18 @@ def fast_streams(path: Path) -> list[dict]:
             streams = []
     if not streams:
         details = media_details_with_ietf(str(path))
-        streams = [{"source": "embedded", "stream_type": item["codec_type"], "type_index": int(item["type_index"]), "external_path": "", "codec": str(item.get("codec") or "unknown"), "language": str(item.get("language") or ""), "region": str(item.get("region") or ""), "track_name": str(item.get("title") or ""), "default": bool(item.get("default")), "forced": bool(item.get("forced")), "filename_tags": []} for item in details.get("streams", [])]
+        streams = [{"source": "embedded", "stream_type": item["codec_type"], "type_index": int(item["type_index"]), "external_path": "", "codec": str(item.get("codec") or "unknown"), "language": str(item.get("language") or ""), "region": str(item.get("region") or ""), "track_name": str(item.get("title") or ""), "default": bool(item.get("default")), "forced": bool(item.get("forced")), "filename_tags": []} for item in details.get("streams", []) if item.get("codec_type") in {"audio", "subtitle"}]
+        video_title = ""
+        video_index = 0
+        try:
+            for stream in probe(path).get("streams", []):
+                if stream.get("codec_type") == "video":
+                    if not video_title:
+                        video_title = str((stream.get("tags") or {}).get("title") or "").strip()
+                    video_index += 1
+        except Exception:
+            pass
+    streams.append({"source": "__video_meta__", "stream_type": "video", "type_index": 0, "external_path": "", "codec": "", "language": "", "region": "", "track_name": video_title, "default": False, "forced": False, "filename_tags": [], "video_index": max(0, video_index - 1)})
     for item in external_subtitles(path):
         streams.append({"source": "external", "stream_type": "external", "type_index": -1, "external_path": str(item["path"]), "codec": str(item.get("codec") or ""), "language": str(item.get("language") or ""), "region": str(item.get("region") or ""), "track_name": str(item.get("title") or ""), "default": False, "forced": bool(item.get("forced")), "filename_tags": item.get("filename_tags") or []})
     return streams
@@ -97,12 +123,15 @@ def unified_core_index(item: dict) -> None:
     ensure_unified_index()
     path = Path(item["path"])
     values = fast_streams(path)
+    video_meta = next((value for value in values if value.get("source") == "__video_meta__"), {"track_name": "", "video_index": 0})
+    values = [value for value in values if value.get("source") != "__video_meta__"]
     stat = path.stat()
     with connection() as db:
         kind = db.execute("SELECT kind FROM plex_media WHERE path=?", (str(path),)).fetchone()
         db.execute("DELETE FROM media_stream_index WHERE path=?", (str(path),))
         db.executemany("INSERT INTO media_stream_index(path,source,stream_type,type_index,external_path,codec,language,region,track_name,is_default,is_forced,filename_tags) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", [(str(path), value["source"], value["stream_type"], value["type_index"], value["external_path"], value["codec"], value["language"], value["region"], value["track_name"], int(value["default"]), int(value["forced"]), json.dumps(value["filename_tags"], ensure_ascii=False)) for value in values])
         db.execute("INSERT OR REPLACE INTO media_stream_index_state(path,modified_ns,size,schema_version,indexed_at) VALUES(?,?,?,2,CURRENT_TIMESTAMP)", (str(path), stat.st_mtime_ns, stat.st_size))
+        db.execute("INSERT OR REPLACE INTO media_video_title(path,title,video_index,modified_ns,size,indexed_at) VALUES(?,?,?,?,?,CURRENT_TIMESTAMP)", (str(path), str(video_meta.get("track_name") or ""), int(video_meta.get("video_index") or 0), stat.st_mtime_ns, stat.st_size))
         if kind and kind["kind"] == "movie":
             db.execute("DELETE FROM movie_stream_index_value WHERE path=?", (str(path),))
             db.executemany("INSERT INTO movie_stream_index_value(path,stream_type,language,track_name) VALUES(?,?,?,?)", [(str(path), "subtitle" if value["stream_type"] == "external" else value["stream_type"], value["language"], value["track_name"]) for value in values])
@@ -159,6 +188,12 @@ def initialize_unified_stream_index() -> None:
             db.execute("INSERT INTO feature_migrations(name) VALUES('canonical_index_design_v3')")
             db.execute("INSERT INTO index_task_queue(job,path,reason,status,created_at,updated_at) SELECT 'core',path,'Canonical index design v3 migration','pending',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP FROM plex_media")
             logger.info("core_index event=canonical_migration_queued version=3")
+
+        language_migration = db.execute("SELECT 1 FROM feature_migrations WHERE name=\"plex_language_semantics_v4\"").fetchone()
+        if not language_migration:
+            db.execute("INSERT INTO index_task_queue(job,path,reason,status,created_at,updated_at) SELECT \"core\",path,\"Plex language semantics v4 migration\",\"pending\",CURRENT_TIMESTAMP,CURRENT_TIMESTAMP FROM (SELECT DISTINCT path FROM media_stream_index WHERE lower(language)=\"und\") media WHERE NOT EXISTS (SELECT 1 FROM index_task_queue q WHERE q.job=\"core\" AND q.path=media.path AND q.status IN (\"pending\",\"running\"))")
+            db.execute("INSERT INTO feature_migrations(name) VALUES(\"plex_language_semantics_v4\")")
+            logger.info("core_index event=plex_language_semantics_migration_queued version=4")
 
 
 def selected_movies(paths: list[str]) -> list[dict]:
@@ -237,9 +272,10 @@ def enqueue_filtered_movie_edits(paths: list[str], request: MovieStreamBulkEdit)
                 continue
             per_media = {**template, "target_keys": targets[path]}
             payload = json.dumps({"path": path, "request": per_media}, ensure_ascii=False, separators=(",", ":"))
+            task_type = 'filtered_stream_edit_now' if request.mode == 'now' else 'filtered_stream_edit'
             cursor = db.execute(
-                "INSERT INTO task_queue(task_type,label,payload_json,status,progress_message,created_at,updated_at) VALUES('filtered_stream_edit',?,?,'pending','Waiting',?,?)",
-                (f"Movie filtered stream edit · {Path(path).name}", payload, now, now),
+                "INSERT INTO task_queue(task_type,label,payload_json,status,progress_message,created_at,updated_at) VALUES(?,?,?,'pending','Waiting',?,?)",
+                (task_type, f"Movie filtered stream edit · {Path(path).name}", payload, now, now),
             )
             db.execute("INSERT OR REPLACE INTO media_change_request(task_id,path,requested_at) VALUES(?,?,?)", (cursor.lastrowid, path, now))
             task_ids.append(int(cursor.lastrowid))
@@ -250,6 +286,7 @@ def enqueue_filtered_movie_edits(paths: list[str], request: MovieStreamBulkEdit)
 
 
 tasks.TASK_HANDLERS["filtered_stream_edit"] = process_filtered_stream_edit
+tasks.TASK_HANDLERS["filtered_stream_edit_now"] = process_filtered_stream_edit
 
 
 @app.post("/api/v82/movies/stream-bulk-edit")
@@ -306,15 +343,20 @@ def unified_pending_index_items(job: str) -> list[dict]:
         return []
     with connection() as db:
         rows = [dict(row) for row in db.execute(
-            """SELECT p.path,p.title,s.modified_ns,s.size AS indexed_size,s.schema_version
+            """SELECT p.path,p.title,s.modified_ns,s.size AS indexed_size,s.schema_version,
+                      v.modified_ns AS video_modified_ns,v.size AS video_size
                FROM plex_media p LEFT JOIN media_stream_index_state s ON s.path=p.path
+               LEFT JOIN media_video_title v ON v.path=p.path
                ORDER BY p.path"""
         )]
     pending: dict[str, dict] = {}
     for item in rows:
         try:
             stat = Path(item["path"]).stat()
-            if item["modified_ns"] != stat.st_mtime_ns or item["indexed_size"] != stat.st_size or item["schema_version"] != 2:
+            if (item["modified_ns"] != stat.st_mtime_ns or item["indexed_size"] != stat.st_size
+                    or item["schema_version"] != 2
+                    or item["video_modified_ns"] != stat.st_mtime_ns
+                    or item["video_size"] != stat.st_size):
                 pending[item["path"]] = {"path": item["path"], "title": item["title"], "modified": int(stat.st_mtime), "size": stat.st_size}
         except OSError:
             pending[item["path"]] = {"path": item["path"], "title": item["title"], "modified": 0, "size": 0}
@@ -329,6 +371,7 @@ def clear_unified_index(job: str) -> None:
         with connection() as db:
             db.execute("DELETE FROM media_stream_index")
             db.execute("DELETE FROM media_stream_index_state")
+            db.execute("DELETE FROM media_video_title")
     _original_clear_index(job)
 
 

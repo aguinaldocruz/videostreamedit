@@ -3,8 +3,15 @@ const originalFetch = window.fetch.bind(window);
 
 function isApplicationRequest(resource) {
   const value = typeof resource === 'string' ? resource : resource?.url || '';
-  try { return new URL(value, window.location.href).pathname.startsWith('/api/'); }
-  catch (_) { return value.startsWith('/api/'); }
+  try {
+    const path = new URL(value, window.location.href).pathname;
+    // These endpoints only load/filter cached values. Their screens already
+    // show a local loading state; they must not block the whole page with the
+    // processing overlay while a large season is being expanded.
+    if (path === '/api/v79/tv/show-status' || path === '/api/v79/tv/season-stream-values' || path === '/api/v82/movies/stream-values'
+        || path === '/api/v8/saved-values' || path === '/api/v8/value-uses' || path === '/api/v86/language-region-use') return false;
+    return path.startsWith('/api/');
+  } catch (_) { return value.startsWith('/api/'); }
 }
 
 function busyContext(resource, options) {

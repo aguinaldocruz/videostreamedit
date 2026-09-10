@@ -49,7 +49,16 @@
     }).catch(error => console.warn('Could not record language selection usage', error));
   }
 
-  function makeSelector(values, selected, unchanged, multiple = false) {
+  function syncHiddenValue(input) {
+    // The hidden language/region inputs still need their normal input event
+    // for dirty-state handling, but must not open the inline saved-value menu.
+    const wasSuppressed = typeof suppressSavedComboboxInput !== 'undefined' && suppressSavedComboboxInput;
+    if (typeof suppressSavedComboboxInput !== 'undefined') suppressSavedComboboxInput = true;
+    input.dispatchEvent(new Event('input', {bubbles: true}));
+    if (typeof suppressSavedComboboxInput !== 'undefined') suppressSavedComboboxInput = wasSuppressed;
+  }
+
+  function makeSelector(values, selected, unchanged, multiple = false, compact = false) {
     const select = document.createElement('select');
     select.className = 'language-region-select';
     if (multiple) { select.multiple = true; select.setAttribute('aria-label', 'Language and region filters (multiple selection)'); select.title = 'Hold Ctrl or Command to select multiple values'; }
@@ -60,9 +69,26 @@
       const item = document.createElement('option');
       item.value = '__all__'; item.textContent = 'All languages and regions'; select.append(item);
     }
-    [...new Set(values.filter(value => value !== '__all__').concat(Array.isArray(selected) ? selected.filter(value => !values.includes(value)) : (selected && !values.includes(selected) ? [selected] : [])))]
-      .sort((left, right) => usageFor(right) - usageFor(left) || labelFor(left).localeCompare(labelFor(right)))
-      .forEach(value => option(select, value, selected));
+    const isSentinel = value => {
+      const key = String(value || '').trim().toLowerCase();
+      return key === '__all__' || key === '__unchanged__' || key === '__load_more__' || key.startsWith('__unchanged__|');
+    };
+    const selectedValues = Array.isArray(selected)
+      ? selected.filter(value => !isSentinel(value) && !values.includes(value))
+      : (selected && !isSentinel(selected) && !values.includes(selected) ? [selected] : []);
+    const ordered = [...new Set(values.filter(value => !isSentinel(value)).concat(selectedValues))]
+      .sort((left, right) => usageFor(right) - usageFor(left) || labelFor(left).localeCompare(labelFor(right)));
+    const visible = compact && ordered.length > 4 ? ordered.slice(0, 4) : ordered;
+    if (compact && ordered.length > 4 && !Array.isArray(selected) && selected && !visible.includes(selected)) {
+      visible[visible.length - 1] = selected;
+    }
+    visible.forEach(value => option(select, value, selected));
+    if (compact && ordered.length > 4) {
+      const more = document.createElement('option');
+      more.value = '__load_more__';
+      more.textContent = 'Load more…';
+      select.append(more);
+    }
     return select;
   }
 
@@ -79,19 +105,30 @@
         const languageCode = value.split('|')[0];
         return [value, ...savedRegions.map(regionCode => normalized(languageCode, regionCode))];
       });
-      const select = makeSelector([...common, ...savedPairs], current, false);
-      select.setAttribute('aria-label', 'Language and region');
+      const values = [...common, ...savedPairs];
+      let expanded = false;
+      let selectedValue = current;
+      let select;
+      const rebuild = () => {
+        const previous = selectedValue;
+        select?.remove();
+        select = makeSelector(values, previous, false, false, !expanded);
+        select.setAttribute('aria-label', 'Language and region');
+        language.before(select);
+        select.onchange = () => {
+          if (select.value === '__load_more__') { expanded = true; rebuild(); return; }
+          selectedValue = select.value;
+          recordSelection(select.value);
+          const [nextLanguage, nextRegion] = select.value.split('|');
+          language.value = nextLanguage; region.value = nextRegion;
+          language.dataset.dirty = 'true'; region.dataset.dirty = 'true';
+          syncHiddenValue(language);
+          syncHiddenValue(region);
+        };
+      };
       language.classList.add('language-region-internal');
       region.classList.add('language-region-internal');
-      language.before(select);
-      select.onchange = () => {
-        recordSelection(select.value);
-        const [nextLanguage, nextRegion] = select.value.split('|');
-        language.value = nextLanguage; region.value = nextRegion;
-        language.dataset.dirty = 'true'; region.dataset.dirty = 'true';
-        language.dispatchEvent(new Event('input', {bubbles: true}));
-        region.dispatchEvent(new Event('input', {bubbles: true}));
-      };
+      rebuild();
     });
     const head = root.querySelector('.stream-grid.v7.head');
     if (head && !head.dataset.languageRegionReady) {
@@ -116,18 +153,28 @@
     wrapper.textContent = 'Language / region';
     const values = [...common];
     for (const value of ((typeof v8Saved !== "undefined" && v8Saved.language) || [])) values.push(normalized(value, ''));
-    const select = makeSelector(values, '', true);
-    wrapper.append(select);
-    languageLabel.before(wrapper);
-    select.onchange = () => {
-      if (select.value === '__unchanged__') return;
-      recordSelection(select.value);
-      const [nextLanguage, nextRegion] = select.value.split('|');
-      language.value = nextLanguage; region.value = nextRegion;
-      language.dataset.dirty = 'true'; region.dataset.dirty = 'true';
-      language.dispatchEvent(new Event('input', {bubbles: true}));
-      region.dispatchEvent(new Event('input', {bubbles: true}));
+    let expanded = false;
+    let selectedValue = '__unchanged__';
+    let select;
+    const rebuild = () => {
+      const previous = selectedValue;
+      select?.remove();
+      select = makeSelector(values, previous, true, false, !expanded);
+      wrapper.append(select);
+      select.onchange = () => {
+        if (select.value === '__load_more__') { expanded = true; rebuild(); return; }
+        if (select.value === '__unchanged__') return;
+        selectedValue = select.value;
+        recordSelection(select.value);
+        const [nextLanguage, nextRegion] = select.value.split('|');
+        language.value = nextLanguage; region.value = nextRegion;
+        language.dataset.dirty = 'true'; region.dataset.dirty = 'true';
+        syncHiddenValue(language);
+        syncHiddenValue(region);
+      };
     };
+    languageLabel.before(wrapper);
+    rebuild();
   }
 
   function enhanceFilter(container, records) {
@@ -135,50 +182,51 @@
     if (!filters || filters.dataset.languageRegionReady) return;
     const language = filters.querySelector('[data-season-field=language]');
     const region = filters.querySelector('[data-season-field=region]');
+    const streamControl = filters.querySelector('[data-season-field=stream]');
+    const trackControl = filters.querySelector('[data-season-field=track_name]');
     if (!language || !region) return;
     filters.dataset.languageRegionReady = 'true';
     language.closest('label').classList.add('language-region-internal');
     region.closest('label').classList.add('language-region-internal');
     const wrapper = document.createElement('label');
     wrapper.textContent = 'Language / region';
-    const pairs = [...new Set((records || []).map(item => normalized(item.language, item.region)))];
-    const select = makeSelector(['__all__', ...pairs], '__all__', false);
-    wrapper.append(select);
+    let select;
+    function rebuildPairs() {
+      const stream = streamControl?.value || '__all__';
+      const track = trackControl?.value || '__all__';
+      const previous = select?.value || '__all__';
+      const pairs = [...new Set((records || [])
+        .filter(item => stream === '__all__' || String(item.stream_type).toLowerCase() === String(stream).toLowerCase())
+        .filter(item => track === '__all__' || (track === '__empty__' ? !item.track_name : item.track_name === track))
+        .map(item => normalized(item.language, item.region)))];
+      const initial = filters.parentElement?.dataset.initialSingleton === 'true' && pairs.length === 1 ? pairs[0] : (pairs.includes(previous) ? previous : '__all__');
+      const next = makeSelector(['__all__', ...pairs], initial, false);
+      select?.replaceWith(next);
+      select = next;
+      if (filters.parentElement?.dataset.initialSingleton === 'true') delete filters.parentElement.dataset.initialSingleton;
+      if (initial !== '__all__') {
+        const [initialLanguage, initialRegion] = initial.split('|');
+        language.value = initialLanguage || '__empty__';
+        region.value = initialRegion || '__empty__';
+      }
+      select.onchange = () => {
+        let selected = [...select.selectedOptions].map(item => item.value);
+        if (!selected.length || selected.includes('__all__')) { selected = []; language.value = '__all__'; region.value = '__all__'; }
+        else {
+          const [nextLanguage, nextRegion] = selected[0].split('|');
+          language.value = nextLanguage || '__empty__'; region.value = nextRegion || '__empty__';
+        }
+        select.dataset.selectedValues = selected.join('\u001f');
+        selected.filter(value => !value.startsWith('__')).forEach(recordSelection);
+        streamControl?.dispatchEvent(new Event('change', {bubbles: true}));
+      };
+    }
+    wrapper.append(document.createElement('select'));
+    select = wrapper.lastElementChild;
     language.closest('label').before(wrapper);
-    select.onchange = () => {
-      let selected = [...select.selectedOptions].map(item => item.value);
-      if (selected.includes('__all__') && selected.length > 1) {
-        selected = selected.filter(value => value !== '__all__');
-        [...select.options].forEach(item => { item.selected = selected.includes(item.value); });
-      }
-      if (!selected.length || selected.includes('__all__')) { language.value = '__all__'; region.value = '__all__'; }
-      else {
-        const [nextLanguage, nextRegion] = selected[0].split('|');
-        language.value = nextLanguage || '__empty__';
-        region.value = nextRegion || '__empty__';
-      }
-      select.dataset.selectedValues = selected.join('\u001f');
-      selected.filter(value => !value.startsWith('__')).forEach(recordSelection);
-      region.dispatchEvent(new Event('change', {bubbles: true}));
-      const stream = filters.querySelector('[data-season-field=stream]')?.value || '__all__';
-      const trackName = filters.querySelector('[data-season-field=track_name]');
-      if (!trackName) return;
-      const selectedPairs = selected.filter(value => !value.startsWith('__'));
-      const names = [...new Set((records || [])
-        .filter(item => (stream === '__all__' || item.stream_type === stream)
-          && (!selectedPairs.length || selectedPairs.includes(normalized(item.language, item.region))))
-        .map(item => item.track_name))].sort((left, right) => left.localeCompare(right));
-      const previous = trackName.value;
-      trackName.innerHTML = '<option value="__all__">All track names</option>';
-      names.forEach(name => {
-        const item = document.createElement('option');
-        item.value = name === '' ? '__empty__' : name;
-        item.textContent = name === '' ? '<empty>' : name;
-        trackName.append(item);
-      });
-      trackName.value = [...trackName.options].some(item => item.value === previous) ? previous : '__all__';
-      if (trackName.value !== previous) trackName.dispatchEvent(new Event('change', {bubbles: true}));
-    };
+    rebuildPairs();
+    streamControl?.addEventListener('change', rebuildPairs);
+    trackControl?.addEventListener('change', rebuildPairs);
   }
 
   function relabelLegacyMovieFilter() {
@@ -189,12 +237,29 @@
     });
   }
 
+  // Older selector instances could expose the internal sentinel as a normal
+  // option.  Normalize any already-rendered selectors as well as new ones.
+  function sanitizeSelectors(root = document) {
+    root.querySelectorAll('.language-region-select option').forEach(item => {
+      const key = String(item.value || '').trim().toLowerCase();
+      if (key === '__unchanged__') {
+        const select = item.parentElement;
+        const prior = select?.querySelector('option[data-unchanged-normalized="true"]');
+        if (prior && prior !== item) { item.remove(); return; }
+        if (item.dataset.unchangedNormalized !== 'true') item.dataset.unchangedNormalized = 'true';
+        if (item.textContent !== 'Leave unchanged') item.textContent = 'Leave unchanged';
+      }
+      else if (key === 'unchanged' || key === 'unchanged|' || key.startsWith('__unchanged__|')) item.remove();
+    });
+  }
+
   const observer = new MutationObserver(() => {
     enhanceStreamRows(document.querySelector('#stream-content') || document);
     enhanceBulkEditor(document.querySelector('.season-stream-editor'));
     enhanceBulkEditor(document.querySelector('.movie-header-stream-editor'));
     enhanceFilter(document.querySelector('#season-stream-filter-content'), window.currentTvStreamRecords || []);
     enhanceFilter(document.querySelector('#movie-header-stream-filter-content'), window.currentMovieStreamRecords || []);
+    sanitizeSelectors();
     relabelLegacyMovieFilter();
   });
   observer.observe(document.body, {childList: true, subtree: true});

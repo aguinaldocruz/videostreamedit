@@ -37,3 +37,27 @@
 
 .season-stream-editor,.movie-header-stream-editor{overflow-x:visible!important;overflow-y:visible!important}.bulk-actions{margin-left:.8rem!important}
 .bulk-actions [data-season-edit-close],.bulk-actions [data-movie-edit-close],.bulk-actions [data-season-edit-close][aria-label="Close editor"] { margin-left:auto!important; }
+
+/* TV show title and operational status share the centered header area. */
+.episode-heading>div:first-child{display:flex!important;flex:1 1 auto;min-width:0;align-items:center;justify-content:center;gap:.7rem;overflow:visible!important}
+.episode-heading>div:first-child>h3{margin:0;max-width:min(52vw,38rem);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.episode-heading>div:first-child>p{display:none}
+.tv-show-status{flex:0 0 auto;padding:.2rem .55rem;border:1px solid #d49b52;border-radius:999px;color:#f0c078;background:#5b3d1d;font-size:.68rem;font-weight:700;white-space:nowrap}
+.tv-show-status.hidden{display:none!important}
+.tv-show-status.busy{border-color:#e69b9b;color:#ffc1c1;background:#542b32}
+@media(max-width:760px){.episode-heading>div:first-child>h3{max-width:45vw}}
+
+.video-title-metadata {
+  border: 0;
+  padding: 0 0 0 .3rem;
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  cursor: pointer;
+}
+.video-title-metadata:hover { color: var(--accent); text-decoration: underline; }
+#video-title-dialog { width: min(560px, 92vw); }
+#video-title-dialog label { display: grid; gap: .4rem; color: var(--muted); }
+
+.season-language-removal{padding:.2rem .45rem;font-size:.7rem;font-weight:700}.language-selection-actions{display:flex;gap:.4rem;flex-wrap:wrap;margin:.4rem 0 .7rem}.language-selection-actions button{padding:.3rem .55rem;font-size:.72rem}.season-language-removal[hidden]{display:none!important}.show-pane{min-height:0;overflow-y:auto}.episode-pane{min-height:0;overflow-y:auto}.tv-layout{height:calc(100vh - 112px);min-height:0}
+.season-language-preview-out{display:none!important}

@@ -102,7 +102,7 @@ def index_previews(item: dict) -> None:
     except (TypeError, ValueError):
         duration = 0
     (temporary / "duration.txt").write_text(str(duration), encoding="ascii")
-    audio_index = subtitle_index = audio_files = subtitle_files = 0
+    audio_index = audio_files = 0
     try:
         for stream in details.get("streams", []):
             kind = stream.get("codec_type")
@@ -114,18 +114,11 @@ def index_previews(item: dict) -> None:
                     if data:
                         target.write_bytes(data); audio_files += 1
                 audio_index += 1
-            elif kind == "subtitle":
-                codec = str(stream.get("codec_name") or "")
-                if codec in {"subrip", "srt", "ass", "ssa", "webvtt", "mov_text", "text"}:
-                    data = run_quiet(["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-i", str(path), "-map", f"0:s:{subtitle_index}", "-t", "300", "-f", "srt", "pipe:1"])
-                    if data:
-                        (temporary / f"subtitle-{subtitle_index}.srt").write_bytes(data); subtitle_files += 1
-                subtitle_index += 1
         shutil.rmtree(folder, ignore_errors=True)
         temporary.rename(folder)
         total_bytes = sum(file.stat().st_size for file in folder.iterdir() if file.is_file())
         with connection() as db:
-            db.execute("INSERT OR REPLACE INTO preview_cache_index(path,modified,size,audio_files,subtitle_files,cache_bytes,indexed_at) VALUES(?,?,?,?,?,?,datetime('now'))", (str(path), item["modified"], item["size"], audio_files, subtitle_files, total_bytes))
+            db.execute("INSERT OR REPLACE INTO preview_cache_index(path,modified,size,audio_files,subtitle_files,cache_bytes,indexed_at) VALUES(?,?,?,?,?,?,datetime('now'))", (str(path), item["modified"], item["size"], audio_files, 0, total_bytes))
     except Exception:
         shutil.rmtree(temporary, ignore_errors=True)
         raise
@@ -179,8 +172,8 @@ def status(job: str) -> dict:
         result["indexed"] = db.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
         result["movies"] = db.execute("SELECT count(*) FROM plex_media WHERE kind='movie'").fetchone()[0]
         if job == "previews":
-            row = db.execute("SELECT coalesce(sum(audio_files),0),coalesce(sum(subtitle_files),0),coalesce(sum(cache_bytes),0) FROM preview_cache_index").fetchone()
-            result.update(audio_files=row[0], subtitle_files=row[1], cache_bytes=row[2])
+            row = db.execute("SELECT coalesce(sum(audio_files),0),coalesce(sum(cache_bytes),0) FROM preview_cache_index").fetchone()
+            result.update(audio_files=row[0], cache_bytes=row[1])
     result["pending"] = max(0, result["total"] - result["completed"]) if result["running"] else len(pending(job))
     return result
 

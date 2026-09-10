@@ -44,6 +44,15 @@ def canonical_language(value: str) -> str:
     return ISO_639_TO_1.get(normalized, normalized)
 
 
+def plex_language_pair(language, region=None):
+    """Return stream language/region using Plex semantics."""
+    language = canonical_language(language or "")
+    region = str(region or "").strip().upper()
+    if language == "pt" and not region:
+        region = "PT"
+    return language, region
+
+
 REGION_CODES = {"BR", "PT", "US", "GB", "CA", "AU", "NZ", "MX", "ES", "FR", "DE", "IT", "JP", "KR", "CN", "TW", "HK", "RU", "IN"}
 SUBTITLE_FILENAME_MARKERS = {
     "forced": "Forced", "force": "Forced", "foreign": "Forced",
@@ -124,6 +133,8 @@ def external_filename_metadata(suffix: str) -> tuple[str, str, list[str]]:
         marker = "Hearing impaired" if hearing_impaired else SUBTITLE_FILENAME_MARKERS.get(lowered.replace("_", ""))
         if marker and marker not in labels:
             labels.append(marker)
+    if language == "pt" and not region:
+        region = "PT"
     return language, region, labels
 
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
 import subprocess
@@ -118,6 +119,33 @@ def matroska_metadata_command(source: Path, request: media_editor.ReorderEditReq
     return command if edits else []
 
 
+def _verify_language_updates(source: Path, request: media_editor.ReorderEditRequest) -> list[str]:
+    """Verify that requested BCP-47 tags survived the metadata edit."""
+    requested = {(item.codec_type, item.type_index): item for item in request.tracks if item.language is not None or item.region is not None}
+    if not requested:
+        return []
+    try:
+        result = subprocess.run(["mkvmerge", "-J", str(source)], capture_output=True, text=True, timeout=120, check=True)
+        tracks = {"audio": [], "subtitle": []}
+        for track in json.loads(result.stdout).get("tracks", []):
+            kind = "subtitle" if track.get("type") == "subtitles" else track.get("type")
+            if kind in tracks:
+                tracks[kind].append(track.get("properties") or {})
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
+        raise HTTPException(422, f"Could not verify language metadata: {exc}") from exc
+    mismatches = []
+    for (kind, index), update in requested.items():
+        if index >= len(tracks[kind]):
+            mismatches.append(f"{kind} {index + 1}: stream not found")
+            continue
+        props = tracks[kind][index]
+        actual = str(props.get("language_ietf") or props.get("language") or "").strip()
+        expected = make_language(update.language, update.region)
+        # MKVToolNix may expose a three-letter legacy code when no IETF tag was requested.
+        if expected and actual.casefold() != expected.casefold():
+            mismatches.append(f"{kind} {index + 1}: expected {expected}, found {actual or "<empty>"}")
+    return mismatches
+
 def apply_in_place(source: Path, request: media_editor.ReorderEditRequest, typed: dict[str, list[dict]], external_removed: list[Path]) -> dict:
     original = source.stat()
     command = matroska_metadata_command(source, request, typed)
@@ -129,6 +157,14 @@ def apply_in_place(source: Path, request: media_editor.ReorderEditRequest, typed
             raise HTTPException(503, "mkvpropedit is not installed") from exc
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
             raise HTTPException(422, (getattr(exc, "stderr", None) or "Matroska metadata edit failed")[-2000:]) from exc
+        mismatches = _verify_language_updates(source, request)
+        if mismatches:
+            # Retry once with the exact generated command, then fail loudly if
+            # another process or container rewrite removed the requested tag.
+            subprocess.run(command, capture_output=True, text=True, timeout=600, check=True)
+            mismatches = _verify_language_updates(source, request)
+            if mismatches:
+                raise HTTPException(422, "Language metadata verification failed: " + "; ".join(mismatches))
         try:
             os.utime(source, ns=(original.st_atime_ns, original.st_mtime_ns))
         except OSError as exc:

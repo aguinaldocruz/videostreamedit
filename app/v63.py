@@ -55,10 +55,30 @@ def migrate_efficient_preview_cache() -> None:
             db.execute("DELETE FROM preview_cache_index")
             db.execute("DELETE FROM preview_cache_files")
             db.execute("INSERT INTO feature_migrations(name) VALUES('preview_cache_policy_v2')")
+        subtitle_cache_removed = db.execute("SELECT 1 FROM feature_migrations WHERE name='subtitle_preview_cache_removed_v1'").fetchone()
+        if not subtitle_cache_removed:
+            # Remove legacy subtitle preview artifacts while retaining audio cache.
+            db.execute("DELETE FROM preview_cache_files WHERE filename LIKE 'subtitle-%'")
+            db.execute("UPDATE preview_cache_index SET cache_bytes=COALESCE((SELECT SUM(size) FROM preview_cache_files f WHERE f.path=preview_cache_index.path),0)")
+            db.execute("INSERT INTO feature_migrations(name) VALUES('subtitle_preview_cache_removed_v1')")
     if not migrated:
         shutil.rmtree(jobs.CACHE_DIR, ignore_errors=True)
         jobs.CACHE_DIR.mkdir(parents=True, exist_ok=True)
         logger.info("index_job=previews event=cache_policy_migrated policy=first_25_seconds_64k_mono old_cache=cleared")
+    # Legacy subtitle files may not have been registered in the database.
+    removed_subtitle_files = 0
+    for folder in jobs.CACHE_DIR.iterdir():
+        if not folder.is_dir():
+            continue
+        for pattern in ("subtitle-*.srt", "subtitle-*-page-*.json"):
+            for file in folder.glob(pattern):
+                try:
+                    file.unlink()
+                    removed_subtitle_files += 1
+                except OSError:
+                    pass
+    if removed_subtitle_files:
+        logger.info("index_job=previews event=subtitle_cache_removed files=%d", removed_subtitle_files)
 
 
 def cache_limit() -> int:

@@ -4,7 +4,7 @@
   const definitions=[
     ['core','Common filters','Common stream filters queue','Fast language, stream type, region, and track-name updates.'],
     ['subtitles','Subtitles','Extended subtitle properties queue','Markup/style tags, text/graphical classification, and hover details.'],
-    ['previews','Previews','Efficient preview cache queue','On-demand audio samples and internal subtitle previews.']
+    ['previews','Previews','Efficient preview cache queue','On-demand audio samples.']
   ];
   maintenance.innerHTML=`<div class="split-index-shell"><div class="split-index-heading"><h3>Incremental media indexes</h3><p>Each index has an independent queue. Check adds only new or changed movies; rebuild preparation runs in the generic job queue.</p></div><div class="index-queue-tabs" role="tablist" aria-label="Index queues">${definitions.map(([job,label])=>`<button type="button" role="tab" data-index-tab="${job}" aria-controls="index-panel-${job}">${label}</button>`).join('')}</div><div class="split-index-grid">${definitions.map(([job,,title,description],index)=>`<article id="index-panel-${job}" role="tabpanel" data-index-job="${job}"${index?' hidden':''}><div><h3>${title}</h3><p>${description}</p></div><div class="index-maintenance-actions"><button type="button" ${job==='core'?'id="movie-index-check" ':''}data-index-check>Queue check</button><button type="button" ${job==='core'?'id="movie-index-rebuild" ':''}class="danger" data-index-rebuild>Queue rebuild</button></div><p ${job==='core'?'id="movie-index-progress" ':''}class="plex-status" data-index-status>Checking status…</p></article>`).join('')}</div></div>`;
   const previousApi=api;
@@ -17,7 +17,7 @@
   function show(card,status){
     const job=card.dataset.indexJob,text=card.querySelector('[data-index-status]');
     let summary=`${status.running?1:0} running · ${status.queued||0} queued · ${status.failed||0} failed · ${status.indexed||0} indexed${status.paused?' · Paused':''}`;
-    if(job==='previews')summary+=` · ${status.audio_files||0} audio segments · ${status.subtitle_files||0} subtitles · ${bytes(status.cache_bytes||0)}`;
+    if(job==='previews')summary+=` · ${status.audio_files||0} audio segments · ${bytes(status.cache_bytes||0)}`;
     stableText(text,summary);
     let details=card.querySelector('[data-index-queue-items]');
     if(!details){text.insertAdjacentHTML('afterend','<details data-index-queue-items><summary>Queued work and errors</summary><div></div></details>');details=card.querySelector('[data-index-queue-items]')}

@@ -144,12 +144,30 @@ def paged_metadata(key: str, kind: str, metadata_type: int | None = None) -> lis
         start += len(page)
 
 
+def clear_reviewed_for_sync_records(records: list[tuple]) -> int:
+    cleared = 0
+    with connection() as db:
+        for record in records:
+            entity_type, entity_key = ("movie", str(record[0])) if record[1] == "movie" else ("tv", f"{record[3]}:{record[6] or 'Unknown show'}")
+            row = db.execute("SELECT reviewed,note FROM media_notes WHERE entity_type=? AND entity_key=?", (entity_type, entity_key)).fetchone()
+            if not row or not row["reviewed"]:
+                continue
+            if str(row["note"] or "").strip():
+                db.execute("UPDATE media_notes SET reviewed=0,updated_at=CURRENT_TIMESTAMP WHERE entity_type=? AND entity_key=?", (entity_type, entity_key))
+            else:
+                db.execute("DELETE FROM media_notes WHERE entity_type=? AND entity_key=?", (entity_type, entity_key))
+            cleared += 1
+    return cleared
+
+
 @app.post("/api/v11/plex/sync")
 def sync_plex() -> dict:
     with connection() as db:
         selected = [dict(row) for row in db.execute("SELECT library_key,title,kind FROM plex_libraries WHERE selected=1")]
     if not selected: raise HTTPException(400, "Select at least one Plex library")
     records=[]
+    with connection() as db:
+        previous = {str(row["path"]): (str(row["kind"]), int(row["size"] or 0), int(row["modified"] or 0)) for row in db.execute("SELECT path,kind,size,modified FROM plex_media").fetchall()}
     for library in selected:
         show_titles = {str(show.get("ratingKey")): show.get("originalTitle") or show.get("title") for show in paged_metadata(library["library_key"], library["kind"], 2)} if library["kind"] == "show" else {}
         for item in paged_metadata(library["library_key"], library["kind"]):
@@ -159,11 +177,13 @@ def sync_plex() -> dict:
                     path=part.get("file");
                     if not path: continue
                     records.append((path,media_kind,str(item.get("ratingKey", "")),library["library_key"],library["title"],item.get("title") or Path(path).stem,show_titles.get(str(item.get("grandparentRatingKey"))) or item.get("grandparentTitle"),item.get("parentIndex"),item.get("index"),int(part.get("size") or 0),int(item.get("updatedAt") or 0)))
+    changed_records = [record for record in records if previous.get(str(record[0])) != (str(record[1]), int(record[9] or 0), int(record[10] or 0))]
+    cleared_reviews = clear_reviewed_for_sync_records(changed_records)
     with connection() as db:
         db.execute("DELETE FROM plex_media")
         db.executemany("INSERT OR REPLACE INTO plex_media(path,kind,rating_key,library_key,library_name,title,show_title,season_number,episode_number,size,modified) VALUES(?,?,?,?,?,?,?,?,?,?,?)",records)
         db.execute("UPDATE plex_config SET last_sync = datetime('now') WHERE id=1")
-    logger.info("change=plex_catalog_synced libraries=%d media=%d", len(selected), len(records))
+    logger.info("change=plex_catalog_synced libraries=%d media=%d changed=%d reviewed_cleared=%d", len(selected), len(records), len(changed_records), cleared_reviews)
     return {"libraries":len(selected),"media":len(records),"configuration":get_plex_config()}
 
 

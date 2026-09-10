@@ -403,6 +403,39 @@ def queue_state(job: str) -> dict:
             "current": "Index queue", "items": items, "queue": True}
 
 
+def subtitle_index_signature(path: str, job: str) -> tuple:
+    """Capture indexed subtitle rows before/after an index operation."""
+    with connection() as db:
+        if job == "subtitles":
+            rows = db.execute("SELECT source,type_index,external_path,codec,encoding,markup FROM subtitle_extended_index WHERE path=? ORDER BY source,type_index,external_path", (path,)).fetchall()
+            return tuple(tuple(row) for row in rows)
+        rows = []
+        for table in ("media_stream_index", "movie_stream_index_value", "tv_stream_index_value"):
+            try:
+                rows.extend(tuple(row) for row in db.execute(f"SELECT stream_type,language,region,track_name FROM {table} WHERE path=? AND lower(stream_type)='subtitle' ORDER BY stream_type,language,region,track_name", (path,)).fetchall())
+            except Exception:
+                continue
+        return tuple(sorted(rows, key=repr))
+
+
+def clear_reviewed_for_index_change(path: str) -> bool:
+    with connection() as db:
+        row = db.execute("SELECT kind,library_key,show_title FROM plex_media WHERE path=?", (path,)).fetchone()
+        if not row:
+            return False
+        entity_type = "movie" if row["kind"] == "movie" else "tv"
+        entity_key = path if entity_type == "movie" else f"{row['library_key']}:{row['show_title'] or 'Unknown show'}"
+        note = db.execute("SELECT reviewed,note FROM media_notes WHERE entity_type=? AND entity_key=?", (entity_type, entity_key)).fetchone()
+        if not note or not note["reviewed"]:
+            return False
+        if str(note["note"] or "").strip():
+            db.execute("UPDATE media_notes SET reviewed=0,updated_at=CURRENT_TIMESTAMP WHERE entity_type=? AND entity_key=?", (entity_type, entity_key))
+        else:
+            db.execute("DELETE FROM media_notes WHERE entity_type=? AND entity_key=?", (entity_type, entity_key))
+    logger.info("change=review_status_cleared reason=subtitle_index_changed type=%s key=%s", entity_type, entity_key.replace("\n", " ")[:300])
+    return True
+
+
 def worker(job: str) -> None:
     logger.info("index_queue=%s event=worker_started", job)
     processed = 0
@@ -425,6 +458,8 @@ def worker(job: str) -> None:
             if not media.is_file():
                 recovered = resolve_moved_plex_path(path)
                 if not recovered:
+                    from app.v65 import enqueue as enqueue_task
+                    enqueue_task("plex_sync", {"rebuild": False, "source": "missing-index-media"}, "Plex sync requested for missing indexed media", deduplicate=True)
                     raise FileNotFoundError(f"Media file is not accessible and Plex has no accessible replacement: {path}")
                 path = recovered
                 media = Path(path)
@@ -432,13 +467,38 @@ def worker(job: str) -> None:
                     db.execute("UPDATE index_task_queue SET path=?,reason=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (path, "Recovered moved Plex media", row["id"]))
                 logger.info("index_queue=%s event=item_path_recovered id=%d file=%s", job, row["id"], path.replace("\n", "\\n"))
             stat = media.stat()
+            subtitle_before = subtitle_index_signature(path, job) if job in ("core", "subtitles") else ()
             with connection() as db:
                 catalog = db.execute("SELECT title FROM plex_media WHERE path=?", (path,)).fetchone()
             if not catalog:
                 raise RuntimeError("Media is not in the synchronized Plex catalog")
             legacy.processors[job]({"path": path, "title": catalog["title"], "modified": int(stat.st_mtime), "size": stat.st_size})
+            subtitle_after = subtitle_index_signature(path, job) if job in ("core", "subtitles") else subtitle_before
+            subtitle_changed = subtitle_before != subtitle_after
+            # A media operation can finish its final rename/write shortly
+            # after the indexer returns. For edit-triggered core work, require
+            # two identical fingerprints separated by a settling delay before
+            # declaring success.
+            after = media.stat()
+            operation_reason = str(row["reason"] or "").lower()
+            settling = job == "core" and any(token in operation_reason for token in ("edit", "clone", "import", "cleanup", "remux", "outside generic queue"))
+            if settling:
+                time.sleep(0.35)
+                settled = media.stat()
+                time.sleep(0.35)
+                final = media.stat()
+                changed = (after.st_mtime_ns != stat.st_mtime_ns or after.st_size != stat.st_size or
+                           settled.st_mtime_ns != final.st_mtime_ns or settled.st_size != final.st_size)
+            else:
+                changed = after.st_mtime_ns != stat.st_mtime_ns or after.st_size != stat.st_size
             with connection() as db:
-                db.execute("UPDATE index_task_queue SET status='succeeded',finished_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP,error=NULL WHERE id=?", (row["id"],))
+                if changed:
+                    db.execute("UPDATE index_task_queue SET status='pending',finished_at=NULL,updated_at=CURRENT_TIMESTAMP,error='Media changed during indexing; waiting for stable fingerprint' WHERE id=?", (row["id"],))
+                    logger.info("index_queue=%s event=requeued_after_change id=%d file=%s settling=%s", job, row["id"], path.replace("\n", "\\n"), settling)
+                else:
+                    db.execute("UPDATE index_task_queue SET status='succeeded',finished_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP,error=NULL WHERE id=?", (row["id"],))
+            if subtitle_changed:
+                clear_reviewed_for_index_change(path)
             processed += 1
             if processed == 1 or processed % 25 == 0:
                 logger.info("index_queue=%s event=progress processed=%d last_id=%d seconds=%.2f", job, processed, row["id"], time.monotonic()-started)

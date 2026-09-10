@@ -67,8 +67,19 @@ function displayCloneValue(value) {
   return String(value);
 }
 
+function normalizeCloneState(state) {
+  const value = structuredClone(state || {});
+  (value.rows || []).forEach(row => {
+    const language = String(row.language || "").trim().toLowerCase();
+    if (language === "por") row.language = "pt";
+    if (String(row.language || "").toLowerCase() === "pt" && !String(row.region || "").trim()) row.region = "PT";
+    row.region = String(row.region || "").trim().toUpperCase();
+  });
+  return value;
+}
+
 function compatibleCloneState(expected, current) {
-  return JSON.stringify(expected) === JSON.stringify(current);
+  return JSON.stringify(normalizeCloneState(expected)) === JSON.stringify(normalizeCloneState(current));
 }
 
 function readLastChange() {
