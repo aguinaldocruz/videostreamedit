@@ -17,6 +17,7 @@ class MediaNoteRequest(BaseModel):
     entity_key: str = Field(min_length=1, max_length=1000)
     note: str = Field(default="", max_length=4000)
     reviewed: bool | None = None
+    plex_sync_change: bool | None = None
 
 
 @app.on_event("startup")
@@ -40,6 +41,10 @@ def initialize_language_region_usage() -> None:
         """)
         try:
             db.execute("ALTER TABLE media_notes ADD COLUMN reviewed INTEGER NOT NULL DEFAULT 0")
+        except Exception:
+            pass
+        try:
+            db.execute("ALTER TABLE media_notes ADD COLUMN plex_sync_change INTEGER NOT NULL DEFAULT 0")
         except Exception:
             pass
 
@@ -100,30 +105,31 @@ def dashboard_stats() -> dict:
 @app.get("/api/v86/notes")
 def list_media_notes(entity_type: Literal["movie", "tv"] | None = None) -> dict:
     with connection() as db:
-        query = "SELECT entity_type,entity_key,note,reviewed FROM media_notes WHERE (note!='' OR reviewed=1)"
+        query = "SELECT entity_type,entity_key,note,reviewed,plex_sync_change FROM media_notes WHERE (note!='' OR reviewed=1 OR plex_sync_change=1)"
         args = []
         if entity_type:
             query += " AND entity_type=?"; args.append(entity_type)
         rows = db.execute(query, args).fetchall()
-    return {"items": {f"{row['entity_type']}:{row['entity_key']}": {"note": row["note"], "reviewed": bool(row["reviewed"])} for row in rows}, "by_key": {row["entity_key"]: {"note": row["note"], "reviewed": bool(row["reviewed"])} for row in rows}}
+    return {"items": {f"{row['entity_type']}:{row['entity_key']}": {"note": row["note"], "reviewed": bool(row["reviewed"]), "plex_sync_change": bool(row["plex_sync_change"])} for row in rows}, "by_key": {row["entity_key"]: {"note": row["note"], "reviewed": bool(row["reviewed"]), "plex_sync_change": bool(row["plex_sync_change"])} for row in rows}}
 
 
 @app.get("/api/v86/note")
 def get_media_note(entity_type: Literal["movie", "tv"], entity_key: str) -> dict:
     with connection() as db:
-        row = db.execute("SELECT note,reviewed FROM media_notes WHERE entity_type=? AND entity_key=?", (entity_type, entity_key)).fetchone()
-    return {"entity_type": entity_type, "entity_key": entity_key, "note": row["note"] if row else "", "reviewed": bool(row["reviewed"]) if row else False}
+        row = db.execute("SELECT note,reviewed,plex_sync_change FROM media_notes WHERE entity_type=? AND entity_key=?", (entity_type, entity_key)).fetchone()
+    return {"entity_type": entity_type, "entity_key": entity_key, "note": row["note"] if row else "", "reviewed": bool(row["reviewed"]) if row else False, "plex_sync_change": bool(row["plex_sync_change"]) if row else False}
 
 
 @app.put("/api/v86/note")
 def save_media_note(request: MediaNoteRequest) -> dict:
     note = request.note.strip()
     with connection() as db:
-        current = db.execute("SELECT reviewed FROM media_notes WHERE entity_type=? AND entity_key=?", (request.entity_type, request.entity_key)).fetchone()
+        current = db.execute("SELECT reviewed,plex_sync_change FROM media_notes WHERE entity_type=? AND entity_key=?", (request.entity_type, request.entity_key)).fetchone()
         reviewed = bool(request.reviewed) if request.reviewed is not None else bool(current["reviewed"]) if current else False
-        if note or reviewed:
-            db.execute("INSERT INTO media_notes(entity_type,entity_key,note,reviewed,updated_at) VALUES(?,?,?, ?,CURRENT_TIMESTAMP) ON CONFLICT(entity_type,entity_key) DO UPDATE SET note=excluded.note,reviewed=excluded.reviewed,updated_at=CURRENT_TIMESTAMP", (request.entity_type, request.entity_key, note, int(reviewed)))
+        plex_sync_change = bool(request.plex_sync_change) if request.plex_sync_change is not None else bool(current["plex_sync_change"]) if current else False
+        if note or reviewed or plex_sync_change:
+            db.execute("INSERT INTO media_notes(entity_type,entity_key,note,reviewed,plex_sync_change,updated_at) VALUES(?,?,?,?,?,CURRENT_TIMESTAMP) ON CONFLICT(entity_type,entity_key) DO UPDATE SET note=excluded.note,reviewed=excluded.reviewed,plex_sync_change=excluded.plex_sync_change,updated_at=CURRENT_TIMESTAMP", (request.entity_type, request.entity_key, note, int(reviewed), int(plex_sync_change)))
         else:
             db.execute("DELETE FROM media_notes WHERE entity_type=? AND entity_key=?", (request.entity_type, request.entity_key))
-    logger.info("change=media_note_saved type=%s key=%s present=%s reviewed=%s", request.entity_type, request.entity_key.replace("\n", " ")[:200], bool(note), reviewed)
-    return {"entity_type": request.entity_type, "entity_key": request.entity_key, "note": note, "reviewed": reviewed}
+    logger.info("change=media_note_saved type=%s key=%s present=%s reviewed=%s plex_sync_change=%s", request.entity_type, request.entity_key.replace("\n", " ")[:200], bool(note), reviewed, plex_sync_change)
+    return {"entity_type": request.entity_type, "entity_key": request.entity_key, "note": note, "reviewed": reviewed, "plex_sync_change": plex_sync_change}

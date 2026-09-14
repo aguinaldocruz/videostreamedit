@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import re
 import sqlite3
+import subprocess
+import tempfile
 import threading
 import time
 import urllib.parse
@@ -158,6 +162,22 @@ def file_changed_records(records: list[tuple], previous: dict[str, tuple[int, in
     ]
 
 
+def structurally_changed_records(records: list[tuple], previous: dict[str, tuple[int, int]]) -> list[tuple]:
+    """Return changes that are strong evidence of a replacement/new media.
+
+    A modified timestamp alone is not structural: mkvpropedit and other
+    metadata-only edits update mtime without adding/removing media. A new path
+    or a size change is retained here; stream add/remove detection is handled
+    separately by the index worker after it compares stream identities.
+    """
+    result = []
+    for record in records:
+        old = previous.get(str(record[0]))
+        if old is None or int(old[0] or 0) != int(record[9] or 0):
+            result.append(record)
+    return result
+
+
 def persist_library(library: dict, records: list[tuple], aliases: list[tuple], watermark: int, rebuild: bool, current_paths: set[str] | None = None) -> None:
     moved_paths: dict[str, str] = {}
     with plex.connection() as db:
@@ -211,6 +231,29 @@ def persist_library(library: dict, records: list[tuple], aliases: list[tuple], w
         logger.info("plex_sync event=moved_paths_reconciled paths=%d queue_items=%d", len(moved_paths), migrated)
 
 
+def clear_reviewed_for_removed_media(library_key: str, current_paths: set[str]) -> int:
+    """Clear a TV show's review flag when an episode leaves the Plex catalog."""
+    cleared = 0
+    with plex.connection() as db:
+        rows = db.execute("SELECT path,kind,show_title FROM plex_media WHERE library_key=?", (library_key,)).fetchall()
+        seen = set()
+        for row in rows:
+            if str(row["path"]) in current_paths or str(row["path"]) in seen:
+                continue
+            seen.add(str(row["path"]))
+            if row["kind"] != "episode":
+                continue
+            key = f"{library_key}:{row['show_title'] or 'Unknown show'}"
+            note = db.execute("SELECT reviewed,note FROM media_notes WHERE entity_type='tv' AND entity_key=?", (key,)).fetchone()
+            if not note or not note["reviewed"]:
+                continue
+            db.execute("UPDATE media_notes SET plex_sync_change=1,updated_at=CURRENT_TIMESTAMP WHERE entity_type='tv' AND entity_key=?", (key,))
+            cleared += 1
+    if cleared:
+        logger.info("plex_sync event=review_status_cleared reason=media_removed library=%s shows=%d", library_key, cleared)
+    return cleared
+
+
 def clear_reviewed_for_changed_records(records: list[tuple]) -> int:
     """Clear collection review flags when Plex reports new or changed media.
 
@@ -230,10 +273,7 @@ def clear_reviewed_for_changed_records(records: list[tuple]) -> int:
             row = db.execute("SELECT reviewed,note FROM media_notes WHERE entity_type=? AND entity_key=?", (entity_type, entity_key)).fetchone()
             if not row or not row["reviewed"]:
                 continue
-            if str(row["note"] or "").strip():
-                db.execute("UPDATE media_notes SET reviewed=0,updated_at=CURRENT_TIMESTAMP WHERE entity_type=? AND entity_key=?", (entity_type, entity_key))
-            else:
-                db.execute("DELETE FROM media_notes WHERE entity_type=? AND entity_key=?", (entity_type, entity_key))
+            db.execute("UPDATE media_notes SET plex_sync_change=1,updated_at=CURRENT_TIMESTAMP WHERE entity_type=? AND entity_key=?", (entity_type, entity_key))
             cleared += 1
     if cleared:
         logger.info("plex_sync event=review_status_cleared changed_media=%d", cleared)
@@ -261,7 +301,9 @@ def process_plex_sync(task_id: int, payload: dict) -> dict:
             records, aliases = rows_for_items(library, items)
             previous = existing_file_fingerprints(library["library_key"])
             changed_records = file_changed_records(records, previous)
-            clear_reviewed_for_changed_records(changed_records)
+            structural_records = structurally_changed_records(records, previous)
+            clear_reviewed_for_changed_records(structural_records)
+            clear_reviewed_for_removed_media(library["library_key"], catalog_paths(all_items))
             persist_library(library, records, aliases, started, rebuild, catalog_paths(all_items))
             if changed_records:
                 from app.v80 import request_media_indexes
@@ -294,6 +336,84 @@ def process_subtitle_html(task_id: int, payload: dict) -> dict:
 
 tasks.TASK_HANDLERS["plex_sync"] = process_plex_sync
 tasks.TASK_HANDLERS["subtitle_html_cleanup"] = process_subtitle_html
+
+_TESS_LANGUAGES = {"pt": "por", "pt-br": "por", "pt-pt": "por", "en": "eng", "es": "spa", "fr": "fra", "de": "deu", "it": "ita"}
+
+def _ocr_graphical_subtitle(media: Path, type_index: int, language: str) -> Path:
+    if type_index < 0:
+        raise RuntimeError("External image subtitle conversion is not supported without a timed container stream")
+    tess = _TESS_LANGUAGES.get(language.strip().casefold(), language.strip())
+    if not tess or tess.casefold() in {"und", "unknown"}:
+        raise RuntimeError("Image subtitle language is not set or is und")
+    try:
+        packets = subprocess.run(["ffprobe", "-v", "error", "-select_streams", f"s:{type_index}", "-show_entries", "packet=pts_time", "-of", "json", str(media)], capture_output=True, text=True, timeout=120, check=True)
+        timestamps = [float(item["pts_time"]) for item in json.loads(packets.stdout).get("packets", []) if item.get("pts_time") is not None]
+    except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired, ValueError, json.JSONDecodeError) as exc:
+        raise RuntimeError("Could not locate image subtitle events") from exc
+    if not timestamps:
+        raise RuntimeError("Image subtitle contains no timed events")
+    entries = []
+    for number, timestamp in enumerate(timestamps):
+        end = timestamps[number + 1] if number + 1 < len(timestamps) else timestamp + 4.0
+        frame = subprocess.run(["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-ss", f"{max(0, timestamp):.3f}", "-i", str(media), "-filter_complex", f"[0:v:0][0:s:{type_index}]overlay", "-frames:v", "1", "-f", "image2pipe", "-vcodec", "png", "pipe:1"], capture_output=True, timeout=120, check=True)
+        try:
+            text = subprocess.run(["tesseract", "stdin", "stdout", "-l", tess, "--psm", "6"], input=frame.stdout, capture_output=True, text=True, timeout=30, check=True).stdout.strip()
+        except FileNotFoundError as exc:
+            raise RuntimeError("Tesseract OCR is not installed in the container") from exc
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+            raise RuntimeError(f"OCR failed for language {language}") from exc
+        text = re.sub(r"\s+", " ", text).strip()
+        if text:
+            def stamp(value):
+                hours, rest = divmod(value, 3600); minutes, seconds = divmod(rest, 60); millis = int(round((seconds - int(seconds)) * 1000)); seconds = int(seconds)
+                if millis >= 1000: seconds += 1; millis -= 1000
+                return f"{int(hours):02d}:{int(minutes):02d}:{seconds:02d},{millis:03d}"
+            entries.append(f"{len(entries)+1}\n{stamp(timestamp)} --> {stamp(max(timestamp + .2, end))}\n{text}\n")
+    if not entries:
+        raise RuntimeError("OCR produced no subtitle text")
+    output = media.with_name(f".{media.stem}.vse-ocr.srt")
+    output.write_text("\n".join(entries), encoding="utf-8")
+    return output
+
+def process_image_subtitle_convert(task_id: int, payload: dict) -> dict:
+    media = Path(str(payload.get("path") or "")).resolve()
+    if not media.is_file():
+        raise RuntimeError(f"Media is not accessible: {media}")
+    language = str(payload.get("language") or "").strip()
+    if not language or language.casefold() in {"und", "unknown", "zxx"}:
+        raise RuntimeError("Image subtitle language is not set or is und")
+    tasks.update_progress(task_id, 0, 3, "Reading graphical subtitle events")
+    subtitle = _ocr_graphical_subtitle(media, int(payload.get("type_index", -1)), language)
+    tasks.update_progress(task_id, 1, 3, "Replacing graphical subtitle with OCR text")
+    streams = indexes.probe(media).get("streams", []) if hasattr(indexes, "probe") else []
+    if not streams:
+        from app.v2 import probe
+        streams = probe(media).get("streams", [])
+    subtitle_globals = [i for i, stream in enumerate(streams) if stream.get("codec_type") == "subtitle"]
+    selected = subtitle_globals[int(payload.get("type_index", -1))] if 0 <= int(payload.get("type_index", -1)) < len(subtitle_globals) else -1
+    if selected < 0:
+        subtitle.unlink(missing_ok=True); raise RuntimeError("Subtitle stream was not found")
+    temporary = media.with_name(f".{media.stem}.vse-ocr{media.suffix}")
+    command = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-i", str(media), "-i", str(subtitle)]
+    subtitle_output = 0
+    for global_index, stream in enumerate(streams):
+        command += ["-map", "1:0" if global_index == selected else f"0:{global_index}"]
+        if stream.get("codec_type") == "subtitle":
+            if global_index == selected: command += [f"-c:s:{subtitle_output}", "srt"]
+            subtitle_output += 1
+    command += ["-map_metadata", "0", "-map_chapters", "0", "-c", "copy", f"-metadata:s:s:{int(payload.get('type_index', 0))}", f"language={language}", str(temporary)]
+    try:
+        subprocess.run(command, capture_output=True, text=True, timeout=3600, check=True)
+        os.chmod(temporary, media.stat().st_mode); os.replace(temporary, media)
+    finally:
+        subtitle.unlink(missing_ok=True); temporary.unlink(missing_ok=True)
+    tasks.update_progress(task_id, 2, 3, "Queueing subtitle indexes")
+    from app.v80 import request_media_indexes
+    request_media_indexes(str(media), ["subtitles", "core"], "Image subtitle converted to SRT")
+    tasks.update_progress(task_id, 3, 3, "Image subtitle conversion completed")
+    return {"path": str(media), "type_index": int(payload.get("type_index", -1)), "language": language}
+
+tasks.TASK_HANDLERS["image_subtitle_convert"] = process_image_subtitle_convert
 
 
 def plex_schedule_data() -> dict:

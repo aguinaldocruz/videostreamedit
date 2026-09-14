@@ -9,7 +9,7 @@ from fastapi.responses import HTMLResponse
 
 from app.v2 import probe
 from app.v5 import canonical_language, external_subtitles, split_tag, plex_language_pair
-from app.v11 import STATIC_DIR, app, asset, plex_authorized_file
+from app.v11 import STATIC_DIR, app, asset, connection, plex_authorized_file
 
 
 def matroska_tracks(path: Path) -> dict[str, list[dict]]:
@@ -80,4 +80,9 @@ def media_details_with_ietf(path: str) -> dict:
             "forced": bool((stream.get("disposition") or {}).get("forced")),
             "external": False,
         })
-    return {"path": str(media), "streams": streams, "external_subtitles": external_subtitles(media)}
+    with connection() as db:
+        detections = [dict(row) for row in db.execute(
+            "SELECT source,type_index,external_path,metadata_language,detected_language,confidence,evidence "
+            "FROM portuguese_language_detection WHERE path=?", (str(media),)
+        ).fetchall()]
+    return {"path": str(media), "streams": streams, "external_subtitles": external_subtitles(media), "portuguese_detection": detections}

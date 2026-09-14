@@ -12,9 +12,9 @@
   pageTitle.querySelector('h2').textContent = 'Setup';
   pageTitle.querySelector('p').textContent = 'Configure Plex, movie import, reusable metadata, templates, and editing automation.';
   pageTitle.insertAdjacentHTML('afterend', `<div class="setup-tabs" role="tablist" aria-label="Setup sections">
-    <button type="button" role="tab" data-setup-tab="plex">Plex</button><button type="button" role="tab" data-setup-tab="import">Movie import</button><button type="button" role="tab" data-setup-tab="properties">Saved properties</button><button type="button" role="tab" data-setup-tab="templates">Templates</button><button type="button" role="tab" data-setup-tab="automation">Automation</button><button type="button" role="tab" data-setup-tab="suggestions">Learned suggestions</button>
+    <button type="button" role="tab" data-setup-tab="plex">Plex</button><button type="button" role="tab" data-setup-tab="import">Movie import</button><button type="button" role="tab" data-setup-tab="properties">Saved properties</button><button type="button" role="tab" data-setup-tab="templates">Templates</button><button type="button" role="tab" data-setup-tab="automation">Automation</button><button type="button" role="tab" data-setup-tab="suggestions">Learned suggestions</button><button type="button" role="tab" data-setup-tab="language-detection">Language detection</button>
   </div><div class="setup-tab-panels">
-    <section data-setup-panel="plex"></section><section data-setup-panel="import"></section><section data-setup-panel="properties"></section><section data-setup-panel="templates"></section><section data-setup-panel="automation"></section><section data-setup-panel="suggestions"></section>
+    <section data-setup-panel="plex"></section><section data-setup-panel="import"></section><section data-setup-panel="properties"></section><section data-setup-panel="templates"></section><section data-setup-panel="automation"></section><section data-setup-panel="suggestions"></section><section data-setup-panel="language-detection"></section>
   </div>`);
 
   const panel = name => setup.querySelector(`[data-setup-panel="${name}"]`);
@@ -26,6 +26,7 @@
   if (indexMaintenance) panel('automation').append(indexMaintenance);
   setup.querySelectorAll('.import-setup-grid').forEach(grid => {if (!grid.children.length) grid.remove()});
   panel('suggestions').innerHTML = `<article id="learned-suggestion-maintenance"><div class="learned-suggestion-heading"><div><h3>Learned track-name suggestions</h3><p>Edit, pause, resume, reset, or remove individual audio and subtitle correction rules.</p></div><button type="button" id="clear-learned-suggestions" class="danger">Delete all</button></div><input type="search" id="learned-suggestion-search" class="search" placeholder="Filter old or replacement names…"><div id="learned-suggestion-list"></div></article>`;
+  panel('language-detection').innerHTML = `<article class="language-detection-settings"><h3>Common languages</h3><p>Languages checked by subtitle inspection and the <em>langs</em> report. Enter codes separated by commas, such as <code>pt</code>, <code>pt-BR</code>, and <code>en</code>.</p><label>Common languages<input id="language-detection-common" type="text" placeholder="pt, pt-BR, en" autocomplete="off"></label><button type="button" class="primary" id="language-detection-save">Save common languages</button><small id="language-detection-status"></small></article>`;
 
   const TAB_KEY = 'videostreamedit.setup-tab.v1';
   function activateSetupTab(name) {

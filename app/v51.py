@@ -21,7 +21,10 @@ from app.v50 import app
 
 logger = logging.getLogger("uvicorn.error")
 TEXT_SUBTITLE_CODECS = {"subrip", "srt", "ass", "ssa", "webvtt", "mov_text", "text"}
+# Broad tag matcher is retained for cleanup; reports use the stricter
+# presentation-tag matcher so angle-bracket text is not misclassified.
 HTML_TAG = re.compile(r"<\s*/?\s*[a-zA-Z][^>]*>")
+HTML_PRESENTATION_TAG = re.compile(r"<\s*/?\s*(?:i|b|u|s|em|strong|font|span|br|div|p|ruby|rt|rb|c|q|small|big|sub|sup|a|nobr)(?:\s+[^>]*)?\s*/?>", re.I)
 ASS_TAG = re.compile(r"\{\\[^}]+}")
 
 
@@ -59,7 +62,7 @@ def decode_external(data: bytes) -> tuple[str, str]:
 
 def markup_kind(text: str) -> str:
     kinds = []
-    if HTML_TAG.search(text):
+    if HTML_PRESENTATION_TAG.search(text):
         kinds.append("HTML tags")
     if ASS_TAG.search(text):
         kinds.append("ASS styling")

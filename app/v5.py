@@ -133,7 +133,12 @@ def external_filename_metadata(suffix: str) -> tuple[str, str, list[str]]:
         marker = "Hearing impaired" if hearing_impaired else SUBTITLE_FILENAME_MARKERS.get(lowered.replace("_", ""))
         if marker and marker not in labels:
             labels.append(marker)
-    if language == "pt" and not region:
+    # An external subtitle without a recognized language tag is still a valid
+    # subtitle.  Normalize it to Plex's explicit undetermined language so the
+    # editor, filters, indexing, and integration all use the same value.
+    if not language:
+        language, region = "und", ""
+    elif language == "pt" and not region:
         region = "PT"
     return language, region, labels
 

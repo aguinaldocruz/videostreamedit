@@ -69,6 +69,8 @@ def affected_media_path(task_type: str, payload: dict) -> str:
         return str((payload.get("edit") or payload).get("path") or "")
     if task_type == "subtitle_html_cleanup":
         return str(payload.get("path") or "")
+    if task_type in {"tv_filtered_stream_edit", "tv_filtered_stream_edit_now", "filtered_stream_edit", "filtered_stream_edit_now", "plex_import_refresh"}:
+        return str(payload.get("path") or "")
     if task_type == "movie_import":
         return str(payload.get("source") or "")
     return ""
@@ -92,6 +94,12 @@ def enqueue(task_type: str, payload: dict, label: str = "", *, deduplicate: bool
         affected = affected_media_path(task_type, payload)
         if affected:
             db.execute("INSERT OR REPLACE INTO media_change_request(task_id,path,requested_at) VALUES(?,?,?)", (task_id, affected, utc_now()))
+    if affected:
+        try:
+            from app.v80 import invalidate_language_detection
+            invalidate_language_detection(affected)
+        except Exception as exc:
+            logger.warning("subtitle_detection event=invalidation_failed task=%d error=%s", task_id, str(exc).replace("\n", " ")[-300:])
     logger.info("task_queue event=added id=%d type=%s label=%s", task_id, task_type, (label or "").replace("\n", "\\n"))
     wake_queue()
     return task_row(task_id)
@@ -199,6 +207,13 @@ def run_queue() -> None:
                     "UPDATE task_queue SET status='failed',error=?,progress_message='Failed',finished_at=?,updated_at=? WHERE id=?",
                     (message[-4000:], utc_now(), utc_now(), task_id),
                 )
+            failed_path = affected_media_path(task_type, json.loads(row["payload_json"]))
+            if failed_path:
+                try:
+                    from app.v80 import request_media_indexes
+                    request_media_indexes(failed_path, ["core"], "Queued media change failed; refresh subtitle detection")
+                except Exception as index_exc:
+                    logger.warning("subtitle_detection event=failed_task_refresh_error task=%d error=%s", task_id, str(index_exc).replace("\n", " ")[-300:])
             logger.exception("task_queue event=task_failed id=%d type=%s seconds=%.2f error=%s", task_id, task_type, time.monotonic() - started, message.replace("\n", " ")[-500:])
 
 

@@ -2,21 +2,22 @@
   const maintenance=document.querySelector('.index-maintenance');
   if(!maintenance)return;
   const heading=maintenance.querySelector('.split-index-heading p');
-  if(heading)heading.textContent='Core metadata is scheduled and indexed. Subtitle inspection and media previews run only when requested.';
+  if(heading)heading.textContent='Core metadata and subtitle inspection can run incrementally on demand or on a schedule. Preview media remains on demand.';
   const core=maintenance.querySelector('[data-index-job="core"]');
   if(core){core.querySelector('h3').textContent='Core stream metadata index';core.querySelector('p').textContent='Language, region, track name, stream type, flags, and external subtitle tags for movie and TV filters.'}
   document.head.insertAdjacentHTML('beforeend','<style>.index-on-demand [data-index-status],.index-on-demand [data-index-queue-items],.index-on-demand [data-index-retry],.index-on-demand [data-index-pause],.index-on-demand [data-index-stop],.index-on-demand .index-schedule{display:none!important}</style>');
   for(const [job,title,description] of [
-    ['subtitles','On-demand subtitle inspection','Subtitle text, formatting tags, and graphical previews are inspected only when you open a subtitle preview.'],
+    ['subtitles','Subtitle inspection','Incremental subtitle inspection can run now or on a schedule. Start from scratch only when necessary.'],
     ['previews','On-demand preview cache','Audio segments stream when requested and only viewed segments are retained in the 512 MB LRU cache.']
   ]){
     const card=maintenance.querySelector(`[data-index-job="${job}"]`);
     if(!card)continue;
-    card.classList.add('index-on-demand');
+    if(job==='previews')card.classList.add('index-on-demand');
     const tab=maintenance.querySelector(`[data-index-tab="${job}"]`);if(tab)tab.textContent=job==='subtitles'?'Subtitle inspection':'Preview cache';
     card.querySelector('h3').textContent=title;
     card.querySelector('p').textContent=description;
-    const check=card.querySelector('[data-index-check]');if(check)check.hidden=true;
+    const check=card.querySelector('[data-index-check]');if(check&&job==='previews')check.hidden=true;
+    if(job==='subtitles'){if(check)check.textContent='Run incremental';const rebuildButton=card.querySelector('[data-index-rebuild]');if(rebuildButton)rebuildButton.textContent='Start from scratch';card.querySelector('.index-maintenance-actions').insertAdjacentHTML('beforeend','<button type="button" data-index-clear>Clear data</button>');const clear=card.querySelector('[data-index-clear]');clear.onclick=async()=>{if(!confirm('Clear all subtitle inspection data and queued subtitle inspection work?'))return;clear.disabled=true;try{await api('/api/v80/setup/index/subtitles/clear',{method:'POST',body:'{}'});toast('Subtitle inspection data cleared')}catch(error){toast(error.message,true)}finally{clear.disabled=false}}}
     const rebuild=card.querySelector('[data-index-rebuild]');
     if(rebuild){
       rebuild.textContent=job==='subtitles'?'Clear inspection data':'Clear preview cache';
@@ -25,7 +26,7 @@
         try{const task=await api(`/api/v80/setup/index/${job}/rebuild`,{method:'POST',body:'{}'});toast(`Cleanup queued as job #${task.id}.`)}catch(error){toast(error.message,true)}
       };
     }
-    card.querySelector('.index-schedule')?.classList.add('hidden');
+    if(job==='previews')card.querySelector('.index-schedule')?.classList.add('hidden');
   }
   core?.insertAdjacentHTML('beforeend','<section id="performance-health"><h3>Performance health</h3><p data-performance-summary>Load Setup to check current risks.</p><div class="index-maintenance-actions"><button type="button" data-prune-history>Clean all finished queue history</button></div></section>');
   const cacheInput=maintenance.querySelector('[data-cache-limit]');if(cacheInput){cacheInput.min='0.25';cacheInput.step='0.25'}

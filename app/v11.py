@@ -5,6 +5,8 @@ import logging
 import urllib.error
 import urllib.parse
 import urllib.request
+import time
+import secrets
 from pathlib import Path
 from typing import Literal
 
@@ -30,13 +32,23 @@ class LibrarySelection(BaseModel):
     keys: list[str]
 
 
+class PlexAuthStart(BaseModel):
+    url: str
+
+
+class PlexAuthPoll(BaseModel):
+    pin_id: int
+    url: str
+
+
 @app.on_event("startup")
 def initialize_plex() -> None:
     with connection() as db:
         db.executescript("""
             CREATE TABLE IF NOT EXISTS plex_config (
                 id INTEGER PRIMARY KEY CHECK(id = 1), url TEXT NOT NULL, token TEXT NOT NULL,
-                server_name TEXT NOT NULL DEFAULT '', last_sync TEXT
+                server_name TEXT NOT NULL DEFAULT '', last_sync TEXT,
+                auth_method TEXT NOT NULL DEFAULT 'manual'
             );
             CREATE TABLE IF NOT EXISTS plex_libraries (
                 library_key TEXT PRIMARY KEY, title TEXT NOT NULL,
@@ -51,6 +63,24 @@ def initialize_plex() -> None:
             CREATE INDEX IF NOT EXISTS plex_media_kind ON plex_media(kind);
             CREATE INDEX IF NOT EXISTS plex_media_show ON plex_media(show_title, season_number, episode_number);
         """)
+        try:
+            db.execute("ALTER TABLE plex_config ADD COLUMN auth_method TEXT NOT NULL DEFAULT 'manual'")
+        except Exception:
+            pass
+
+
+PLEX_CLIENT_ID = "videostreamedit"
+_pending_plex_auth: dict[int, dict] = {}
+
+
+def plex_cloud_request(method: str, path: str, data: bytes | None = None) -> dict:
+    headers = {"Accept": "application/json", "X-Plex-Client-Identifier": PLEX_CLIENT_ID, "X-Plex-Product": "VideoStreamEdit", "X-Plex-Version": "0.11"}
+    request = urllib.request.Request("https://plex.tv" + path, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            return json.load(response)
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+        raise HTTPException(502, f"Could not communicate with Plex authentication service: {getattr(exc, 'reason', str(exc))}") from exc
 
 
 def config_row():
@@ -99,13 +129,49 @@ async def v11_assets(request: Request, call_next):
     return await call_next(request)
 
 
+@app.post("/api/v11/plex/auth/start")
+def start_plex_auth(item: PlexAuthStart) -> dict:
+    url = item.url.strip().rstrip("/")
+    if not url.startswith(("http://", "https://")):
+        raise HTTPException(400, "Plex URL must begin with http:// or https://")
+    pin = plex_cloud_request("POST", "/api/v2/pins?strong=true")
+    pin_id = int(pin.get("id") or 0); code = str(pin.get("code") or "")
+    if not pin_id or not code:
+        raise HTTPException(502, "Plex did not return an authentication PIN")
+    _pending_plex_auth[pin_id] = {"url": url, "created": time.time()}
+    query = urllib.parse.urlencode({"clientID": PLEX_CLIENT_ID, "code": code, "forwardUrl": "http://localhost/"})
+    return {"pin_id": pin_id, "auth_url": f"https://app.plex.tv/auth#?{query}", "expires_in": 900}
+
+
+@app.post("/api/v11/plex/auth/poll")
+def poll_plex_auth(item: PlexAuthPoll) -> dict:
+    pending = _pending_plex_auth.get(item.pin_id)
+    if not pending or time.time() - float(pending["created"]) > 900:
+        _pending_plex_auth.pop(item.pin_id, None)
+        raise HTTPException(400, "Plex authentication PIN expired; start again")
+    pin = plex_cloud_request("GET", f"/api/v2/pins/{item.pin_id}")
+    token = str(pin.get("authToken") or pin.get("auth_token") or "")
+    if not token:
+        return {"status": "pending"}
+    url = item.url.strip().rstrip("/") or pending["url"]
+    name, libraries = section_list(url, token)
+    with connection() as db:
+        db.execute("INSERT INTO plex_config(id,url,token,server_name,auth_method) VALUES(1,?,?,?,?) ON CONFLICT(id) DO UPDATE SET url=excluded.url,token=excluded.token,server_name=excluded.server_name,auth_method=excluded.auth_method", (url, encrypt_token(token), name, "plex"))
+        old = {row["library_key"]: row["selected"] for row in db.execute("SELECT library_key,selected FROM plex_libraries")}
+        db.execute("DELETE FROM plex_libraries")
+        db.executemany("INSERT INTO plex_libraries(library_key,title,kind,selected) VALUES(?,?,?,?)", [(x["key"], x["title"], x["kind"], old.get(x["key"], 0)) for x in libraries])
+    _pending_plex_auth.pop(item.pin_id, None)
+    logger.info("change=plex_authentication method=plex server=%s libraries=%d", name.replace("\n", "\\n"), len(libraries))
+    return {"status": "authenticated", **get_plex_config()}
+
+
 @app.get("/api/v11/plex/config")
 def get_plex_config() -> dict:
     row = config_row()
     with connection() as db:
         libraries = [dict(item) for item in db.execute("SELECT library_key AS key, title, kind, selected FROM plex_libraries ORDER BY kind, title COLLATE NOCASE")]
         count = db.execute("SELECT COUNT(*) FROM plex_media").fetchone()[0]
-    return {"url": row["url"] if row else "", "has_token": bool(row and row["token"]), "server_name": row["server_name"] if row else "", "last_sync": row["last_sync"] if row else None, "libraries": libraries, "media_count": count}
+    return {"url": row["url"] if row else "", "has_token": bool(row and row["token"]), "server_name": row["server_name"] if row else "", "auth_method": row["auth_method"] if row and "auth_method" in row.keys() else "manual", "last_sync": row["last_sync"] if row else None, "libraries": libraries, "media_count": count}
 
 
 @app.post("/api/v11/plex/config")
@@ -113,7 +179,7 @@ def save_plex_config(item: PlexConfig) -> dict:
     current = config_row(); token = item.token.strip() or (decrypt_token(current["token"]) if current else "")
     name, libraries = section_list(item.url, token)
     with connection() as db:
-        db.execute("INSERT INTO plex_config(id,url,token,server_name) VALUES(1,?,?,?) ON CONFLICT(id) DO UPDATE SET url=excluded.url,token=excluded.token,server_name=excluded.server_name", (item.url.strip().rstrip("/"), encrypt_token(token), name))
+        db.execute("INSERT INTO plex_config(id,url,token,server_name,auth_method) VALUES(1,?,?,?,?) ON CONFLICT(id) DO UPDATE SET url=excluded.url,token=excluded.token,server_name=excluded.server_name,auth_method=excluded.auth_method", (item.url.strip().rstrip("/"), encrypt_token(token), name, "manual"))
         old = {row["library_key"]: row["selected"] for row in db.execute("SELECT library_key,selected FROM plex_libraries")}
         db.execute("DELETE FROM plex_libraries")
         db.executemany("INSERT INTO plex_libraries(library_key,title,kind,selected) VALUES(?,?,?,?)", [(x["key"], x["title"], x["kind"], old.get(x["key"], 0)) for x in libraries])
@@ -152,10 +218,7 @@ def clear_reviewed_for_sync_records(records: list[tuple]) -> int:
             row = db.execute("SELECT reviewed,note FROM media_notes WHERE entity_type=? AND entity_key=?", (entity_type, entity_key)).fetchone()
             if not row or not row["reviewed"]:
                 continue
-            if str(row["note"] or "").strip():
-                db.execute("UPDATE media_notes SET reviewed=0,updated_at=CURRENT_TIMESTAMP WHERE entity_type=? AND entity_key=?", (entity_type, entity_key))
-            else:
-                db.execute("DELETE FROM media_notes WHERE entity_type=? AND entity_key=?", (entity_type, entity_key))
+            db.execute("UPDATE media_notes SET plex_sync_change=1,updated_at=CURRENT_TIMESTAMP WHERE entity_type=? AND entity_key=?", (entity_type, entity_key))
             cleared += 1
     return cleared
 

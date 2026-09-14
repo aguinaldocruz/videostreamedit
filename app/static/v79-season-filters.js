@@ -2,10 +2,68 @@
   const table=$('#episode-list')?.closest('table'),head=table?.querySelector('thead tr');
   if(!head)return;
   const action=head.lastElementChild;
-  action.innerHTML='<button type="button" id="season-stream-toggle" class="season-stream-toggle hidden" title="Show stream-value filters" aria-label="Show stream-value filters">&gt;&gt;</button><button type="button" class="refresh" data-kind="tv">Refresh</button><button type="button" id="tv-show-note" class="note-button" title="Edit TV show note" aria-label="Edit TV show note">i</button>';
-  action.querySelector('#tv-show-note').onclick=()=>state.currentShow&&openEntityNote('tv',state.currentShow.id,state.currentShow.name);
-  head.insertAdjacentHTML('afterend','<tr id="season-stream-filter-row" class="season-stream-filter-row hidden"><th colspan="4"><div id="season-stream-filter-content"></div></th></tr><tr id="season-stream-edit-row" class="season-stream-edit-row hidden"><th colspan="4"><div id="season-stream-edit-content"></div></th></tr>');
+  action.innerHTML='<button type="button" id="season-stream-toggle" class="season-stream-toggle hidden" title="Show stream-value filters" aria-label="Show stream-value filters">&gt;&gt;</button><button type="button" class="refresh" data-kind="tv">Refresh</button>';
+  const seasonTools=document.querySelector('#season-tools');
+  if(seasonTools)action.insertBefore(seasonTools,action.querySelector('.refresh'));
+  head.insertAdjacentHTML('afterend','<tr id="season-stream-filter-row" class="season-stream-filter-row hidden"><th colspan="5"><div id="season-stream-filter-content"></div></th></tr><tr id="season-stream-edit-row" class="season-stream-edit-row hidden"><th colspan="5"><div id="season-stream-edit-content"></div></th></tr>');
   const toggle=$('#season-stream-toggle'),showTitle=document.querySelector('#show-title'),showStatus=document.querySelector('#show-title')?.parentElement,filterRow=$('#season-stream-filter-row'),filterContent=$('#season-stream-filter-content'),editRow=$('#season-stream-edit-row'),editContent=$('#season-stream-edit-content');
+  const originalRenderShows=renderShows;
+  window.jumpToFirstFilteredShow=function(force=false){const first=document.querySelector('#show-list .show-card');if(first&&(force||!state.currentShow||String(state.currentShow.id)!==String(first.dataset.id))){state.currentShow=state.shows.find(show=>String(show.id)===String(first.dataset.id))||null;state.currentSeason='*';$('#episode-search').value='';originalRenderShows();renderEpisodes()}};
+  renderShows=function(){originalRenderShows();if(window._preserveShowSelection){window._preserveShowSelection=false;return}if(window._suppressShowFilterJump)return;window.jumpToFirstFilteredShow(true)};
+  $('#show-search').oninput=()=>renderShows();
+  const episodeHeading=document.querySelector('.episode-heading');
+  if(episodeHeading&&!document.querySelector('#tv-show-navigation-left')){
+    episodeHeading.insertAdjacentHTML('afterbegin','<div id="tv-show-navigation-left" class="tv-show-navigation"><button type="button" data-show-nav="first" aria-label="First filtered TV show">&lt;&lt;</button><button type="button" data-show-nav="previous" aria-label="Previous filtered TV show">&lt;</button></div>');
+    episodeHeading.insertAdjacentHTML('beforeend','<div id="tv-show-navigation-right" class="tv-show-navigation"><button type="button" id="tv-show-note" class="note-button" title="Edit TV show note" aria-label="Edit TV show note">i</button><button type="button" data-show-nav="next" aria-label="Next filtered TV show">&gt;</button><button type="button" data-show-nav="last" aria-label="Last filtered TV show">&gt;&gt;</button></div>');
+  }
+  document.querySelector('#tv-show-note')?.addEventListener('click',()=>state.currentShow&&openEntityNote('tv',state.currentShow.id,state.currentShow.name));
+  function renderShowTags(){
+    const scope=document.querySelector('#episode-scope');
+    if(!scope)return;
+    const text=scope.dataset.scopeText||scope.textContent||'';
+    scope.dataset.scopeText=text.replace(/\s+R:[^\s]+|\s+N:[^\s]+|\s+P:[^\s]+/g,'').trim();
+    const show=state.currentShow;
+    const tags=[];
+    if(show?.reviewed)tags.push('<button type="button" class="reviewed-tag header-state-action" data-show-reset="reviewed" title="Reviewed — click to mark unreviewed">✓</button>');
+    if(show?.note)tags.push('<span class="note-tag" title="This TV show has a note">i</span>');
+    if(show?.plex_sync_change)tags.push('<button type="button" class="plex-sync-tag header-state-action" data-show-reset="plex_sync_change" title="Plex Sync Change — click to reset">P</button>');
+    scope.innerHTML=`<span class="episode-scope-text">${esc(scope.dataset.scopeText)}</span><span class="show-state-tags">${tags.join('')}</span>`;
+    scope.querySelectorAll('[data-show-reset]').forEach(button=>button.onclick=()=>resetShowState(button.dataset.showReset));
+  }
+  async function resetShowState(field){
+    if(!state.currentShow)return;
+    const item=state.currentShow;
+    try{
+      const result=await api('/api/v86/note',{method:'PUT',body:JSON.stringify({entity_type:'tv',entity_key:item.id,note:item.note||'',reviewed:field==='reviewed'?false:Boolean(item.reviewed),plex_sync_change:field==='plex_sync_change'?false:Boolean(item.plex_sync_change)})});
+      updateNoteState(result);
+      renderShowTags();
+      toast(field==='reviewed'?'Marked unreviewed':'Plex Sync Change reset');
+    }catch(error){toast(error.message,true)}
+  }
+  function updateShowNavigation(){
+    const cards=[...document.querySelectorAll('#show-list .show-card')], ids=cards.map(card=>card.dataset.id), current=state.currentShow?ids.indexOf(String(state.currentShow.id)):-1, active=current>=0;
+    const set=(kind,disabled)=>{const button=document.querySelector(`[data-show-nav="${kind}"]`);if(button)button.disabled=disabled||!ids.length;};
+    set('first',current===0);set('previous',current===0);set('next',current===ids.length-1);set('last',current===ids.length-1);
+  }
+  document.querySelectorAll('[data-show-nav]').forEach(button=>button.onclick=()=>{
+    const cards=[...document.querySelectorAll('#show-list .show-card')], ids=cards.map(card=>card.dataset.id), current=state.currentShow?ids.indexOf(String(state.currentShow.id)):-1;
+    const kind=button.dataset.showNav;
+    const target=current<0?(kind==='first'||kind==='previous'?0:ids.length-1):(kind==='first'?0:kind==='last'?ids.length-1:kind==='previous'?current-1:current+1);
+    if(target<0||target>=ids.length)return; state.currentShow=state.shows.find(show=>String(show.id)===String(ids[target]))||null; state.currentSeason='*'; $('#episode-search').value=''; window._preserveShowSelection=true; renderShows(); renderEpisodes();
+  });
+  // Keep keyboard navigation scoped to the TV page.  Do not steal P/N while
+  // the user is typing in a field or while a dialog is open.
+  document.addEventListener('keydown', event=>{
+    if(event.defaultPrevented||document.querySelector('#tv')?.classList.contains('hidden')||document.querySelector('dialog[open]'))return;
+    const target=event.target;
+    if(target?.matches('input,textarea,select,[contenteditable="true"]'))return;
+    const key=String(event.key||'').toLowerCase();
+    if(key!=='p'&&key!=='n')return;
+    const button=document.querySelector(`[data-show-nav="${key==='p'?'previous':'next'}"]`);
+    if(!button||button.disabled)return;
+    event.preventDefault();button.click();
+  });
+  showTitle?.parentElement.classList.add('tv-show-title-block');
   if(showTitle&&!document.querySelector('#tv-show-status'))showTitle.insertAdjacentHTML('afterend','<span id="tv-show-status" class="tv-show-status hidden" role="status"></span>');
   const statusBadge=document.querySelector('#tv-show-status');action.querySelector('.refresh').onclick=async()=>{await loadTv();statusScope='';await updateShowStatus();};
   let scope='',records=[],loading=false;
@@ -37,18 +95,22 @@
   function applyFilter(){const filters=selectedFilters(),active=Object.entries(filters).some(([name,value])=>name!=='presence'&&value!==null),matches=matchingPaths();$('#episode-list').querySelectorAll('tr').forEach(item=>{const path=item.querySelector('.edit-file')?.dataset.path;item.classList.toggle('season-stream-filtered-out',active&&!matches.has(path))});const count=active?matches.size:scopeEpisodes().length;const summary=filterContent.querySelector('[data-filter-summary]');if(summary)summary.textContent=`${count} matches`;const edit=filterContent.querySelector('[data-season-edit-toggle]');if(edit){edit.disabled=filters.presence==='not_have'||!filters.stream_type||!matches.size;edit.title=filters.presence==='not_have'?'Bulk editing requires Have':(!filters.stream_type?'Select Audio or Subtitles before editing':'Edit matching streams')}if(!matches.size)closeEditor()}
 
   function availableExtraLanguages(){
-    const ignored=new Set(['pt','pt-br','en','und','']);
-    const collect=types=>new Set(records.filter(item=>types.includes(String(item.stream_type).toLowerCase())).map(item=>String(item.language||'').toLowerCase()).filter(value=>!ignored.has(value)));
-    return {audio:collect(['audio']), subtitle:collect(['subtitle','external'])};
+    const configured=(window.commonDetectionLanguages||['pt','pt-br','en']).map(value=>String(value).trim().toLowerCase()).filter(Boolean);
+    const commonBases=new Set(configured.map(value=>value.split(/[-_]/,1)[0]));
+    const base=value=>String(value||'').trim().toLowerCase().split(/[-_]/,1)[0];
+    const used=new Set(records.map(item=>String(item.language||'').trim().toLowerCase()).filter(value=>value&&value!=='und'));
+    const commonUsed=new Set([...used].filter(value=>commonBases.has(base(value))));
+    const collect=types=>new Set(records.filter(item=>types.includes(String(item.stream_type).toLowerCase())).map(item=>String(item.language||'').toLowerCase()).filter(value=>value&&!commonBases.has(base(value))&&value!=='und'));
+    return {audio:collect(['audio']), subtitle:collect(['subtitle','external']), commonUsed, configured};
   }
   function updateLanguageButton(){
     const button=filterContent.querySelector('[data-season-language-removal]'); if(!button)return;
-    const values=availableExtraLanguages(); button.hidden=values.audio.size<=2&&values.subtitle.size<=2;
-    button.title=`Remove uncommon languages (audio: ${values.audio.size}, subtitles: ${values.subtitle.size})`;
+    const values=availableExtraLanguages(); button.hidden=values.audio.size<=2&&values.subtitle.size<=2&&values.commonUsed.size<2;
+    button.title=`Remove uncommon languages (common in use: ${[...values.commonUsed].sort().join(', ')||'none'}; audio: ${values.audio.size}, subtitles: ${values.subtitle.size})`;
   }
   async function openLanguageRemoval(){
     const values=availableExtraLanguages(), dialogId='season-language-removal-dialog'; let dialog=document.getElementById(dialogId);
-    if(!dialog){document.body.insertAdjacentHTML('beforeend',`<dialog id="${dialogId}"><div class="dialog-title"><div><h2>Remove uncommon languages</h2><p>Select stream type and languages to remove from the listed episodes.</p></div><button type="button" class="icon-close" data-lang-remove-cancel>×</button></div><div class="dialog-body"><label>Streams<select data-lang-remove-scope><option value="both">Audio + subtitles</option><option value="audio">Audio</option><option value="subtitle">Subtitles</option></select></label><fieldset><legend>Languages</legend><div class="language-selection-actions"><button type="button" data-lang-select-all>Select all</button><button type="button" data-lang-select-none>Unselect all</button><button type="button" data-lang-select-invert>Invert selection</button></div><div data-lang-remove-options></div></fieldset></div><div class="dialog-actions"><button type="button" data-lang-remove-cancel>Cancel</button><button type="button" class="primary" data-lang-remove-apply>Remove selected</button></div></dialog>`);dialog=document.getElementById(dialogId);dialog.querySelectorAll('[data-lang-remove-cancel]').forEach(item=>item.onclick=()=>{dialog.close();document.querySelectorAll('.season-language-preview-out').forEach(row=>row.classList.remove('season-language-preview-out'))});dialog.querySelector('[data-lang-select-all]').onclick=()=>dialog.querySelectorAll('[data-lang-remove-language]').forEach(item=>{item.checked=true});dialog.querySelector('[data-lang-select-none]').onclick=()=>dialog.querySelectorAll('[data-lang-remove-language]').forEach(item=>{item.checked=false});dialog.querySelector('[data-lang-select-invert]').onclick=()=>dialog.querySelectorAll('[data-lang-remove-language]').forEach(item=>{item.checked=!item.checked});dialog.querySelector('[data-lang-remove-apply]').onclick=async()=>{
+    if(!dialog){document.body.insertAdjacentHTML('beforeend',`<dialog id="${dialogId}"><div class="dialog-title"><div><h2>Remove uncommon languages</h2><p>Select stream type and languages to remove from the listed episodes.</p><p class="language-common-summary" data-lang-common-summary></p></div><button type="button" class="icon-close" data-lang-remove-cancel>×</button></div><div class="dialog-body"><label>Streams<select data-lang-remove-scope><option value="both">Audio + subtitles</option><option value="audio">Audio</option><option value="subtitle">Subtitles</option></select></label><fieldset><legend>Languages</legend><div class="language-selection-actions"><button type="button" data-lang-select-all>Select all</button><button type="button" data-lang-select-none>Unselect all</button><button type="button" data-lang-select-invert>Invert selection</button></div><div data-lang-remove-options></div></fieldset></div><div class="dialog-actions"><button type="button" data-lang-remove-cancel>Cancel</button><button type="button" class="primary" data-lang-remove-apply>Remove selected</button></div></dialog>`);dialog=document.getElementById(dialogId);dialog.querySelectorAll('[data-lang-remove-cancel]').forEach(item=>item.onclick=()=>{dialog.close();document.querySelectorAll('.season-language-preview-out').forEach(row=>row.classList.remove('season-language-preview-out'))});dialog.querySelector('[data-lang-select-all]').onclick=()=>dialog.querySelectorAll('[data-lang-remove-language]').forEach(item=>{item.checked=true});dialog.querySelector('[data-lang-select-none]').onclick=()=>dialog.querySelectorAll('[data-lang-remove-language]').forEach(item=>{item.checked=false});dialog.querySelector('[data-lang-select-invert]').onclick=()=>dialog.querySelectorAll('[data-lang-remove-language]').forEach(item=>{item.checked=!item.checked});dialog.querySelector('[data-lang-remove-apply]').onclick=async()=>{
       const scope=dialog.querySelector('[data-lang-remove-scope]').value,selected=[...dialog.querySelectorAll('[data-lang-remove-language]:checked')].map(item=>item.value);
       if(!selected.length){toast('Select at least one language',true);return}
       const types=scope==='audio'?['audio']:scope==='subtitle'?['subtitle','external']:['audio','subtitle','external'],base=selectedFilters();
@@ -76,7 +138,7 @@
       statusScope='';
       await updateShowStatus();
     };dialog.querySelector('[data-lang-remove-scope]').onchange=()=>{renderLanguageOptions(dialog,values);dialog.querySelectorAll('[data-lang-remove-language]').forEach(item=>item.onchange=()=>previewLanguageRemoval(dialog));previewLanguageRemoval(dialog)}}
-    renderLanguageOptions(dialog,values);dialog.querySelectorAll('[data-lang-remove-language]').forEach(item=>item.onchange=()=>previewLanguageRemoval(dialog));previewLanguageRemoval(dialog);dialog.showModal();
+    const summary=dialog.querySelector('[data-lang-common-summary]');if(summary)summary.textContent=`Common languages in use: ${values.commonUsed.size?[...values.commonUsed].sort().join(', '):'none'}`;renderLanguageOptions(dialog,values);dialog.querySelectorAll('[data-lang-remove-language]').forEach(item=>item.onchange=()=>previewLanguageRemoval(dialog));previewLanguageRemoval(dialog);dialog.showModal();
   }
   function renderLanguageOptions(dialog,values){const scope=dialog.querySelector('[data-lang-remove-scope]').value, selected=scope==='audio'?values.audio:scope==='subtitle'?values.subtitle:new Set([...values.audio,...values.subtitle]);dialog.querySelector('[data-lang-remove-options]').innerHTML=[...selected].sort().map(value=>`<label><input type="checkbox" data-lang-remove-language value="${attr(value)}"> ${esc(value)}</label>`).join('')||'<small>No uncommon languages detected.</small>'}
   function previewLanguageRemoval(dialog){const scope=dialog.querySelector('[data-lang-remove-scope]').value,selected=new Set([...dialog.querySelectorAll('[data-lang-remove-language]:checked')].map(item=>item.value)),types=scope==='audio'?['audio']:scope==='subtitle'?['subtitle','external']:['audio','subtitle','external'],base=selectedFilters(),matches=new Set();if(selected.size)for(const item of records){if(!types.includes(String(item.stream_type).toLowerCase())||!selected.has(String(item.language||'').toLowerCase()))continue;if(base.region!==null&&String(item.region||'')!==String(base.region||''))continue;if(base.track_name!==null&&String(item.track_name||'')!==String(base.track_name||''))continue;if(base.filename_tag!==null&&!(item.filename_tags||[]).includes(base.filename_tag))continue;matches.add(item.path)}document.querySelectorAll('#episode-list tr').forEach(row=>{const path=row.querySelector('.edit-file')?.dataset.path;row.classList.toggle('season-language-preview-out',selected.size>0&&!matches.has(path))})}
@@ -84,7 +146,7 @@
   function renderFilters(){
     filterContent.innerHTML='<div class="season-stream-filters"><label class="filter-not-have"><span>&lt;&gt;</span><input type="checkbox" data-season-field="presence" aria-label="Not have"></label><label>Stream<select data-season-field="stream"></select></label><label>Language<select data-season-field="language"></select></label><label>Region<select data-season-field="region"></select></label><label>Track name<select data-season-field="track_name"></select></label><label class="filename-tag-filter hidden">Filename tag<select data-season-field="filename_tag"></select></label><button type="button" data-season-language-removal class="season-language-removal" hidden>langs</button><span data-filter-summary></span><button type="button" data-season-edit-toggle class="season-stream-toggle" aria-label="Edit matching streams">&gt;&gt;</button><button type="button" class="season-stream-filter-close" title="Hide and clear stream filters" aria-label="Hide and clear stream filters">&lt;&lt;</button></div>';
     const stream=filterContent.querySelector('[data-season-field=stream]'),language=filterContent.querySelector('[data-season-field=language]'),region=filterContent.querySelector('[data-season-field=region]'),name=filterContent.querySelector('[data-season-field=track_name]'),filenameTag=filterContent.querySelector('[data-season-field=filename_tag]');
-    const refreshOptions=(changed='')=>{const order=['stream','language','region','track_name','filename_tag'],selectedCount=[stream,language,region,name,filenameTag].filter(select=>select.value&&select.value!=='__all__').length,start=!changed||selectedCount<=1?0:Math.max(0,order.indexOf(changed));if(!changed||start===0)fill(stream,'stream_type','Audio or subtitles');const external=stream.value==='external';filenameTag.closest('label').classList.toggle('hidden',!external);if(!external)filenameTag.value='__all__';if(!changed||start<=1)fill(language,'language','All languages');if(!changed||start<=2)fill(region,'region','All regions');if(!changed||start<=3)fill(name,'track_name','All track names');if(external&&(!changed||start<=4))fill(filenameTag,'filename_tags','All filename tags');if(filterContent.dataset.initialFilterLoad==='true'&&[language,region,name].every(select=>select.options.length===2&&select.options[1].value!=='__all__')){language.value=language.options[1].value;region.value=region.options[1].value;name.value=name.options[1].value;filterContent.dataset.initialSingleton='true';filterContent.dataset.initialFilterLoad='done'}filterChanged()};
+    const refreshOptions=(changed='')=>{const order=['stream','language','region','track_name','filename_tag'],changedIndex=order.indexOf(changed),pairCascade=filterContent.dataset.pairCascade==='true';delete filterContent.dataset.pairCascade;if(changedIndex>=0&&!pairCascade){for(let i=changedIndex+1;i<order.length;i++)([stream,language,region,name,filenameTag][i]).value='__all__'}const selectedCount=[stream,language,region,name,filenameTag].filter(select=>select.value&&select.value!=='__all__').length,start=!changed||selectedCount<=1?0:Math.max(0,changedIndex);if(!changed||start===0)fill(stream,'stream_type','Audio or subtitles');const external=stream.value==='external';filenameTag.closest('label').classList.toggle('hidden',!external);if(!external)filenameTag.value='__all__';if(!changed||start<=1)fill(language,'language','All languages');if(!changed||start<=2)fill(region,'region','All regions');if(!changed||start<=3)fill(name,'track_name','All track names');if(external&&(!changed||start<=4))fill(filenameTag,'filename_tags','All filename tags');if(filterContent.dataset.initialFilterLoad==='true'&&[language,region,name].every(select=>select.options.length===2&&select.options[1].value!=='__all__')){language.value=language.options[1].value;region.value=region.options[1].value;name.value=name.options[1].value;filterContent.dataset.initialSingleton='true';filterContent.dataset.initialFilterLoad='done'}filterChanged()};
     for(const select of[stream,language,region,name,filenameTag])select.onchange=()=>{if(!statusPending)refreshOptions(select.dataset.seasonField)};filterContent.querySelector("[data-season-field=presence]").onchange=()=>{if(!statusPending)filterChanged()};filterContent.querySelector('.season-stream-filter-close').onclick=collapse;filterContent.querySelector('[data-season-edit-toggle]').onclick=openEditor;filterContent.querySelector('[data-season-language-removal]').onclick=openLanguageRemoval;filterContent.dataset.initialFilterLoad='true';const streamTypes=new Set(records.map(item=>String(item.stream_type||'').toLowerCase()));if(streamTypes.has('audio')&&!streamTypes.has('subtitle')&&!streamTypes.has('external'))stream.dataset.initial='audio';refreshOptions();if(stream.dataset.initial){stream.value=stream.dataset.initial;refreshOptions('stream')}updateLanguageButton();
   }
   async function expand(){
@@ -122,6 +184,6 @@
   function collapse(){records=[];scope='';closeEditor();filterRow.classList.add('hidden');filterContent.innerHTML='';$('#episode-list').querySelectorAll('tr').forEach(item=>item.classList.remove('season-stream-filtered-out'))}
   window.resetTvHeaderFilters=collapse;
   toggle.onclick=expand;
-  const oldRender=renderEpisodes;renderEpisodes=function(){const next=currentScope();if(scope&&scope!==next)collapse();oldRender();toggle.classList.toggle('hidden',!state.currentShow);if(!state.currentShow){filterRow.classList.add('hidden');closeEditor();statusBadge?.classList.add('hidden');statusScope='';}else if(records.length&&scope===next)applyFilter();const nextStatus=state.currentShow?String(state.currentShow.id):'';if(nextStatus!==statusScope){statusScope=nextStatus;updateShowStatus()}};
+  const oldRender=renderEpisodes;renderEpisodes=function(){const next=currentScope();if(scope&&scope!==next)collapse();oldRender();renderShowTags();updateShowNavigation();toggle.classList.toggle('hidden',!state.currentShow);if(!state.currentShow){filterRow.classList.add('hidden');closeEditor();statusBadge?.classList.add('hidden');statusScope='';}else if(records.length&&scope===next)applyFilter();const nextStatus=state.currentShow?String(state.currentShow.id):'';if(nextStatus!==statusScope){statusScope=nextStatus;updateShowStatus()}};
   renderEpisodes();
 })();

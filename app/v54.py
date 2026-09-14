@@ -31,7 +31,8 @@ def initialize_split_indexes() -> None:
         db.executescript("""
             CREATE TABLE IF NOT EXISTS subtitle_extended_media (
                 path TEXT PRIMARY KEY, modified INTEGER NOT NULL, size INTEGER NOT NULL,
-                indexed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                indexed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                markup_version INTEGER NOT NULL DEFAULT 1
             );
             CREATE TABLE IF NOT EXISTS preview_cache_index (
                 path TEXT PRIMARY KEY, modified INTEGER NOT NULL, size INTEGER NOT NULL,
@@ -40,6 +41,11 @@ def initialize_split_indexes() -> None:
                 indexed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
         """)
+        try:
+            db.execute("ALTER TABLE subtitle_extended_media ADD COLUMN markup_version INTEGER NOT NULL DEFAULT 1")
+        except Exception as exc:
+            if "duplicate column" not in str(exc).lower():
+                raise
 
 
 def media_rows() -> list[dict]:
@@ -87,7 +93,7 @@ def index_subtitles(item: dict) -> None:
     with connection() as db:
         db.execute("DELETE FROM subtitle_extended_index WHERE path=?", (str(path),))
         db.executemany("INSERT INTO subtitle_extended_index(path,source,type_index,external_path,codec,encoding,markup) VALUES(?,?,?,?,?,?,?)", values)
-        db.execute("INSERT OR REPLACE INTO subtitle_extended_media(path,modified,size,indexed_at) VALUES(?,?,?,datetime('now'))", (str(path), item["modified"], item["size"]))
+        db.execute("INSERT OR REPLACE INTO subtitle_extended_media(path,modified,size,markup_version,indexed_at) VALUES(?,?,?,2,datetime('now'))", (str(path), item["modified"], item["size"]))
 
 
 def index_previews(item: dict) -> None:

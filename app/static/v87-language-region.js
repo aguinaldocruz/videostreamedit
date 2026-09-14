@@ -218,6 +218,8 @@
         }
         select.dataset.selectedValues = selected.join('\u001f');
         selected.filter(value => !value.startsWith('__')).forEach(recordSelection);
+        const cascadeContainer = streamControl?.closest('.season-stream-filter-row,.movie-header-stream-filter-row')?.querySelector('.season-stream-filter-content,.movie-header-stream-filter-content');
+        if (cascadeContainer) cascadeContainer.dataset.pairCascade = 'true';
         streamControl?.dispatchEvent(new Event('change', {bubbles: true}));
       };
     }

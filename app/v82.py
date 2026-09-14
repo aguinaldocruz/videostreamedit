@@ -82,21 +82,24 @@ def fast_streams(path: Path) -> list[dict]:
                 language, region = plex_language_pair(language, region)
                 type_index = counters[kind]
                 language = tv_bulk.comparable_language(language)
-                # mkvmerge may expose only the legacy ISO-639 code (for example
-                # ``por``), while the editor also reads the BCP-47 region from
-                # FFmpeg tags.  Reconcile Portuguese tracks lazily so filters
-                # and the editor always use the same language/region pair.
-                if language in {"", "und"} or (language == "pt" and not region):
-                    try:
-                        if detailed_streams is None:
-                            detailed_streams = media_details_with_ietf(str(path)).get("streams", [])
-                        match = next((item for item in detailed_streams if item.get("codec_type") == kind and int(item.get("type_index", -1)) == type_index), None)
-                        if match:
-                            language = tv_bulk.comparable_language(match.get("language") or language)
-                            region = str(match.get("region") or "").strip().upper()
-                    except Exception:
-                        pass
-                streams.append({"source": "embedded", "stream_type": kind, "type_index": type_index, "external_path": "", "codec": str(track.get("codec") or properties.get("codec_id") or "unknown"), "language": language, "region": region, "track_name": str(properties.get("track_name") or ""), "default": bool(properties.get("default_track")), "forced": bool(properties.get("forced_track")), "filename_tags": []})
+                track_name = str(properties.get("track_name") or "")
+                # Plex-aware editor parsing is authoritative. mkvmerge can
+                # expose only legacy ISO-639 values (for example ``por``) and
+                # incorrectly imply PT for a regionless Portuguese track. Read
+                # the richer IETF-aware details once per file and reconcile
+                # every embedded stream before writing filter indexes.
+                try:
+                    if detailed_streams is None:
+                        detailed_streams = media_details_with_ietf(str(path)).get("streams", [])
+                    match = next((item for item in detailed_streams if item.get("codec_type") == kind and int(item.get("type_index", -1)) == type_index), None)
+                    if match:
+                        language = tv_bulk.comparable_language(match.get("language") or language)
+                        region = str(match.get("region") or "").strip().upper()
+                        if match.get("title") is not None:
+                            track_name = str(match.get("title") or "")
+                except Exception:
+                    pass
+                streams.append({"source": "embedded", "stream_type": kind, "type_index": type_index, "external_path": "", "codec": str(track.get("codec") or properties.get("codec_id") or "unknown"), "language": language, "region": region, "track_name": track_name, "default": bool(properties.get("default_track")), "forced": bool(properties.get("forced_track")), "filename_tags": []})
                 counters[kind] += 1
         except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
             streams = []
@@ -167,6 +170,14 @@ def initialize_unified_stream_index() -> None:
             db.execute("INSERT OR IGNORE INTO index_task_queue(job,path,reason,status,created_at,updated_at) SELECT 'core',path,'Unified parser v2 migration','pending',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP FROM plex_media")
             db.execute("INSERT INTO feature_migrations(name) VALUES('unified_stream_index_parser_v2')")
             logger.info("core_index event=parser_migration_queued version=2")
+        parser_v3 = db.execute("SELECT 1 FROM feature_migrations WHERE name='plex_aware_parser_v3'").fetchone()
+        if not parser_v3:
+            # Re-evaluate every cached stream row with the same IETF-aware
+            # parser used by Stream Properties; retain old rows until each
+            # media is refreshed so filters remain usable during the rollout.
+            db.execute("INSERT OR IGNORE INTO index_task_queue(job,path,reason,status,created_at,updated_at) SELECT 'core',path,'Plex-aware parser v3 migration','pending',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP FROM plex_media")
+            db.execute("INSERT INTO feature_migrations(name) VALUES('plex_aware_parser_v3')")
+            logger.info("core_index event=plex_aware_parser_migration_queued version=3")
         canonical = db.execute("SELECT 1 FROM feature_migrations WHERE name='canonical_index_design_v3'").fetchone()
         if not canonical:
             # Keep Plex configuration/catalog and all learning/saved-property
@@ -280,6 +291,8 @@ def enqueue_filtered_movie_edits(paths: list[str], request: MovieStreamBulkEdit)
             db.execute("INSERT OR REPLACE INTO media_change_request(task_id,path,requested_at) VALUES(?,?,?)", (cursor.lastrowid, path, now))
             task_ids.append(int(cursor.lastrowid))
             queued += 1
+    from app.v80 import invalidate_language_detections
+    invalidate_language_detections([path for path in paths if targets.get(path)])
     tasks.wake_queue()
     logger.info("movie_stream_bulk_edit event=batch_queued media=%d", queued)
     return queued, task_ids

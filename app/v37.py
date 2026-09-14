@@ -61,6 +61,11 @@ def rename_media(request: MediaRenameRequest) -> dict:
             if new.exists() and not old.exists():
                 new.rename(old)
         raise
+    try:
+        from app.v80 import invalidate_language_detections
+        invalidate_language_detections([str(source), str(target)])
+    except Exception as exc:
+        logger.warning("subtitle_detection event=rename_invalidation_failed error=%s", str(exc).replace("\n", " ")[-300:])
     logger.info("change=media_file_renamed from=%s to=%s", str(source).replace("\n", "\\n"), str(target).replace("\n", "\\n"))
     for old, new in subtitle_moves:
         logger.info("change=external_subtitle_renamed from=%s to=%s", str(old).replace("\n", "\\n"), str(new).replace("\n", "\\n"))

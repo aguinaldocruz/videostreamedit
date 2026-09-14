@@ -196,6 +196,13 @@ def apply_in_place(source: Path, request: media_editor.ReorderEditRequest, typed
 
 @app.post("/api/v43/media/edit")
 def optimized_media_edit(request: media_editor.ReorderEditRequest) -> dict:
+    # Remove any language-detection mark before touching the media. The next
+    # incremental core/subtitle pass will recompute it from the new streams.
+    try:
+        from app.v80 import invalidate_language_detection
+        invalidate_language_detection(request.path)
+    except Exception as exc:
+        logger.warning("subtitle_detection event=pre_edit_invalidation_failed error=%s", str(exc).replace("\n", " ")[-300:])
     source = media_editor.authorized_file(request.path)
     data = media_editor.probe(source)
     typed = typed_streams(data)
@@ -211,6 +218,11 @@ def optimized_media_edit(request: media_editor.ReorderEditRequest) -> dict:
         result = _remux_edit(request)
         result["operation"] = "single_remux"
     record_track_name_corrections(request, before)
+    try:
+        from app.v80 import media_indexes_for_edit, request_media_indexes
+        request_media_indexes(str(result.get("edited") or request.path), media_indexes_for_edit(request.model_dump(), remuxed=result.get("operation") == "single_remux"), "Media edit completed")
+    except Exception as exc:
+        logger.warning("subtitle_detection event=post_edit_reindex_failed file=%s error=%s", str(request.path).replace("\n", "\\n"), str(exc).replace("\n", " ")[-300:])
     return result
 
 

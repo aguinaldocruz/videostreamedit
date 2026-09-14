@@ -126,7 +126,9 @@ def persist_remux_language_tags(
                     language, region = update.language, update.region
             elif codec_type == "subtitle":
                 external = external_by_path[str(identity)][0]
-                language, region = external.language, external.region
+                # Unknown/missing filename tags must be imported as Plex's
+                # undetermined language rather than an empty/invalid value.
+                language, region = external.language or "und", external.region or ""
             if language is None and region is None:
                 continue
             ietf = make_language(language, region)
