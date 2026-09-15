@@ -4,8 +4,20 @@
   const common = ['und|','pt|PT','pt|BR','en|','en|US','en|GB','es|','es|ES','es|MX','fr|','fr|FR','fr|CA','de|','it|','ja|','ko|','zh|CN','zh|TW','ar|','nl|','pl|','ru|','tr|','sv|','no|','da|','fi|','el|','he|','hi|'];
 
   function normalized(language, region) {
-    return `${String(language || '').trim().toLowerCase()}|${String(region || '').trim().toUpperCase()}`;
+    let lang = String(language || '').trim().toLowerCase().replace('_', '-');
+    let area = String(region || '').trim().toUpperCase();
+    // Plex treats regionless Portuguese as European Portuguese. Canonicalize
+    // all equivalent spellings so the selector cannot show duplicate labels.
+    if (lang === 'pt-br') { lang = 'pt'; area = 'BR'; }
+    else if (lang === 'pt-pt') { lang = 'pt'; area = 'PT'; }
+    else if (lang === 'pt' && !area) area = 'PT';
+    return `${lang}|${area}`;
   }
+
+  const canonicalCommon = common.map(value => {
+    const [language, region] = value.split('|');
+    return normalized(language, region);
+  });
 
   function labelFor(value) {
     const [language, region] = value.split('|');
@@ -105,7 +117,7 @@
         const languageCode = value.split('|')[0];
         return [value, ...savedRegions.map(regionCode => normalized(languageCode, regionCode))];
       });
-      const values = [...common, ...savedPairs];
+      const values = [...canonicalCommon, ...savedPairs];
       let expanded = false;
       let selectedValue = current;
       let select;
@@ -151,7 +163,7 @@
     regionLabel.classList.add('language-region-internal');
     const wrapper = document.createElement('label');
     wrapper.textContent = 'Language / region';
-    const values = [...common];
+    const values = [...canonicalCommon];
     for (const value of ((typeof v8Saved !== "undefined" && v8Saved.language) || [])) values.push(normalized(value, ''));
     let expanded = false;
     let selectedValue = '__unchanged__';

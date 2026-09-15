@@ -2,8 +2,13 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import subprocess
+import tempfile
 import threading
 import time
+import urllib.request
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
@@ -23,6 +28,8 @@ from app.v64 import app
 logger = logging.getLogger("uvicorn.error")
 queue_condition = threading.Condition()
 queue_thread: threading.Thread | None = None
+queue_light_thread: threading.Thread | None = None
+LIGHT_TASK_TYPES = ("index_check_prepare", "index_rebuild_prepare")
 
 
 class QueueRequest(BaseModel):
@@ -73,6 +80,8 @@ def affected_media_path(task_type: str, payload: dict) -> str:
         return str(payload.get("path") or "")
     if task_type == "movie_import":
         return str(payload.get("source") or "")
+    if task_type == "audio_language_detection":
+        return str(payload.get("path") or "")
     return ""
 
 
@@ -156,27 +165,145 @@ def process_media_edit(task_id: int, payload: dict) -> dict:
     return {**result, "path": final_path}
 
 
-TASK_HANDLERS = {"media_edit": process_media_edit, "media_reindex": process_media_reindex}
+def _audio_language_code(value: str) -> str:
+    key = str(value or '').strip().casefold().replace('_', '-')
+    aliases = {'por': 'pt', 'pt-br': 'pt', 'pt-pt': 'pt', 'eng': 'en', 'jpn': 'ja', 'spa': 'es', 'fre': 'fr', 'fra': 'fr', 'ger': 'de', 'deu': 'de', 'ita': 'it', 'rus': 'ru', 'zho': 'zh', 'chi': 'zh', 'kor': 'ko'}
+    return aliases.get(key, key.split('-', 1)[0])
 
 
-def run_queue() -> None:
-    logger.info("task_queue event=worker_started")
+def _language_service_request(wav: str, service_url: str | None = None) -> dict:
+    boundary = '----vse-language-' + uuid.uuid4().hex
+    with open(wav, 'rb') as handle:
+        content = handle.read()
+    body = (f'--{boundary}\r\nContent-Disposition: form-data; name="audio_file"; filename="sample.wav"\r\n'
+            'Content-Type: audio/wav\r\n\r\n').encode() + content + f'\r\n--{boundary}--\r\n'.encode()
+    url = (service_url or os.environ.get('LANGUAGE_ID_URL', 'http://language-id:9000')).rstrip('/') + '/detect-language'
+    request = urllib.request.Request(url, data=body, method='POST', headers={'Content-Type': f'multipart/form-data; boundary={boundary}', 'Content-Length': str(len(body))})
+    with urllib.request.urlopen(request, timeout=180) as response:
+        return json.loads(response.read().decode('utf-8'))
+
+
+def process_audio_language_detection(task_id: int, payload: dict) -> dict:
+    path = str(payload.get('path') or '')
+    if not path or not Path(path).is_file():
+        raise RuntimeError(f'Media file is not accessible: {path}')
+    probe = json.loads(subprocess.check_output(['ffprobe', '-v', 'error', '-show_entries', 'format=duration:stream=codec_type:stream_tags=language', '-of', 'json', path, '-select_streams', 'a'], text=True))
+    streams = [stream for stream in probe.get('streams', []) if stream.get('codec_type') == 'audio']
+    duration = float((probe.get('format') or {}).get('duration') or 0)
+    service_url = os.environ.get('LANGUAGE_ID_URL', 'http://language-id:9000')
+    sample_seconds = 30
+    sample_positions = (0.10, 0.50, 0.90)
+    try:
+        with connection() as db:
+            config = {str(row['key']): str(row['value']) for row in db.execute("SELECT key,value FROM language_detection_settings WHERE key LIKE 'voice_detection_%'").fetchall()}
+        service_url = config.get('voice_detection_url', service_url)
+        sample_seconds = max(10, min(120, int(config.get('voice_detection_sample_seconds', '30'))))
+        parsed_positions = json.loads(config.get('voice_detection_positions', '[0.1,0.5,0.9]'))
+        sample_positions = tuple(max(0.0, min(1.0, float(value))) for value in parsed_positions) or sample_positions
+    except (ValueError, TypeError, json.JSONDecodeError):
+        pass
+    if not streams:
+        return {'path': path, 'streams': 0, 'mismatches': 0}
+    results = []
+    with tempfile.TemporaryDirectory(prefix='vse-audio-language-') as work:
+        for index, stream in enumerate(streams):
+            metadata = str((stream.get('tags') or {}).get('language') or '').strip()
+            samples = []
+            for number, fraction in enumerate(sample_positions, 1):
+                start = max(0.0, min(max(0.0, duration - float(sample_seconds)), duration * fraction))
+                wav = str(Path(work) / f'audio-{index}-{number}.wav')
+                subprocess.run(['ffmpeg', '-nostdin', '-hide_banner', '-loglevel', 'error', '-ss', f'{start:.3f}', '-i', path, '-map', f'0:a:{index}', '-t', str(sample_seconds), '-ac', '1', '-ar', '16000', '-c:a', 'pcm_s16le', '-f', 'wav', wav], check=True, timeout=180)
+                detected = _language_service_request(wav, service_url)
+                samples.append({'language': str(detected.get('language_code') or '').strip().lower(), 'confidence': float(detected.get('confidence') or 0), 'position': round(start, 2)})
+                update_progress(task_id, (index * 3) + number, len(streams) * len(sample_positions), f'Detecting audio {index + 1}/{len(streams)} sample {number}/{len(sample_positions)}')
+            votes = {}
+            for sample in samples:
+                bucket = _audio_language_code(sample['language'])
+                if bucket:
+                    votes.setdefault(bucket, []).append(sample)
+            detected_code, winning = max(votes.items(), key=lambda item: (len(item[1]), sum(x['confidence'] for x in item[1]))) if votes else ('', [])
+            confidence = sum(x['confidence'] for x in winning) / len(winning) if winning else 0.0
+            metadata_code = _audio_language_code(metadata)
+            mismatch = bool(detected_code and (not metadata or metadata_code in {'', 'und', 'unknown'} or detected_code != metadata_code))
+            results.append((path, index, metadata, '', detected_code, confidence, json.dumps(samples, ensure_ascii=False), 1 if mismatch else 0))
+    with connection() as db:
+        db.execute('DELETE FROM audio_language_detection WHERE path=?', (path,))
+        db.executemany("""INSERT INTO audio_language_detection(path,type_index,metadata_language,metadata_region,detected_language,confidence,samples_json,mismatch,checked_at)
+            VALUES(?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)""", results)
+    update_progress(task_id, len(streams) * len(sample_positions), len(streams) * len(sample_positions), 'Audio language detection completed')
+    mismatches = sum(row[-1] for row in results)
+    logger.info('audio_language_detection event=completed path=%s streams=%d mismatches=%d', path.replace('\n', '\\n'), len(results), mismatches)
+    return {'path': path, 'streams': len(results), 'mismatches': mismatches, 'results': [{'type_index': row[1], 'metadata_language': row[2], 'detected_language': row[4], 'confidence': row[5], 'mismatch': bool(row[7])} for row in results]}
+
+
+TASK_HANDLERS = {"media_edit": process_media_edit, "media_reindex": process_media_reindex, "audio_language_detection": process_audio_language_detection}
+
+
+DEFAULT_TASK_PRIORITIES = [
+    "media_edit", "tv_filtered_stream_edit_now", "filtered_stream_edit_now",
+    "tv_filtered_stream_edit", "filtered_stream_edit", "movie_import",
+    "audio_language_detection", "subtitle_html_cleanup", "image_subtitle_convert",
+    "media_reindex", "plex_sync", "plex_import_refresh", "index_check_prepare", "index_rebuild_prepare",
+]
+
+def task_priority_order() -> list[str]:
+    with connection() as db:
+        row = db.execute("SELECT value FROM task_queue_settings WHERE key='priority_order'").fetchone()
+        seen = []
+        try: seen = [str(value) for value in json.loads(row["value"] or "[]")] if row else []
+        except (TypeError, ValueError, json.JSONDecodeError): seen = []
+        existing = [str(item["task_type"]) for item in db.execute("SELECT DISTINCT task_type FROM task_queue").fetchall()]
+    return list(dict.fromkeys([item for item in seen + DEFAULT_TASK_PRIORITIES + existing if item]))
+
+
+@app.get("/api/v65/queue/priorities")
+def get_queue_priorities() -> dict:
+    return {"priorities": task_priority_order()}
+
+
+class QueuePrioritiesRequest(BaseModel):
+    priorities: list[str] = Field(min_length=1, max_length=100)
+
+
+@app.put("/api/v65/queue/priorities")
+def save_queue_priorities(request: QueuePrioritiesRequest) -> dict:
+    allowed = set(DEFAULT_TASK_PRIORITIES)
+    with connection() as db:
+        allowed.update(str(item["task_type"]) for item in db.execute("SELECT DISTINCT task_type FROM task_queue").fetchall())
+        values = list(dict.fromkeys(str(value).strip() for value in request.priorities if str(value).strip() in allowed))
+        if not values: raise HTTPException(400, "At least one valid queue task type is required")
+        db.execute("INSERT OR REPLACE INTO task_queue_settings(key,value) VALUES('priority_order',?)", (json.dumps(values),))
+    logger.info("task_queue event=priorities_saved count=%d order=%s", len(values), ",".join(values))
+    wake_queue()
+    return {"priorities": task_priority_order()}
+
+
+def run_queue(lane: str = "main") -> None:
+    light_lane = lane == "light"
+    logger.info("task_queue event=worker_started lane=%s", lane)
     while True:
         if queue_paused():
             with queue_condition:
                 queue_condition.wait(timeout=5)
             continue
+        priorities = task_priority_order()
+        priority_case = "CASE task_type " + " ".join(f"WHEN ? THEN {index}" for index, _ in enumerate(priorities)) + " ELSE 999 END"
         with connection() as db:
             # Immediate bulk edits are submitted as individual tasks so the
             # UI can report per-media progress. Run them ahead of unrelated
             # backlog items; otherwise an immediate operation could remain at
             # 0/N behind hundreds of older maintenance tasks.
-            row = db.execute("""SELECT * FROM task_queue
-                WHERE status='pending' AND task_type!='media_reindex'
-                ORDER BY CASE WHEN task_type IN ('tv_filtered_stream_edit_now','filtered_stream_edit_now') THEN 0
-                              WHEN task_type IN ('tv_filtered_stream_edit','filtered_stream_edit') THEN 1 ELSE 2 END,
-                         CASE WHEN task_type IN ('tv_filtered_stream_edit_now','filtered_stream_edit_now','tv_filtered_stream_edit','filtered_stream_edit') THEN id END DESC,
-                         id LIMIT 1""").fetchone()
+            if light_lane:
+                row = db.execute(f"""SELECT * FROM task_queue
+                    WHERE status='pending' AND task_type IN ('index_check_prepare','index_rebuild_prepare')
+                    ORDER BY {priority_case}, id LIMIT 1""", priorities).fetchone()
+            else:
+                row = db.execute(f"""SELECT * FROM task_queue
+                    WHERE status='pending' AND task_type NOT IN ('media_reindex','index_check_prepare','index_rebuild_prepare')
+                    ORDER BY {priority_case}, CASE WHEN task_type IN ('tv_filtered_stream_edit_now','filtered_stream_edit_now') THEN 0
+                                  WHEN task_type IN ('tv_filtered_stream_edit','filtered_stream_edit') THEN 1 ELSE 2 END,
+                             CASE WHEN task_type IN ('tv_filtered_stream_edit_now','filtered_stream_edit_now','tv_filtered_stream_edit','filtered_stream_edit') THEN id END DESC,
+                             id LIMIT 1""", priorities).fetchone()
             if row:
                 claimed = db.execute(
                     "UPDATE task_queue SET status='running',started_at=?,updated_at=?,attempts=attempts+1,progress_message='Starting' WHERE id=? AND status='pending'",
@@ -189,7 +316,7 @@ def run_queue() -> None:
                 queue_condition.wait(timeout=5)
             continue
         task_id, task_type = row["id"], row["task_type"]
-        logger.info("task_queue event=task_started id=%d type=%s attempt=%d", task_id, task_type, row["attempts"] + 1)
+        logger.info("task_queue event=task_started lane=%s id=%d type=%s attempt=%d", lane, task_id, task_type, row["attempts"] + 1)
         started = time.monotonic()
         try:
             result = TASK_HANDLERS[task_type](task_id, json.loads(row["payload_json"]))
@@ -199,7 +326,7 @@ def run_queue() -> None:
                     (json.dumps(result, ensure_ascii=False), utc_now(), utc_now(), task_id),
                 )
                 db.execute("DELETE FROM media_change_request WHERE task_id=?", (task_id,))
-            logger.info("task_queue event=task_completed id=%d type=%s seconds=%.2f", task_id, task_type, time.monotonic() - started)
+            logger.info("task_queue event=task_completed lane=%s id=%d type=%s seconds=%.2f", lane, task_id, task_type, time.monotonic() - started)
         except Exception as exc:
             message = str(getattr(exc, "detail", exc))
             with connection() as db:
@@ -214,7 +341,7 @@ def run_queue() -> None:
                     request_media_indexes(failed_path, ["core"], "Queued media change failed; refresh subtitle detection")
                 except Exception as index_exc:
                     logger.warning("subtitle_detection event=failed_task_refresh_error task=%d error=%s", task_id, str(index_exc).replace("\n", " ")[-300:])
-            logger.exception("task_queue event=task_failed id=%d type=%s seconds=%.2f error=%s", task_id, task_type, time.monotonic() - started, message.replace("\n", " ")[-500:])
+            logger.exception("task_queue event=task_failed lane=%s id=%d type=%s seconds=%.2f error=%s", lane, task_id, task_type, time.monotonic() - started, message.replace("\n", " ")[-500:])
 
 
 @app.on_event("startup")
@@ -238,6 +365,7 @@ def initialize_task_queue() -> None:
             CREATE INDEX IF NOT EXISTS media_change_request_path ON media_change_request(path);
             CREATE TABLE IF NOT EXISTS task_queue_settings (key TEXT PRIMARY KEY,value TEXT NOT NULL);
             INSERT OR IGNORE INTO task_queue_settings(key,value) VALUES('paused','0');
+            INSERT OR IGNORE INTO task_queue_settings(key,value) VALUES('priority_order','[]');
             UPDATE task_queue SET status='pending',progress_message='Recovered after restart',started_at=NULL WHERE status='running';
         """)
         db.execute("DELETE FROM media_change_request WHERE task_id NOT IN (SELECT id FROM task_queue WHERE status IN ('pending','running','failed'))")
@@ -250,10 +378,13 @@ def initialize_task_queue() -> None:
             if affected:
                 db.execute("INSERT OR IGNORE INTO media_change_request(task_id,path,requested_at) VALUES(?,?,?)", (row["id"], affected, row["created_at"]))
 def start_task_queue_worker() -> None:
-    global queue_thread
+    global queue_thread, queue_light_thread
     if not queue_thread or not queue_thread.is_alive():
-        queue_thread = threading.Thread(target=run_queue, name="vse-task-queue", daemon=True)
+        queue_thread = threading.Thread(target=run_queue, args=("main",), name="vse-task-queue", daemon=True)
         queue_thread.start()
+    if not queue_light_thread or not queue_light_thread.is_alive():
+        queue_light_thread = threading.Thread(target=run_queue, args=("light",), name="vse-task-queue-light", daemon=True)
+        queue_light_thread.start()
     wake_queue()
 
 
@@ -267,18 +398,35 @@ def add_queue_item(request: QueueRequest) -> dict:
 
 
 @app.get("/api/v65/queue")
-def list_queue(limit: int = 200) -> dict:
+def list_queue(limit: int = 200, status: str | None = None, task_type: str | None = None) -> dict:
     limit = max(1, min(limit, 500))
+    if status not in {None, "running", "pending", "failed", "succeeded", "cancelled"}:
+        raise HTTPException(400, "Unsupported queue status")
+    if task_type and not task_type.strip():
+        task_type = None
+    clauses = []
+    params: list[Any] = []
+    if status:
+        clauses.append("status=?")
+        params.append(status)
+    if task_type:
+        clauses.append("task_type=?")
+        params.append(task_type)
+    where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+    params.append(limit)
     with connection() as db:
-        rows = db.execute("SELECT * FROM task_queue ORDER BY CASE status WHEN 'running' THEN 0 WHEN 'pending' THEN 1 WHEN 'failed' THEN 2 ELSE 3 END,id DESC LIMIT ?", (limit,)).fetchall()
+        rows = db.execute(f"SELECT * FROM task_queue{where} ORDER BY CASE status WHEN 'running' THEN 0 WHEN 'pending' THEN 1 WHEN 'failed' THEN 2 ELSE 3 END,id DESC LIMIT ?", params).fetchall()
         counts = {row["status"]: row["amount"] for row in db.execute("SELECT status,count(*) amount FROM task_queue GROUP BY status")}
+        pending_rows = db.execute("SELECT task_type,count(*) amount FROM task_queue WHERE status='pending' GROUP BY task_type").fetchall()
+    priority = {value: index for index, value in enumerate(task_priority_order())}
+    pending_types = sorted(({"task_type": str(row["task_type"]), "count": row["amount"]} for row in pending_rows), key=lambda row: (priority.get(row["task_type"], 999999), row["task_type"]))
     items = []
     for row in rows:
         item = dict(row)
         item["payload"] = json.loads(item.pop("payload_json"))
         item.pop("result_json", None)
         items.append(item)
-    return {"paused": queue_paused(), "counts": counts, "items": items}
+    return {"paused": queue_paused(), "counts": counts, "pending_types": pending_types, "items": items}
 
 
 @app.post("/api/v65/queue/status")

@@ -31,7 +31,7 @@ body.app-busy::after {
 }
 
 body.app-busy::after { display:none; }
-#global-busy-overlay { position:fixed; inset:0; z-index:2147483646; display:grid; place-items:center; background:rgba(4,8,12,.62); backdrop-filter:blur(1px); }
+#global-busy-overlay { position:fixed; margin:auto; padding:0; border:0; max-width:none; max-height:none; inset:0; z-index:2147483646; display:grid; place-items:center; background:rgba(4,8,12,.62); backdrop-filter:blur(1px); }
 #global-busy-overlay .busy-card { width:min(360px,82vw); padding:22px 24px; border:1px solid color-mix(in srgb,var(--accent) 48%,var(--line)); border-radius:14px; background:#111820f5; color:var(--text); text-align:center; box-shadow:0 12px 40px #000b; }
 #global-busy-overlay .busy-ring { --busy-progress:18%; width:92px; height:92px; margin:0 auto 14px; border-radius:50%; display:grid; place-items:center; background:conic-gradient(var(--accent) var(--busy-progress),#2a343d 0); position:relative; }
 #global-busy-overlay .busy-ring::before { content:''; position:absolute; inset:8px; border-radius:50%; background:#111820; }

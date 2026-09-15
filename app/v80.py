@@ -42,6 +42,7 @@ def ensure_queue_tables() -> None:
             INSERT OR IGNORE INTO index_queue_settings(job) VALUES('core');
             INSERT OR IGNORE INTO index_queue_settings(job) VALUES('subtitles');
             INSERT OR IGNORE INTO index_queue_settings(job) VALUES('previews');
+            CREATE TABLE IF NOT EXISTS deferred_language_detection (path TEXT PRIMARY KEY, requested_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
         """)
 
 
@@ -103,8 +104,8 @@ def clear_index(job: str) -> None:
         elif job == "subtitles":
             db.execute("DELETE FROM subtitle_extended_index")
             db.execute("DELETE FROM subtitle_extended_media")
-            db.execute("DELETE FROM portuguese_language_detection")
-            db.execute("DELETE FROM portuguese_detection_state")
+            # Keep language-detection results when clearing the extended
+            # subtitle index; they are the source for targeted rechecks.
         else:
             db.execute("DELETE FROM preview_cache_index")
             db.execute("DELETE FROM preview_cache_files")
@@ -135,13 +136,8 @@ def pending_index_items(job: str) -> list[dict]:
              WHERE cached.path IS NULL OR cached.modified!=media.modified OR cached.size!=media.size{markup_stale}
              ORDER BY media.kind, media.title COLLATE NOCASE, media.path
         """)]
-    if job == "subtitles":
-        # Re-run subtitle inspection after detector algorithm upgrades even
-        # when the media fingerprint itself has not changed.
-        with connection() as db:
-            rows.extend(dict(row) for row in db.execute(
-                "SELECT media.path, media.modified, media.size, media.title FROM plex_media media LEFT JOIN portuguese_detection_state detected ON detected.path=media.path WHERE coalesce(detected.detector_version,0)!=2"
-            ).fetchall())
+    # Detector upgrades are opt-in and must not turn into a full-library
+    # reinspection. Targeted rechecks use the dedicated endpoint below.
     if job == "core":
         rows.extend(tv_index.pending_episode_rows())
     if job in {"core", "subtitles"}:
@@ -421,7 +417,19 @@ def invalidate_language_detections(paths: list[str]) -> int:
     return removed
 
 
-def request_media_indexes(path: str, names: list[str], reason: str) -> int:
+def flush_deferred_language_detection(path: str) -> dict:
+    ensure_queue_tables()
+    with connection() as db:
+        removed = db.execute("DELETE FROM deferred_language_detection WHERE path=?", (path,)).rowcount
+    if not removed:
+        return {"queued": False, "path": path}
+    added = enqueue("subtitles", path, "Stream editor closed; subtitle language detection")
+    from app.v65 import enqueue as enqueue_task
+    audio = enqueue_task("audio_language_detection", {"path": path}, "Stream editor closed; voice language detection", deduplicate=True)
+    return {"queued": True, "path": path, "subtitle_added": added, "voice_task_id": audio.get("id")}
+
+
+def request_media_indexes(path: str, names: list[str], reason: str, *, defer_detection: bool = False) -> int:
     requested = validate_jobs(names)
     # All media mutations request core indexing, whose worker also refreshes
     # language detection. Remove old marks before any UI can show stale results.
@@ -436,6 +444,20 @@ def request_media_indexes(path: str, names: list[str], reason: str) -> int:
     added = 0
     for job in requested:
         if enqueue(job, path, reason):
+            added += 1
+    # When enabled, every media mutation also refreshes both language detectors.
+    # This covers metadata, stream order, default/forced flags, additions and removals,
+    # even when the regular edit only requested the core index.
+    with connection() as db:
+        detection_row = db.execute("SELECT value FROM language_detection_settings WHERE key='incremental_detection_enabled'").fetchone()
+        if path and defer_detection:
+            db.execute("INSERT OR REPLACE INTO deferred_language_detection(path,requested_at) VALUES(?,CURRENT_TIMESTAMP)", (path,))
+    if path and not defer_detection and str(detection_row["value"] if detection_row else "1") == "1":
+        if enqueue("subtitles", path, "Changed-media subtitle language detection"):
+            added += 1
+        from app.v65 import enqueue as enqueue_task
+        audio_task = enqueue_task("audio_language_detection", {"path": path}, "Changed-media voice language detection", deduplicate=True)
+        if audio_task.get("status") == "pending":
             added += 1
     logger.info("index_queue event=media_indexes_requested file=%s indexes=%s added=%d reason=%s", path.replace("\n", "\\n"), ",".join(requested), added, reason.replace("\n", " ")[:200])
     return added
@@ -631,6 +653,12 @@ def start_index_queue_workers() -> None:
         threads[job] = active
 
 
+@app.post("/api/v79/language-detection/flush")
+def flush_language_detection(path: str) -> dict:
+    from app.v80 import flush_deferred_language_detection
+    return flush_deferred_language_detection(path)
+
+
 @app.post("/api/v80/index/request")
 def add_index_request(request: IndexRequest) -> dict:
     return {"path": request.path, "indexes": validate_jobs(request.indexes), "added": request_media_indexes(request.path, request.indexes, request.reason)}
@@ -639,6 +667,18 @@ def add_index_request(request: IndexRequest) -> dict:
 @app.get("/api/v80/setup/index/{job}/status")
 def index_queue_status(job: str) -> dict:
     validate_jobs([job]); return queue_state(job)
+
+
+@app.post("/api/v80/setup/index/subtitles/recheck-detection")
+def recheck_current_detection() -> dict:
+    """Reinspect only media already present in the language mismatch index."""
+    with connection() as db:
+        items = [dict(row) for row in db.execute(
+            "SELECT DISTINCT media.path,media.modified,media.size,media.title FROM portuguese_language_detection detected JOIN plex_media media ON media.path=detected.path WHERE detected.confidence>=0.60"
+        ).fetchall()]
+    added = enqueue_many("subtitles", items, "Recheck current language detections") if items else 0
+    logger.info("index_queue=subtitles event=detection_recheck_requested media=%d added=%d", len(items), added)
+    return {"media": len(items), "queued": added}
 
 
 @app.post("/api/v80/setup/index/{job}/check")

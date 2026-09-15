@@ -85,4 +85,13 @@ def media_details_with_ietf(path: str) -> dict:
             "SELECT source,type_index,external_path,metadata_language,detected_language,confidence,evidence "
             "FROM portuguese_language_detection WHERE path=?", (str(media),)
         ).fetchall()]
+        try:
+            audio_rows = {int(row["type_index"]): dict(row) for row in db.execute(
+                "SELECT type_index,metadata_language,detected_language,confidence,mismatch FROM audio_language_detection WHERE path=? AND mismatch=1", (str(media),)
+            ).fetchall()}
+        except Exception:
+            audio_rows = {}
+    for stream in streams:
+        if stream.get("codec_type") == "audio" and int(stream.get("type_index", -1)) in audio_rows:
+            stream["audio_detection"] = audio_rows[int(stream["type_index"])]
     return {"path": str(media), "streams": streams, "external_subtitles": external_subtitles(media), "portuguese_detection": detections}

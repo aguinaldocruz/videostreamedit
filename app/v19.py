@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import subprocess
 from pathlib import Path
 from typing import Literal
@@ -12,6 +13,7 @@ from pydantic import BaseModel, Field
 
 from app.v11 import connection, paged_metadata, plex_authorized_file, plex_movies, plex_tv, sync_plex
 from app.v2 import probe
+from app.v5 import external_subtitles
 from app.v16 import STATIC_DIR, app, asset
 
 
@@ -32,6 +34,92 @@ def title_values(item: dict) -> list[str]:
             values.append(value)
     return values
 
+
+
+class ForcedEvaluationRequest(BaseModel):
+    path: str
+
+
+def _subtitle_metrics(text: str, duration: float) -> dict:
+    blocks = re.split(r"\n\s*\n", text.strip()) if text.strip() else []
+    cues = 0
+    covered = 0.0
+    characters = 0
+    marker_cues = 0
+    for block in blocks:
+        lines = [line.strip() for line in block.splitlines() if line.strip()]
+        timing = next((line for line in lines if "-->" in line), "")
+        if not timing:
+            continue
+        cues += 1
+        match = re.search(r"(\d{1,2}):(\d{2}):(\d{2})[,\.](\d{3})\s*-->\s*(\d{1,2}):(\d{2}):(\d{2})[,\.](\d{3})", timing)
+        if match:
+            values = [int(value) for value in match.groups()]
+            start = values[0] * 3600 + values[1] * 60 + values[2] + values[3] / 1000
+            end = values[4] * 3600 + values[5] * 60 + values[6] + values[7] / 1000
+            covered += max(0.0, end - start)
+        payload = " ".join(line for line in lines if "-->" not in line and not line.isdigit())
+        payload = re.sub(r"<[^>]+>", " ", payload).strip()
+        characters += len(payload)
+        if re.search(r"[\[\(].{1,80}[\]\)]|♪|♫|\b(?:[A-Z][A-Z .'-]{2,}|signs?|speaks? foreign)\b", payload, re.I):
+            marker_cues += 1
+    minutes = max(duration / 60.0, 1.0)
+    density = cues / minutes
+    coverage = min(1.0, covered / duration) if duration > 0 else 0.0
+    sparse = density <= 8 and coverage <= 0.35
+    marker_ratio = marker_cues / cues if cues else 0.0
+    score = 0.0
+    if sparse: score += 0.45
+    if density <= 3: score += 0.20
+    if coverage <= 0.12: score += 0.15
+    if marker_ratio >= 0.20: score += 0.15
+    if cues and characters / cues <= 45: score += 0.05
+    return {"cues": cues, "coverage": round(coverage, 3), "density": round(density, 2), "marker_ratio": round(marker_ratio, 3), "score": round(min(score, 0.95), 3), "text_available": bool(cues)}
+
+
+def _extract_subtitle_text(media: Path, index: int, codec: str) -> str:
+    if codec.lower() in {"subrip", "ass", "ssa", "webvtt", "mov_text", "text"}:
+        try:
+            result = subprocess.run(["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-i", str(media), "-map", f"0:s:{index}", "-f", "srt", "pipe:1"], capture_output=True, text=True, timeout=180, check=True)
+            return result.stdout
+        except (OSError, subprocess.SubprocessError):
+            return ""
+    return ""
+
+
+@app.post("/api/v19/stream/evaluate-forced")
+def evaluate_forced_subtitles(request: ForcedEvaluationRequest) -> dict:
+    media = plex_authorized_file(request.path)
+    info = probe(media)
+    duration = float((info.get("format") or {}).get("duration") or 0)
+    subtitles = []
+    subtitle_index = 0
+    for stream in info.get("streams", []):
+        if stream.get("codec_type") != "subtitle":
+            continue
+        tags = stream.get("tags") or {}
+        codec = str(stream.get("codec_name") or "unknown")
+        text = _extract_subtitle_text(media, subtitle_index, codec)
+        metrics = _subtitle_metrics(text, duration)
+        subtitles.append({"source": "embedded", "type_index": subtitle_index, "codec": codec, "language": tags.get("language") or "", "title": tags.get("title") or "", "forced": bool((stream.get("disposition") or {}).get("forced")), "default": bool((stream.get("disposition") or {}).get("default")), **metrics})
+        subtitle_index += 1
+    for item in external_subtitles(media):
+        path = Path(str(item.get("path") or item.get("external_path") or ""))
+        text = ""
+        if path.is_file() and path.suffix.lower() in {".srt", ".vtt", ".ass", ".ssa"}:
+            try: text = path.read_text(encoding="utf-8", errors="replace")
+            except OSError: text = ""
+        metrics = _subtitle_metrics(text, duration)
+        subtitles.append({"source": "external", "path": str(path), "codec": path.suffix.lstrip(".") or "unknown", "language": item.get("language") or "", "title": item.get("title") or path.name, "forced": bool(item.get("forced")), "default": bool(item.get("default")), **metrics})
+    text_items = [item for item in subtitles if item["text_available"]]
+    for item in subtitles:
+        if item["text_available"]:
+            if item["score"] >= 0.70: item["recommendation"] = "Likely forced"
+            elif item["score"] <= 0.25 and item["coverage"] >= 0.45: item["recommendation"] = "Likely full subtitle"
+            else: item["recommendation"] = "Uncertain"
+        else:
+            item["recommendation"] = "Cannot evaluate automatically (graphical or unsupported subtitle)"
+    return {"path": str(media), "subtitle_count": len(subtitles), "analyzed": len(text_items), "message": "Analysis compares all subtitle tracks in this media; recommendations are non-destructive.", "subtitles": subtitles}
 
 
 class VideoTitleRequest(BaseModel):
@@ -202,17 +290,33 @@ def change_requested_paths() -> set[str]:
     return set(change_requests_by_path())
 
 
+def audio_detection_by_path() -> dict[str, dict]:
+    with connection() as db:
+        try:
+            rows = db.execute("SELECT path,metadata_language,detected_language,confidence FROM audio_language_detection WHERE mismatch=1").fetchall()
+        except Exception:
+            return {}
+    result = {}
+    for row in rows:
+        item = {"confidence": float(row["confidence"]), "metadata_language": str(row["metadata_language"] or ""), "detected_language": str(row["detected_language"] or "")}
+        current = result.get(str(row["path"]))
+        if current is None or item["confidence"] > current["confidence"]:
+            result[str(row["path"])] = item
+    return result
+
+
 @app.get("/api/v19/movies")
 def plex_movies_with_alternatives() -> list[dict]:
     aliases = aliases_by_path()
     requested = change_requests_by_path()
+    audio_detection = audio_detection_by_path()
     with connection() as db:
         detection = {}
         for row in db.execute("SELECT path,metadata_language,detected_language,confidence FROM portuguese_language_detection").fetchall():
             current = detection.get(str(row["path"]))
             if current is None or float(row["confidence"]) > current["confidence"]:
                 detection[str(row["path"])] = {"confidence": float(row["confidence"]), "metadata_language": str(row["metadata_language"] or ""), "detected_language": str(row["detected_language"] or "")}
-    return [{**movie, "alternative_titles": aliases.get(movie["path"], []), "change_requested": movie["path"] in requested, "change_requests": requested.get(movie["path"], []), "portuguese_detection_confidence": (detection.get(str(movie["path"])) or {}).get("confidence"), "portuguese_detection_metadata": (detection.get(str(movie["path"])) or {}).get("metadata_language"), "portuguese_detection_language": (detection.get(str(movie["path"])) or {}).get("detected_language")} for movie in plex_movies()]
+    return [{**movie, "alternative_titles": aliases.get(movie["path"], []), "change_requested": movie["path"] in requested, "change_requests": requested.get(movie["path"], []), "portuguese_detection_confidence": (detection.get(str(movie["path"])) or {}).get("confidence"), "portuguese_detection_metadata": (detection.get(str(movie["path"])) or {}).get("metadata_language"), "portuguese_detection_language": (detection.get(str(movie["path"])) or {}).get("detected_language"), "audio_detection_confidence": (audio_detection.get(str(movie["path"])) or {}).get("confidence"), "audio_detection_metadata": (audio_detection.get(str(movie["path"])) or {}).get("metadata_language"), "audio_detection_language": (audio_detection.get(str(movie["path"])) or {}).get("detected_language")} for movie in plex_movies()]
 
 
 @app.get("/api/v19/tv")
@@ -220,6 +324,7 @@ def plex_tv_with_alternatives() -> list[dict]:
     aliases = aliases_by_path()
     requested = change_requests_by_path()
     shows = plex_tv()
+    audio_detection = audio_detection_by_path()
     # Index activity is derived from the live queue, so the filter remains useful
     # while a long-running core/subtitle/preview index is in progress.
     with connection() as db:
@@ -259,6 +364,10 @@ def plex_tv_with_alternatives() -> list[dict]:
         top_detection = max((detection[path] for path in paths if path in detection), key=lambda item: item["confidence"], default=None)
         show["portuguese_detection_metadata"] = top_detection["metadata_language"] if top_detection else None
         show["portuguese_detection_language"] = top_detection["detected_language"] if top_detection else None
+        top_audio = max((audio_detection[path] for path in paths if path in audio_detection), key=lambda item: item["confidence"], default=None)
+        show["audio_detection_confidence"] = top_audio["confidence"] if top_audio else None
+        show["audio_detection_metadata"] = top_audio["metadata_language"] if top_audio else None
+        show["audio_detection_language"] = top_audio["detected_language"] if top_audio else None
         show["alternative_titles"] = next((aliases[path] for path in paths if aliases.get(path)), [])
         for season in show["seasons"]:
             for episode in season["episodes"]:
@@ -269,6 +378,10 @@ def plex_tv_with_alternatives() -> list[dict]:
                 episode["portuguese_detection_confidence"] = episode_detection.get("confidence")
                 episode["portuguese_detection_metadata"] = episode_detection.get("metadata_language")
                 episode["portuguese_detection_language"] = episode_detection.get("detected_language")
+                audio_episode = audio_detection.get(episode["path"]) or {}
+                episode["audio_detection_confidence"] = audio_episode.get("confidence")
+                episode["audio_detection_metadata"] = audio_episode.get("metadata_language")
+                episode["audio_detection_language"] = audio_episode.get("detected_language")
     return shows
 
 
@@ -338,7 +451,10 @@ def html_subtitle_report(kind: str) -> dict:
     with connection() as db:
         rows = db.execute(
             "SELECT path,source,type_index,external_path,codec FROM subtitle_extended_index "
-            "WHERE markup LIKE '%HTML tags%' ORDER BY path,type_index,external_path"
+            "WHERE markup LIKE '%HTML tags%' "
+            "AND path NOT IN (SELECT json_extract(payload_json, '$.path') FROM task_queue "
+            "WHERE task_type='subtitle_html_cleanup' AND status IN ('pending','running')) "
+            "ORDER BY path,type_index,external_path"
         ).fetchall()
     refs_by_path = {}
     for row in rows:
@@ -403,19 +519,19 @@ def portuguese_language_report(kind: str) -> dict:
         raise HTTPException(400, "Kind must be tv or movies")
     with connection() as db:
         rows = db.execute(
-            "SELECT d.path,d.detected_language,d.confidence,d.metadata_region,d.evidence "
+            "SELECT d.path,d.source,d.type_index,d.external_path,d.metadata_language,d.detected_language,d.confidence,d.metadata_region,d.evidence "
             "FROM portuguese_language_detection d JOIN plex_media p ON p.path=d.path "
             "WHERE d.confidence>=0.60 ORDER BY d.path"
         ).fetchall()
     by_path = {}
     for row in rows:
-        by_path.setdefault(str(row["path"]), []).append({"detected_language": row["detected_language"], "confidence": round(float(row["confidence"]) * 100, 1), "metadata_region": row["metadata_region"], "evidence": row["evidence"]})
+        by_path.setdefault(str(row["path"]), []).append({"source": row["source"], "type_index": int(row["type_index"]), "external_path": row["external_path"], "metadata_language": row["metadata_language"], "metadata_region": row["metadata_region"], "detected_language": row["detected_language"], "confidence": round(float(row["confidence"]) * 100, 1), "evidence": row["evidence"]})
     items = []
     if kind == "movies":
         for movie in plex_movies():
             mismatches = by_path.get(str(movie["path"]), [])
             if mismatches:
-                items.append({"title": Path(str(movie.get("name") or movie["path"])).stem, "root_name": movie.get("root_name") or "", "media_count": 1, "mismatches": mismatches})
+                items.append({"title": Path(str(movie.get("name") or movie["path"])).stem, "path": str(movie["path"]), "root_name": movie.get("root_name") or "", "media_count": 1, "mismatches": mismatches})
     else:
         for show in plex_tv():
             episodes = []
@@ -427,9 +543,88 @@ def portuguese_language_report(kind: str) -> dict:
             if episodes:
                 items.append({"title": str(show["name"]), "root_name": str(show.get("root_name") or ""), "media_count": len(episodes), "episodes": episodes})
     items.sort(key=lambda item: item["title"].casefold())
+    fixable = 0
+    for item in items:
+        groups = item.get("episodes") or [{"mismatches": item.get("mismatches") or []}]
+        fixable += sum(1 for group in groups for mismatch in group.get("mismatches") or [] if float(mismatch.get("confidence") or 0) >= 80 and mismatch.get("source") == "embedded")
+    return {"kind": kind, "items": items, "title_count": len(items), "media_count": sum(item["media_count"] for item in items), "fixable_above_80": fixable}
+
+
+class LanguageDetectionFixRequest(BaseModel):
+    kind: Literal["tv", "movies"]
+
+
+def _detected_language_pair(value: str) -> tuple[str, str] | None:
+    key = str(value or "").strip().casefold().replace("_", "-")
+    if key in {"pt-br", "pob", "por-br"}: return "pt", "BR"
+    if key in {"pt-pt", "pt", "por-pt"}: return "pt", "PT"
+    if key in {"en", "eng"}: return "en", ""
+    return None
+
+
+@app.post("/api/v19/reports/portuguese-language/fix")
+def fix_portuguese_language_report(request: LanguageDetectionFixRequest) -> dict:
+    # Build one queued media_edit per file, grouping all embedded subtitle
+    # streams above 80% certainty so each file is processed only once.
+    with connection() as db:
+        rows = db.execute("""SELECT d.path,d.source,d.type_index,d.detected_language,d.confidence,p.kind
+            FROM portuguese_language_detection d JOIN plex_media p ON p.path=d.path
+            WHERE d.confidence>=0.80 AND d.source='embedded'
+              AND ((?='movies' AND p.kind='movie') OR (?='tv' AND p.kind='episode'))
+            ORDER BY d.path,d.type_index""", (request.kind, request.kind)).fetchall()
+    grouped: dict[str, list[dict]] = {}
+    skipped = 0
+    for row in rows:
+        pair = _detected_language_pair(row["detected_language"])
+        if not pair:
+            skipped += 1
+            continue
+        grouped.setdefault(str(row["path"]), []).append({"codec_type": "subtitle", "type_index": int(row["type_index"]), "language": pair[0], "region": pair[1]})
+    from app import v65 as task_queue
+    queued = 0
+    task_ids = []
+    for path, tracks in grouped.items():
+        task = task_queue.enqueue("media_edit", {"edit": {"path": path, "tracks": tracks}, "reindex_indexes": ["core", "subtitles"]}, "Fix detected subtitle languages (above 80%)", deduplicate=True)
+        task_ids.append(task["id"]); queued += len(tracks)
+    logger.info("task_queue event=language_detection_fix kind=%s media=%d streams=%d skipped=%d", request.kind, len(task_ids), queued, skipped)
+    return {"queued_media": len(task_ids), "queued_streams": queued, "skipped": skipped, "task_ids": task_ids}
+
+
+@app.get("/api/v19/reports/forced-streams")
+def forced_stream_report(kind: str) -> dict:
+    if kind not in {"tv", "movies"}:
+        raise HTTPException(400, "Kind must be tv or movies")
+    with connection() as db:
+        setting = db.execute("SELECT value FROM language_detection_settings WHERE key='forced_report_excluded_track_names'").fetchone()
+        rows = db.execute("""SELECT path,stream_type,type_index,external_path,codec,language,region,track_name
+            FROM media_stream_index WHERE is_forced=1 ORDER BY path,type_index""").fetchall()
+    try:
+        excluded = {str(value).strip().casefold() for value in (json.loads(setting["value"]) if setting else []) if str(value).strip()}
+    except (TypeError, ValueError, json.JSONDecodeError):
+        excluded = set()
+    by_path = {}
+    for row in rows:
+        if str(row["track_name"] or "").strip().casefold() in excluded:
+            continue
+        by_path.setdefault(str(row["path"]), []).append(dict(row))
+    items = []
+    if kind == "movies":
+        for movie in plex_movies():
+            path = str(movie["path"]); refs = by_path.get(path, [])
+            if refs:
+                items.append({"title": Path(str(movie.get("name") or path)).stem, "path": path, "root_name": movie.get("root_name") or "", "media_count": 1, "forced_count": len(refs), "streams": refs})
+    else:
+        for show in plex_tv():
+            episodes = []
+            for season in show["seasons"]:
+                for episode in season["episodes"]:
+                    path = str(episode["path"]); refs = by_path.get(path, [])
+                    if refs:
+                        episodes.append({"episode": episode.get("name") or Path(path).stem, "path": path, "forced_count": len(refs), "streams": refs})
+            if episodes:
+                items.append({"title": str(show["name"]), "root_name": str(show.get("root_name") or ""), "media_count": len(episodes), "forced_count": sum(e["forced_count"] for e in episodes), "episodes": episodes})
+    items.sort(key=lambda item: item["title"].casefold())
     return {"kind": kind, "items": items, "title_count": len(items), "media_count": sum(item["media_count"] for item in items)}
-
-
 
 
 @app.middleware("http")

@@ -9,6 +9,7 @@
   };
   function decorate(container){
     container.querySelectorAll('.edit-file').forEach(button=>{
+      if($('#stream-dialog')?.open&&state.selectedPath===button.dataset.path)return;
       if(!requested(button.dataset.path))return;const items=requests(button.dataset.path),row=button.closest('tr');row?.classList.add('change-requested-row');const title=row?.querySelector('.movie-title,.episode-title');
       if(title&&!row.querySelector('.change-requested-badge'))title.insertAdjacentHTML('afterend',`<span class="change-requested-badge ${items.some(item=>item.status==='running')?'running':''} ${items.some(item=>item.status==='failed')?'failed':''}" title="${attr(clue(items))}">${esc(statusLabel(items))}</span>`);
     });
@@ -16,11 +17,12 @@
   const oldMovies=renderMovies;renderMovies=function(){oldMovies();decorate($('#movie-list'))};
   const oldEpisodes=renderEpisodes;renderEpisodes=function(){oldEpisodes();decorate($('#episode-list'))};
   const oldOpen=openEditor;openEditor=async function(path,label){
+    state.selectedPath=path;
     $('#stream-dialog .dialog-title .change-requested-badge')?.remove();
     let status={change_requested:requested(path),requests:requests(path)};try{status=await api(`/api/v78/change-requested?path=${encodeURIComponent(path)}`)}catch(_){}
-    if(status.change_requested)toast(`${statusLabel(status.requests)}: hover the notice for queued change details`,status.requests.some(item=>item.status==='failed'));
+    if(status.change_requested&&!$('#stream-dialog')?.open)toast(`${statusLabel(status.requests)}: hover the notice for queued change details`,status.requests.some(item=>item.status==='failed'));
     const result=await oldOpen(path,label);
-    if(status.change_requested&&$('#stream-dialog')?.open&&!$('#stream-content .change-requested-notice')){
+    if(status.change_requested&&!$('#stream-dialog')?.open&&!$('#stream-content .change-requested-notice')){
       const details=clue(status.requests);$('#stream-content').insertAdjacentHTML('afterbegin',`<p class="change-requested-notice" title="${attr(details)}"><strong>${esc(statusLabel(status.requests))}</strong> — this media has ${status.requests.length} queued, running, or failed request${status.requests.length===1?'':'s'}. Hover for details and review the task queue before applying conflicting edits.</p>`);
       const selected=$('#selected-file');if(selected&&!selected.parentElement.querySelector('.change-requested-badge'))selected.insertAdjacentHTML('afterend',`<span class="change-requested-badge" title="${attr(details)}">${esc(statusLabel(status.requests))}</span>`);
     }

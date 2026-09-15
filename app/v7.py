@@ -44,6 +44,7 @@ class ReorderEditRequest(BaseModel):
     default_subtitle: str | None = None
     forced_subtitle: str | None = None
     remove: list[str] = []
+    defer_language_detection: bool = False
 
 
 def asset(content: str, media_type: str) -> Response:

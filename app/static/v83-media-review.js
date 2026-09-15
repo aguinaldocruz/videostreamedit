@@ -2,8 +2,32 @@
   const actions=$('#stream-form .dialog-actions'),close=actions?.querySelector('[data-close-stream]');
   if(!actions||!close)return;
   const review=document.createElement('button');review.type='button';review.id='review-media';review.textContent='Review media';review.title='Watch this media with the selected audio and subtitle';close.insertAdjacentElement('beforebegin',review);
+  const evaluate=document.createElement('button');evaluate.type='button';evaluate.id='evaluate-forced';evaluate.textContent='Evaluate Forced';evaluate.title='Analyze all subtitles in this media for a likely Forced subtitle';evaluate.hidden=true;close.insertAdjacentElement('beforebegin',evaluate);
+  document.body.insertAdjacentHTML('beforeend','<dialog id="forced-evaluation-dialog" class="forced-evaluation-dialog"><div class="dialog-title"><div><h2>Forced subtitle evaluation</h2><p id="forced-evaluation-summary"></p></div><button type="button" class="icon-close" data-close-forced-evaluation aria-label="Close">×</button></div><div id="forced-evaluation-results"></div><div class="dialog-actions"><button type="button" data-close-forced-evaluation>Close</button></div></dialog>');
   document.body.insertAdjacentHTML('beforeend',`<dialog id="media-review-dialog" class="media-review-dialog"><div class="dialog-title"><div><h2>Review media</h2><p id="media-review-title"></p></div><div class="media-review-controls"><label>Audio<select id="media-review-audio"></select></label><label>Subtitle<select id="media-review-subtitle"></select></label><button type="button" id="media-review-load">Load selection</button></div><button type="button" class="preview-close-top" data-close-media-review>Close</button><button type="button" class="icon-close" data-close-media-review aria-label="Close">×</button></div><div id="media-review-stage"><p class="preview-loading">Choose Review media to prepare a clip.</p></div><div class="media-review-navigation"><button type="button" id="media-review-first" title="Beginning">&lt;&lt;</button><button type="button" id="media-review-previous" title="Previous 60 seconds">&lt;</button><span id="media-review-position">--:-- / --:--</span><button type="button" id="media-review-next" title="Next 60 seconds">&gt;</button><button type="button" id="media-review-last" title="Last segment">&gt;&gt;</button></div></dialog>`);
   const dialog=$('#media-review-dialog'),stage=$('#media-review-stage'),audio=$('#media-review-audio'),subtitle=$('#media-review-subtitle');
+  const forcedDialog=$('#forced-evaluation-dialog'),forcedSummary=$('#forced-evaluation-summary'),forcedResults=$('#forced-evaluation-results');
+  function updateForcedAvailability(){evaluate.hidden=!rows('subtitle').length;}
+  window.updateForcedEvaluateAvailability=updateForcedAvailability;
+  new MutationObserver(updateForcedAvailability).observe($('#stream-content'),{childList:true,subtree:true});
+  forcedDialog.querySelectorAll('[data-close-forced-evaluation]').forEach(button=>button.onclick=()=>forcedDialog.close());
+  forcedDialog.addEventListener('cancel',event=>{event.preventDefault();forcedDialog.close()});
+  function forcedLabel(item,index){return `${item.source==='external'?'External subtitle':`Subtitle ${Number(item.type_index)+1}`} · ${item.language||'language unset'}${item.title?` · ${item.title}`:''}`}
+  async function evaluateForced(){
+    const subtitles=rows('subtitle');if(!subtitles.length){updateForcedAvailability();return;}
+    if(typeof setGlobalBusyProgress==='function')setGlobalBusyProgress(0,3,'Evaluating forced subtitles','Reading all subtitle streams in this media');
+    evaluate.disabled=true;
+    try{
+      if(typeof setGlobalBusyProgress==='function')setGlobalBusyProgress(1,3,'Analyzing subtitle coverage','Measuring timing, density, and signs or foreign-dialogue cues');
+      const result=await api('/api/v19/stream/evaluate-forced',{method:'POST',body:JSON.stringify({path:state.selectedPath})});
+      if(typeof setGlobalBusyProgress==='function')setGlobalBusyProgress(3,3,'Forced evaluation complete','Recommendations are non-destructive and require user confirmation');
+      forcedSummary.textContent=`${result.subtitle_count} subtitle stream${result.subtitle_count===1?'':'s'} analyzed · ${result.analyzed} text stream${result.analyzed===1?'':'s'} available for content analysis`;
+      forcedResults.innerHTML=`<p class="muted">${esc(result.message)}</p>${result.subtitles.map((item,index)=>`<article class="forced-evaluation-item"><div><strong>${esc(forcedLabel(item,index))}</strong><span class="forced-recommendation recommendation-${item.recommendation.startsWith('Likely')?'likely':item.recommendation.startsWith('Cannot')?'unsupported':'uncertain'}">${esc(item.recommendation)}</span></div><small>${item.text_available?`Confidence ${(Number(item.score)*100).toFixed(0)}% · ${item.cues} cues · ${(Number(item.coverage)*100).toFixed(1)}% timeline coverage · ${Number(item.density).toFixed(1)} cues/min`:'Content could not be read automatically; metadata and filename remain the authority.'}${item.forced?' · Currently Forced':''}</small></article>`).join('')||'<p>No subtitle streams were found.</p>'}`;
+      forcedDialog.showModal();
+    }catch(error){forcedSummary.textContent='Evaluation failed';forcedResults.innerHTML=`<p class="no-streams error">${esc(error.message)}</p>`;forcedDialog.showModal();if(typeof setGlobalBusyProgress==='function')setGlobalBusyProgress(3,3,'Forced evaluation failed',error.message)}
+    finally{evaluate.disabled=false;updateForcedAvailability()}
+  }
+  evaluate.onclick=evaluateForced;
   let start=300,duration=0,videoUrl='',requestId=0;
   const format=value=>{value=Math.max(0,Math.floor(Number(value)||0));return`${Math.floor(value/60)}:${String(value%60).padStart(2,'0')}`};
   function rows(type){return[...document.querySelectorAll('#stream-content .stream-row')].filter(row=>row.dataset.codecType===type&&!row.querySelector('[name=remove]')?.checked)}
@@ -16,7 +40,7 @@
   dialog.querySelectorAll('[data-close-media-review]').forEach(button=>button.onclick=closeViewer);dialog.addEventListener('cancel',event=>{event.preventDefault();closeViewer()});
   function selectedSubtitleRow(){const value=subtitle.value;if(!value)return null;return rows('subtitle').find(row=>row.dataset.key===value)||null}
   async function loadClip(){
-    if(!audio.value)return;const own=++requestId;clearVideo();stage.innerHTML='<p class="preview-loading">Preparing the selected 60-second review clip…</p>';beginGlobalBusy();
+    if(!audio.value)return;const own=++requestId;clearVideo();stage.innerHTML='<p class="preview-loading">Preparing the selected 60-second review clip…</p>';beginGlobalBusy('Preparing media review preview');
     const audioRow=rows('audio').find(row=>row.dataset.key===audio.value),subRow=selectedSubtitleRow(),query=new URLSearchParams({path:state.selectedPath,audio_index:audioRow.dataset.typeIndex,start:String(start),length:'60',subtitle_source:'none'});
     if(subRow){query.set('subtitle_source',subRow.dataset.external==='true'?'external':'embedded');if(subRow.dataset.external==='true')query.set('external_path',subRow.dataset.path);else query.set('subtitle_index',subRow.dataset.typeIndex)}
     try{const response=await originalFetch(`/api/v83/media-review/clip?${query}`);if(!response.ok){const body=await response.json().catch(()=>({}));throw new Error(typeof body.detail==='string'?body.detail:`Review failed (${response.status})`)}const blob=await response.blob();if(own!==requestId)return;duration=Number(response.headers.get('X-Media-Duration')||0);start=Number(response.headers.get('X-Review-Start')||start);videoUrl=URL.createObjectURL(blob);stage.innerHTML='<video controls autoplay playsinline></video>';stage.querySelector('video').src=videoUrl;updateNavigation()}catch(error){if(own===requestId)stage.innerHTML=`<p class="no-streams error">${esc(error.message)}</p>`}finally{endGlobalBusy()}

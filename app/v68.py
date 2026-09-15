@@ -6,7 +6,9 @@ import os
 import re
 import sqlite3
 import subprocess
+import shutil
 import tempfile
+import hashlib
 import threading
 import time
 import urllib.parse
@@ -15,6 +17,7 @@ from pathlib import Path
 from typing import Literal
 
 from fastapi import HTTPException
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 import app.v11 as plex
@@ -339,12 +342,226 @@ tasks.TASK_HANDLERS["subtitle_html_cleanup"] = process_subtitle_html
 
 _TESS_LANGUAGES = {"pt": "por", "pt-br": "por", "pt-pt": "por", "en": "eng", "es": "spa", "fr": "fra", "de": "deu", "it": "ita"}
 
+OCR_STAGE_ROOT = Path(os.environ.get("VSE_OCR_STAGE_DIR", "/config/ocr-staging"))
+
+def _ensure_ocr_stage_table() -> None:
+    with plex.connection() as db:
+        db.execute("""CREATE TABLE IF NOT EXISTS ocr_staged_backups (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, original_path TEXT NOT NULL, staged_path TEXT NOT NULL UNIQUE,
+            title TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'staged', task_id INTEGER,
+            size_bytes INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            converted_at TEXT, restored_at TEXT, approved_at TEXT
+        )""")
+        try:
+            db.execute("ALTER TABLE ocr_staged_backups ADD COLUMN media_kind TEXT NOT NULL DEFAULT 'unknown'")
+        except sqlite3.OperationalError as exc:
+            if "duplicate column" not in str(exc).lower():
+                raise
+        db.execute("CREATE INDEX IF NOT EXISTS ocr_staged_status ON ocr_staged_backups(status, id)")
+        try:
+            db.execute("ALTER TABLE ocr_staged_backups ADD COLUMN converted_path TEXT")
+        except sqlite3.OperationalError as exc:
+            if "duplicate column" not in str(exc).lower():
+                raise
+
+def stage_ocr_original(path: Path, task_id: int) -> int:
+    _ensure_ocr_stage_table()
+    if not path.is_file():
+        raise RuntimeError(f"Media is not accessible: {path}")
+    OCR_STAGE_ROOT.mkdir(parents=True, exist_ok=True)
+    digest = hashlib.sha256(str(path).encode("utf-8", "surrogateescape")).hexdigest()[:20]
+    staged = OCR_STAGE_ROOT / f"{digest}-{path.name}"
+    with plex.connection() as db:
+        existing = db.execute("SELECT id,staged_path,status FROM ocr_staged_backups WHERE original_path=? AND status IN ('staged','converted') ORDER BY id DESC LIMIT 1", (str(path),)).fetchone()
+        if existing and Path(existing["staged_path"]).is_file():
+            return int(existing["id"])
+    if not staged.exists():
+        shutil.copy2(path, staged)
+    media_kind = "unknown"
+    with plex.connection() as db:
+        media_row = db.execute("SELECT kind FROM plex_media WHERE path=? LIMIT 1", (str(path),)).fetchone()
+        if media_row and media_row["kind"]:
+            media_kind = "tv episode" if str(media_row["kind"]) == "episode" else str(media_row["kind"])
+        # The same media can be submitted by a manual request and a queued
+        # request at nearly the same time.  The path is intentionally unique,
+        # so make the insert idempotent instead of allowing that race to fail
+        # the OCR job.
+        size_bytes = staged.stat().st_size
+        db.execute(
+            "INSERT OR IGNORE INTO ocr_staged_backups(original_path,staged_path,title,media_kind,status,task_id,size_bytes) VALUES(?,?,?,?,?,?,?)",
+            (str(path), str(staged), path.name, media_kind, "staged", task_id, size_bytes),
+        )
+        row = db.execute(
+            "SELECT id,status FROM ocr_staged_backups WHERE staged_path=? LIMIT 1",
+            (str(staged),),
+        ).fetchone()
+        if not row:
+            raise RuntimeError(f"Unable to register OCR staging backup: {staged}")
+        # A previously approved/restored backup may legitimately be reused
+        # for a later conversion; reactivate its record rather than inserting
+        # a duplicate row with the same staged_path.
+        if str(row["status"]) not in {"staged", "converted"}:
+            db.execute(
+                "UPDATE ocr_staged_backups SET original_path=?,title=?,media_kind=?,status='staged',task_id=?,size_bytes=?,restored_at=NULL,approved_at=NULL WHERE id=?",
+                (str(path), path.name, media_kind, task_id, size_bytes, int(row["id"])),
+            )
+        return int(row["id"])
+
+def _ocr_stage_update(stage_id: int, status: str) -> None:
+    _ensure_ocr_stage_table()
+    column = "converted_at" if status == "converted" else "restored_at" if status == "restored" else "approved_at" if status == "approved" else None
+    with plex.connection() as db:
+        if column:
+            db.execute(f"UPDATE ocr_staged_backups SET status=?,{column}=CURRENT_TIMESTAMP WHERE id=?", (status, stage_id))
+        else:
+            db.execute("UPDATE ocr_staged_backups SET status=? WHERE id=?", (status, stage_id))
+
+
+
+def _ccextractor_subtitle(media: Path, type_index: int, language: str, codec: str) -> Path | None:
+    """Use CCExtractor for DVB/teletext/closed-caption bitmap streams."""
+    codec_key = codec.casefold().replace("_", " ")
+    if not any(value in codec_key for value in ("dvb", "teletext", "eia-608", "cea-608", "cea-708", "xsub")):
+        return None
+    if not shutil.which("ccextractor"):
+        logger.warning("ocr event=ccextractor_unavailable codec=%s", codec)
+        return None
+    work = Path(tempfile.mkdtemp(prefix="vse-ccx-")); source = work / "source.mkv"; output = work / "converted.srt"
+    tess = _TESS_LANGUAGES.get(language.strip().casefold(), language.strip())
+    try:
+        # DVB pages are bitmap subtitles.  First make a DVD-sub/VobSub-style
+        # intermediate when possible; this gives OCR a stable bitmap codec and
+        # preserves event timing while retaining the original as fallback.
+        is_dvb = "dvb" in codec_key
+        remux_args = ["-map", "0:v:0", "-map", f"0:s:{type_index}", "-c:v", "copy"]
+        if is_dvb:
+            remux_args += ["-c:s", "dvdsub"]
+            logger.info("ocr event=dvb_to_vobsub_started file=%s stream=%d", str(media).replace("\n", "\\n"), type_index)
+        else:
+            remux_args += ["-c", "copy"]
+        try:
+            subprocess.run(["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-i", str(media), *remux_args, str(source)], capture_output=True, text=True, timeout=900, check=True)
+        except subprocess.CalledProcessError:
+            if not is_dvb:
+                raise
+            # Some DVB variants cannot be encoded as dvdsub by FFmpeg.  Keep
+            # a second, lossless MKV remux path rather than failing conversion.
+            logger.warning("ocr event=dvb_to_vobsub_fallback file=%s stream=%d", str(media).replace("\n", "\\n"), type_index)
+            subprocess.run(["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-i", str(media), "-map", "0:v:0", "-map", f"0:s:{type_index}", "-c", "copy", str(source)], capture_output=True, text=True, timeout=900, check=True)
+        command = ["ccextractor", "--input", "mkv", "--out", "srt", "--ocr-line-split", "--no-progress-bar", "--ocrlang", tess, "-o", str(output), str(source)]
+        subprocess.run(command, capture_output=True, text=True, timeout=3600, check=True)
+        if output.is_file() and output.stat().st_size > 0:
+            raw = output.read_text(encoding="utf-8", errors="replace")
+            cues = len(re.findall(r"(?m)^\d+\s*$", raw))
+            letters = len(re.findall(r"[A-Za-zÀ-ÿ]", raw))
+            if cues and letters >= max(8, cues * 2):
+                logger.info("ocr event=ccextractor_completed file=%s stream=%d codec=%s vobsub_intermediate=%s cues=%d", str(media).replace("\n", "\\n"), type_index, codec, is_dvb, cues)
+                return output
+            logger.warning("ocr event=ccextractor_rejected file=%s stream=%d reason=low_quality cues=%d letters=%d", str(media).replace("\n", "\\n"), type_index, cues, letters)
+    except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        logger.warning("ocr event=ccextractor_failed file=%s stream=%d error=%s", str(media).replace("\n", "\\n"), type_index, str(exc).replace("\n", " ")[-300:])
+    shutil.rmtree(work, ignore_errors=True)
+    return None
+
+
+def _bdsup2sub_normalized(media: Path, type_index: int, codec: str) -> Path | None:
+    """Extract and normalize a bitmap subtitle with BDSup2Sub when available."""
+    jar = Path("/opt/bdsup2sub.jar")
+    if not jar.is_file() or codec.casefold() not in {"hdmv pgs", "hdmv_pgs_subtitle", "pgs", "vobsub", "dvd_subtitle"}:
+        return None
+    work = Path(tempfile.mkdtemp(prefix="vse-bdsup-"))
+    source = work / ("source.sup" if "pgs" in codec.casefold() or "hdmv" in codec.casefold() else "source.sub")
+    target = work / "normalized.sup"
+    try:
+        # mkvextract preserves VobSub sidecars (.idx/.sub) and PGS packets
+        # more reliably than asking FFmpeg to write a standalone bitmap file.
+        probe = subprocess.run(["ffprobe", "-v", "error", "-select_streams", f"s:{type_index}", "-show_entries", "stream=index", "-of", "csv=p=0", str(media)], capture_output=True, text=True, timeout=60, check=True)
+        global_index = probe.stdout.strip().splitlines()[0]
+        extracted = subprocess.run(["mkvextract", "tracks", str(media), f"{global_index}:{source}"], capture_output=True, text=True, timeout=300, check=True)
+        subprocess.run(["java", "-Djava.awt.headless=true", "-jar", str(jar), "-r", "keep", "-f", "lanczos3", "-S", "2,2", "-o", str(target), str(source)], capture_output=True, text=True, timeout=600, check=True)
+        logger.info("ocr event=bdsup2sub_normalized file=%s stream=%d codec=%s", str(media).replace("\n", "\\n"), type_index, codec)
+        return target
+    except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        logger.warning("ocr event=bdsup2sub_failed file=%s stream=%d error=%s", str(media).replace("\n", "\\n"), type_index, str(exc).replace("\n", " ")[-300:])
+        shutil.rmtree(work, ignore_errors=True)
+        return None
+
+
+def _vobsub_to_srt(media: Path, type_index: int, language: str) -> Path:
+    """Extract a real VobSub track and convert its IDX/SUB pair with VobSub2SRT."""
+    if not shutil.which("vobsub2srt"):
+        raise RuntimeError("VobSub conversion is unavailable: vobsub2srt is not installed")
+    work = Path(tempfile.mkdtemp(prefix="vse-vobsub-"))
+    basename = work / "subtitle"
+    try:
+        probe = subprocess.run(["ffprobe", "-v", "error", "-select_streams", f"s:{type_index}", "-show_entries", "stream=index", "-of", "csv=p=0", str(media)], capture_output=True, text=True, timeout=60, check=True)
+        lines = probe.stdout.strip().splitlines()
+        if not lines:
+            raise RuntimeError("VobSub track could not be located")
+        global_index = lines[0].strip()
+        subprocess.run(["mkvextract", "tracks", str(media), f"{global_index}:{basename}.sub"], capture_output=True, text=True, timeout=300, check=True)
+        tess = _TESS_LANGUAGES.get(language.strip().casefold(), language.strip())
+        command = ["vobsub2srt", str(basename)]
+        if tess and tess.casefold() not in {"und", "unknown"}:
+            command += ["--tesseract-lang", tess]
+        subprocess.run(command, capture_output=True, text=True, timeout=3600, check=True)
+        output = basename.with_suffix(".srt")
+        if not output.is_file() or output.stat().st_size == 0:
+            raise RuntimeError("VobSub2SRT produced no subtitle text")
+        final = media.with_name(f".{media.stem}.vse-ocr.srt")
+        shutil.copyfile(output, final)
+        return final
+    except subprocess.CalledProcessError as exc:
+        detail = (exc.stderr or exc.stdout or "").strip().replace("\n", " ")[-400:]
+        raise RuntimeError(f"VobSub conversion failed: {detail or 'vobsub2srt error'}") from exc
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def _image_codec_family(codec: str) -> str:
+    key = str(codec or "").casefold().replace("_", " ").replace("/", " ")
+    if "vobsub" in key or "dvd subtitle" in key or key in {"s vobsub", "idx"}:
+        return "vobsub"
+    if "dvb" in key:
+        return "dvb"
+    if "pgs" in key or "hdmv" in key or key in {"sup", "s hdmv pgs"}:
+        return "pgs"
+    if "xsub" in key:
+        return "xsub"
+    return "unsupported"
+
 def _ocr_graphical_subtitle(media: Path, type_index: int, language: str) -> Path:
     if type_index < 0:
         raise RuntimeError("External image subtitle conversion is not supported without a timed container stream")
     tess = _TESS_LANGUAGES.get(language.strip().casefold(), language.strip())
     if not tess or tess.casefold() in {"und", "unknown"}:
         raise RuntimeError("Image subtitle language is not set or is und")
+    normalized_subtitle = None
+    cce_subtitle = None
+    try:
+        stream_info = subprocess.run(["ffprobe", "-v", "error", "-select_streams", f"s:{type_index}", "-show_entries", "stream=codec_long_name,codec_name", "-of", "json", str(media)], capture_output=True, text=True, timeout=60, check=True)
+        stream_rows = json.loads(stream_info.stdout).get("streams", [])
+        if stream_rows:
+            codec = str(stream_rows[0].get("codec_long_name") or stream_rows[0].get("codec_name") or "")
+            family = _image_codec_family(codec)
+            if family == "vobsub":
+                return _vobsub_to_srt(media, type_index, language)
+            if family == "dvb":
+                cce_subtitle = _ccextractor_subtitle(media, type_index, language, codec)
+                if not cce_subtitle:
+                    raise RuntimeError("DVB subtitle conversion is unavailable or failed; no fallback conversion was attempted")
+                return cce_subtitle
+            if family == "xsub":
+                raise RuntimeError("XSub conversion is not supported by the selected OCR routine")
+            if family != "pgs":
+                raise RuntimeError(f"Unsupported image subtitle codec: {codec}")
+            normalized_subtitle = _bdsup2sub_normalized(media, type_index, codec)
+            if not normalized_subtitle:
+                raise RuntimeError("PGS conversion requires a working BDSup2Sub installation")
+    except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired, ValueError, json.JSONDecodeError):
+        normalized_subtitle = None
+    if cce_subtitle:
+        return cce_subtitle
     try:
         packets = subprocess.run(["ffprobe", "-v", "error", "-select_streams", f"s:{type_index}", "-show_entries", "packet=pts_time", "-of", "json", str(media)], capture_output=True, text=True, timeout=120, check=True)
         timestamps = [float(item["pts_time"]) for item in json.loads(packets.stdout).get("packets", []) if item.get("pts_time") is not None]
@@ -355,9 +572,34 @@ def _ocr_graphical_subtitle(media: Path, type_index: int, language: str) -> Path
     entries = []
     for number, timestamp in enumerate(timestamps):
         end = timestamps[number + 1] if number + 1 < len(timestamps) else timestamp + 4.0
-        frame = subprocess.run(["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-ss", f"{max(0, timestamp):.3f}", "-i", str(media), "-filter_complex", f"[0:v:0][0:s:{type_index}]overlay", "-frames:v", "1", "-f", "image2pipe", "-vcodec", "png", "pipe:1"], capture_output=True, timeout=120, check=True)
+        # Render only the usual subtitle area and enlarge it before OCR.  OCR
+        # over the complete movie frame also recognizes scenery, credits and
+        # logos, producing the unintelligible text seen in early conversions.
+        render_filter = (
+            f"[0:v:0][0:s:{type_index}]overlay="
+            f"x=(W-w)/2:y=(H-h)/2,"
+            "crop=in_w:in_h*0.50:0:in_h*0.50,"
+            "scale=iw*2:ih*2:flags=lanczos,format=gray,"
+            "eq=contrast=1.8:brightness=0.05"
+        )
+        if normalized_subtitle:
+            frame_command = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-ss", f"{max(0, timestamp):.3f}", "-i", str(media), "-i", str(normalized_subtitle), "-filter_complex", render_filter.replace(f"[0:v:0][0:s:{type_index}]", "[0:v:0][1:s:0]"), "-frames:v", "1", "-f", "image2pipe", "-vcodec", "png", "pipe:1"]
+        else:
+            frame_command = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-ss", f"{max(0, timestamp):.3f}", "-i", str(media), "-filter_complex", render_filter, "-frames:v", "1", "-f", "image2pipe", "-vcodec", "png", "pipe:1"]
+        frame = subprocess.run(frame_command, capture_output=True, timeout=120, check=True)
         try:
-            text = subprocess.run(["tesseract", "stdin", "stdout", "-l", tess, "--psm", "6"], input=frame.stdout, capture_output=True, text=True, timeout=30, check=True).stdout.strip()
+            # ffmpeg emits a binary PNG frame.  Keep the OCR subprocess in
+            # binary mode; ``text=True`` makes subprocess try to encode the
+            # bytes input and raises: "bytes object has no attribute encode".
+            ocr = subprocess.run(
+                ["tesseract", "stdin", "stdout", "-l", tess, "--psm", "6", "-c", "preserve_interword_spaces=1"],
+                input=frame.stdout,
+                capture_output=True,
+                text=False,
+                timeout=30,
+                check=True,
+            )
+            text = ocr.stdout.decode("utf-8", errors="replace").strip()
         except FileNotFoundError as exc:
             raise RuntimeError("Tesseract OCR is not installed in the container") from exc
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
@@ -369,6 +611,8 @@ def _ocr_graphical_subtitle(media: Path, type_index: int, language: str) -> Path
                 if millis >= 1000: seconds += 1; millis -= 1000
                 return f"{int(hours):02d}:{int(minutes):02d}:{seconds:02d},{millis:03d}"
             entries.append(f"{len(entries)+1}\n{stamp(timestamp)} --> {stamp(max(timestamp + .2, end))}\n{text}\n")
+    if normalized_subtitle:
+        shutil.rmtree(normalized_subtitle.parent, ignore_errors=True)
     if not entries:
         raise RuntimeError("OCR produced no subtitle text")
     output = media.with_name(f".{media.stem}.vse-ocr.srt")
@@ -382,7 +626,11 @@ def process_image_subtitle_convert(task_id: int, payload: dict) -> dict:
     language = str(payload.get("language") or "").strip()
     if not language or language.casefold() in {"und", "unknown", "zxx"}:
         raise RuntimeError("Image subtitle language is not set or is und")
-    tasks.update_progress(task_id, 0, 3, "Reading graphical subtitle events")
+    # Preserve the complete original container before any OCR/remux operation.
+    # A full copy is intentional: it restores all tracks, attachments, timing,
+    # and metadata exactly, rather than attempting a lossy subtitle-only rebuild.
+    stage_id = stage_ocr_original(media, task_id)
+    tasks.update_progress(task_id, 0, 3, "Reading graphical subtitle events (original staged)")
     subtitle = _ocr_graphical_subtitle(media, int(payload.get("type_index", -1)), language)
     tasks.update_progress(task_id, 1, 3, "Replacing graphical subtitle with OCR text")
     streams = indexes.probe(media).get("streams", []) if hasattr(indexes, "probe") else []
@@ -405,8 +653,13 @@ def process_image_subtitle_convert(task_id: int, payload: dict) -> dict:
     try:
         subprocess.run(command, capture_output=True, text=True, timeout=3600, check=True)
         os.chmod(temporary, media.stat().st_mode); os.replace(temporary, media)
+        _ocr_stage_update(stage_id, "converted")
+        with plex.connection() as db:
+            db.execute("UPDATE ocr_staged_backups SET converted_path=? WHERE id=?", (str(media), stage_id))
     finally:
         subtitle.unlink(missing_ok=True); temporary.unlink(missing_ok=True)
+        if subtitle.parent.name.startswith("vse-ccx-"):
+            shutil.rmtree(subtitle.parent, ignore_errors=True)
     tasks.update_progress(task_id, 2, 3, "Queueing subtitle indexes")
     from app.v80 import request_media_indexes
     request_media_indexes(str(media), ["subtitles", "core"], "Image subtitle converted to SRT")
@@ -414,6 +667,119 @@ def process_image_subtitle_convert(task_id: int, payload: dict) -> dict:
     return {"path": str(media), "type_index": int(payload.get("type_index", -1)), "language": language}
 
 tasks.TASK_HANDLERS["image_subtitle_convert"] = process_image_subtitle_convert
+
+
+@app.get("/api/v68/ocr/staged")
+def list_ocr_staged() -> dict:
+    _ensure_ocr_stage_table()
+    with plex.connection() as db:
+        rows = db.execute("SELECT * FROM ocr_staged_backups WHERE status IN ('staged','converted','restored') ORDER BY id DESC").fetchall()
+    return {"stage_root": str(OCR_STAGE_ROOT), "items": [dict(row) for row in rows]}
+
+@app.post("/api/v68/ocr/staged/{stage_id}/approve")
+def approve_ocr_staged(stage_id: int) -> dict:
+    _ensure_ocr_stage_table()
+    with plex.connection() as db:
+        row = db.execute("SELECT * FROM ocr_staged_backups WHERE id=? AND status IN ('staged','converted','restored')", (stage_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, "OCR staging record not found")
+    staged = Path(row["staged_path"]).resolve()
+    if staged.parent != OCR_STAGE_ROOT.resolve() or not staged.is_file():
+        raise HTTPException(404, "Staged original file is missing")
+    staged.unlink()
+    converted = Path(str(row["converted_path"] or "")) if row["converted_path"] else None
+    if converted and converted.is_file() and converted.parent == OCR_STAGE_ROOT.resolve():
+        converted.unlink()
+    with plex.connection() as db:
+        db.execute("DELETE FROM ocr_staged_backups WHERE id=?", (stage_id,))
+    logger.info("ocr_staging event=approved id=%d original=%s", stage_id, row["original_path"])
+    return {"id": stage_id, "status": "approved"}
+
+@app.get("/api/v68/ocr/staged/{stage_id}/converted")
+def download_ocr_converted(stage_id: int) -> FileResponse:
+    _ensure_ocr_stage_table()
+    with plex.connection() as db:
+        row = db.execute("SELECT converted_path,title,original_path FROM ocr_staged_backups WHERE id=? AND status IN ('converted','restored')", (stage_id,)).fetchone()
+    if not row or not row["converted_path"]:
+        raise HTTPException(404, "No preserved converted artifact is available")
+    artifact = Path(str(row["converted_path"])).resolve()
+    original = Path(str(row["original_path"])).resolve()
+    if artifact != original and artifact.parent != OCR_STAGE_ROOT.resolve():
+        raise HTTPException(404, "Preserved converted artifact is missing")
+    if not artifact.is_file():
+        raise HTTPException(404, "Preserved converted artifact is missing")
+    return FileResponse(artifact, media_type="video/x-matroska", filename=artifact.name)
+
+@app.post("/api/v68/ocr/staged/{stage_id}/finalize")
+def finalize_ocr_converted(stage_id: int) -> dict:
+    """Put the converted candidate at the media's final/original path, retaining the staged original for rollback."""
+    _ensure_ocr_stage_table()
+    with plex.connection() as db:
+        row = db.execute("SELECT * FROM ocr_staged_backups WHERE id=? AND status IN ('converted','restored')", (stage_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, "OCR staging record not found")
+    original = Path(row["original_path"]).resolve()
+    artifact = Path(str(row["converted_path"] or "")).resolve() if row["converted_path"] else None
+    staged = Path(row["staged_path"]).resolve()
+    if staged.parent != OCR_STAGE_ROOT.resolve() or not staged.is_file():
+        raise HTTPException(404, "Staged original backup is missing")
+    if not original.parent.is_dir():
+        raise HTTPException(409, "Original media folder is unavailable")
+    if artifact == original and original.is_file():
+        return {"id": stage_id, "status": "converted", "path": str(original), "already_final": True}
+    if not artifact or artifact.parent != OCR_STAGE_ROOT.resolve() or not artifact.is_file():
+        raise HTTPException(404, "Preserved converted candidate is missing")
+    temporary = original.with_name(f".{original.name}.vse-finalize")
+    try:
+        shutil.copyfile(artifact, temporary)
+        os.chmod(temporary, original.stat().st_mode if original.exists() else staged.stat().st_mode)
+        os.replace(temporary, original)
+    finally:
+        temporary.unlink(missing_ok=True)
+    # The candidate now lives at its final media path. Keep only the original
+    # rollback copy in staging; approval will remove that copy and its record.
+    artifact.unlink()
+    with plex.connection() as db:
+        db.execute("UPDATE ocr_staged_backups SET status='converted',converted_path=?,size_bytes=? WHERE id=?", (str(original), staged.stat().st_size, stage_id))
+    from app.v80 import request_media_indexes
+    request_media_indexes(str(original), ["subtitles", "core", "previews"], "OCR converted candidate moved to final media path")
+    logger.info("ocr_staging event=converted_finalized id=%d original=%s", stage_id, original)
+    return {"id": stage_id, "status": "converted", "path": str(original)}
+
+@app.post("/api/v68/ocr/staged/{stage_id}/rollback")
+def rollback_ocr_staged(stage_id: int) -> dict:
+    _ensure_ocr_stage_table()
+    with plex.connection() as db:
+        row = db.execute("SELECT * FROM ocr_staged_backups WHERE id=? AND status IN ('staged','converted','restored')", (stage_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, "OCR staging record not found")
+    staged = Path(row["staged_path"]).resolve(); original = Path(row["original_path"]).resolve()
+    if staged.parent != OCR_STAGE_ROOT.resolve() or not staged.is_file():
+        raise HTTPException(404, "Staged original file is missing")
+    if not original.parent.is_dir():
+        raise HTTPException(409, "Original media folder is unavailable")
+    if str(row["status"]) == "restored" and original.is_file():
+        return {"id": stage_id, "status": "restored", "path": str(original), "already_restored": True}
+    # Preserve the currently converted file before restoring the original.
+    # This gives the user a reviewable artifact and keeps rollback reversible.
+    converted_snapshot = Path(str(row["converted_path"] or "")) if row["converted_path"] else OCR_STAGE_ROOT / f"{stage_id}-converted-{original.name}"
+    if original.is_file() and converted_snapshot != original and converted_snapshot.parent == OCR_STAGE_ROOT.resolve() and not converted_snapshot.exists():
+        shutil.copy2(original, converted_snapshot)
+    if converted_snapshot.parent != OCR_STAGE_ROOT.resolve():
+        converted_snapshot = OCR_STAGE_ROOT / f"{stage_id}-converted-{original.name}"
+        if original.is_file() and not converted_snapshot.exists():
+            shutil.copy2(original, converted_snapshot)
+    temporary = original.with_name(f".{original.name}.vse-rollback")
+    shutil.copyfile(staged, temporary)
+    os.chmod(temporary, original.stat().st_mode if original.exists() else staged.stat().st_mode)
+    os.replace(temporary, original)
+    _ocr_stage_update(stage_id, "restored")
+    with plex.connection() as db:
+        db.execute("UPDATE ocr_staged_backups SET converted_path=? WHERE id=?", (str(converted_snapshot), stage_id))
+    from app.v80 import request_media_indexes
+    request_media_indexes(str(original), ["subtitles", "core", "previews"], "OCR original restored")
+    logger.info("ocr_staging event=rollback id=%d original=%s", stage_id, original)
+    return {"id": stage_id, "status": "restored", "path": str(original)}
 
 
 def plex_schedule_data() -> dict:
@@ -464,6 +830,7 @@ def run_plex_scheduler() -> None:
 @app.on_event("startup")
 def initialize_incremental_plex_sync() -> None:
     global plex_schedule_thread
+    _ensure_ocr_stage_table()
     with plex.connection() as db:
         for statement in ("ALTER TABLE plex_media ADD COLUMN plex_added_at INTEGER NOT NULL DEFAULT 0", "ALTER TABLE plex_media ADD COLUMN plex_updated_at INTEGER NOT NULL DEFAULT 0"):
             try:

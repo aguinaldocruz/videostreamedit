@@ -11,6 +11,7 @@ function ensureApplyProgress(){
 function setApplyProgress(step,total,message,detail=''){
   const status=ensureApplyProgress(),progress=total?`Step ${step} of ${total}`:'';
   status.innerHTML=`<strong>${esc(message)}</strong>${progress?`<span>${esc(progress)}</span>`:''}${detail?`<small>${esc(detail)}</small>`:''}`;
+  if (typeof window.setGlobalBusyProgress === 'function') window.setGlobalBusyProgress(step, total, message, detail);
 }
 
 function queuedChangeSummary(){

@@ -220,7 +220,7 @@ def optimized_media_edit(request: media_editor.ReorderEditRequest) -> dict:
     record_track_name_corrections(request, before)
     try:
         from app.v80 import media_indexes_for_edit, request_media_indexes
-        request_media_indexes(str(result.get("edited") or request.path), media_indexes_for_edit(request.model_dump(), remuxed=result.get("operation") == "single_remux"), "Media edit completed")
+        request_media_indexes(str(result.get("edited") or request.path), media_indexes_for_edit(request.model_dump(), remuxed=result.get("operation") == "single_remux"), "Media edit completed", defer_detection=request.defer_language_detection)
     except Exception as exc:
         logger.warning("subtitle_detection event=post_edit_reindex_failed file=%s error=%s", str(request.path).replace("\n", "\\n"), str(exc).replace("\n", " ")[-300:])
     return result

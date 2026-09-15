@@ -106,8 +106,22 @@ def ensure_tv_stream_index() -> None:
             CREATE TABLE IF NOT EXISTS portuguese_detection_state (
                 path TEXT PRIMARY KEY, signature TEXT NOT NULL, checked_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS audio_language_detection (
+                path TEXT NOT NULL, type_index INTEGER NOT NULL,
+                metadata_language TEXT NOT NULL DEFAULT '', metadata_region TEXT NOT NULL DEFAULT '',
+                detected_language TEXT NOT NULL, confidence REAL NOT NULL DEFAULT 0,
+                samples_json TEXT NOT NULL DEFAULT '[]', mismatch INTEGER NOT NULL DEFAULT 0,
+                checked_at TEXT NOT NULL,
+                PRIMARY KEY(path,type_index)
+            );
+            CREATE INDEX IF NOT EXISTS audio_language_detection_mismatch ON audio_language_detection(mismatch,confidence);
         """)
         db.execute("INSERT OR IGNORE INTO language_detection_settings(key,value) VALUES('common_languages',?)", (json.dumps(["pt", "pt-BR", "en"], ensure_ascii=False),))
+        db.execute("INSERT OR IGNORE INTO language_detection_settings(key,value) VALUES('voice_detection_enabled','1')")
+        db.execute("INSERT OR IGNORE INTO language_detection_settings(key,value) VALUES('voice_detection_url','http://language-id:9000')")
+        db.execute("INSERT OR IGNORE INTO language_detection_settings(key,value) VALUES('voice_detection_sample_seconds','30')")
+        db.execute("INSERT OR IGNORE INTO language_detection_settings(key,value) VALUES('voice_detection_positions','[0.1,0.5,0.9]')")
+        db.execute("INSERT OR IGNORE INTO language_detection_settings(key,value) VALUES('incremental_detection_enabled','1')")
         try:
             db.execute("ALTER TABLE portuguese_detection_state ADD COLUMN detector_version INTEGER NOT NULL DEFAULT 1")
         except Exception as exc:
@@ -130,7 +144,6 @@ class LanguageDetectionSettings(BaseModel):
     common_languages: list[str] = Field(default_factory=lambda: ["pt", "pt-BR", "en"], min_length=1, max_length=30)
 
 
-@app.put("/api/v79/language-detection/settings")
 def update_language_detection_settings(request: LanguageDetectionSettings) -> dict:
     values = []
     for value in request.common_languages:
@@ -153,6 +166,172 @@ def update_language_detection_settings(request: LanguageDetectionSettings) -> di
         logger.warning("subtitle_inspection event=settings_queue_failed error=%s", str(exc).replace("\n", " ")[-500:])
     logger.info("change=language_detection_common_languages values=%s queued_subtitle_checks=%d", ",".join(values), queued)
     return {"common_languages": values, "queued": queued}
+
+
+@app.get("/api/v79/language-detection/forced-exclusions")
+def get_forced_report_exclusions() -> dict:
+    with connection() as db:
+        row = db.execute("SELECT value FROM language_detection_settings WHERE key='forced_report_excluded_track_names'").fetchone()
+    try:
+        values = json.loads(row["value"]) if row else []
+    except (TypeError, ValueError, json.JSONDecodeError):
+        values = []
+    return {"track_names": values}
+
+
+class ForcedReportExclusions(BaseModel):
+    track_names: list[str] = Field(default_factory=list, max_length=200)
+
+
+@app.put("/api/v79/language-detection/forced-exclusions")
+def save_forced_report_exclusions(request: ForcedReportExclusions) -> dict:
+    values = []
+    for value in request.track_names:
+        cleaned = str(value).strip()
+        if cleaned and cleaned.casefold() not in {item.casefold() for item in values}:
+            values.append(cleaned[:200])
+    with connection() as db:
+        db.execute("INSERT OR REPLACE INTO language_detection_settings(key,value) VALUES('forced_report_excluded_track_names',?)", (json.dumps(values, ensure_ascii=False),))
+    logger.info("change=forced_report_exclusions_saved count=%d", len(values))
+    return {"track_names": values}
+
+
+class VoiceDetectionSettings(BaseModel):
+    enabled: bool = True
+    service_url: str = Field(default="http://language-id:9000", max_length=500)
+    sample_seconds: int = Field(default=30, ge=10, le=120)
+    sample_positions: list[float] = Field(default_factory=lambda: [0.1, 0.5, 0.9], min_length=1, max_length=5)
+
+
+def voice_detection_settings() -> dict:
+    defaults = {"enabled": True, "service_url": "http://language-id:9000", "sample_seconds": 30, "sample_positions": [0.1, 0.5, 0.9]}
+    with connection() as db:
+        rows = db.execute("SELECT key,value FROM language_detection_settings WHERE key LIKE 'voice_detection_%'").fetchall()
+    values = {str(row["key"]): str(row["value"]) for row in rows}
+    try: positions = [max(0.0, min(1.0, float(x))) for x in json.loads(values.get("voice_detection_positions", "[0.1,0.5,0.9]"))]
+    except (TypeError, ValueError, json.JSONDecodeError): positions = defaults["sample_positions"]
+    return {"enabled": values.get("voice_detection_enabled", "1") == "1", "service_url": values.get("voice_detection_url", defaults["service_url"]), "sample_seconds": max(10, min(120, int(values.get("voice_detection_sample_seconds", "30")))), "sample_positions": positions or defaults["sample_positions"]}
+
+
+@app.get("/api/v79/audio-language-detection/settings")
+def get_voice_detection_settings() -> dict:
+    return voice_detection_settings()
+
+
+@app.get("/api/v79/language-detection/queue-settings")
+def get_detection_queue_settings() -> dict:
+    with connection() as db:
+        row = db.execute("SELECT value FROM language_detection_settings WHERE key='incremental_detection_enabled'").fetchone()
+    return {"incremental_enabled": str(row["value"] if row else "1") == "1"}
+
+
+class DetectionQueueRequest(BaseModel):
+    mode: Literal["full", "incremental", "disable"]
+
+
+@app.post("/api/v79/language-detection/queue")
+def queue_language_detection(request: DetectionQueueRequest) -> dict:
+    """Queue subtitle and voice detection without doing media work in the request."""
+    from app.v80 import enqueue_many as enqueue_index_many
+    from app.v65 import enqueue as enqueue_task
+    with connection() as db:
+        media = [dict(row) for row in db.execute("SELECT path,title FROM plex_media WHERE kind IN ('movie','episode') ORDER BY path").fetchall()]
+        if request.mode == "full":
+            db.execute("DELETE FROM portuguese_language_detection")
+            db.execute("DELETE FROM portuguese_detection_state")
+            db.execute("DELETE FROM audio_language_detection")
+        db.execute("INSERT OR REPLACE INTO language_detection_settings(key,value) VALUES('incremental_detection_enabled',?)", ("1" if request.mode == "incremental" else "0",))
+    queued_media = media if request.mode == "full" else []
+    subtitle_added = enqueue_index_many("subtitles", queued_media, "Full language detection rebuild") if queued_media else 0
+    voice_added = 0
+    for item in queued_media:
+        task = enqueue_task("audio_language_detection", {"path": item["path"]}, "Voice language detection rebuild", deduplicate=True)
+        if task.get("status") == "pending":
+            voice_added += 1
+    logger.info("language_detection event=queue_requested mode=%s media=%d subtitle_added=%d voice_added=%d", request.mode, len(media), subtitle_added, voice_added)
+    return {"mode": request.mode, "media": len(queued_media), "subtitle_queued": subtitle_added, "voice_queued": voice_added, "incremental_enabled": request.mode == "incremental"}
+
+
+@app.put("/api/v79/audio-language-detection/settings")
+def save_voice_detection_settings(request: VoiceDetectionSettings) -> dict:
+    url = request.service_url.strip().rstrip("/") or "http://language-id:9000"
+    positions = [max(0.0, min(1.0, float(value))) for value in request.sample_positions]
+    with connection() as db:
+        for key, value in (("voice_detection_enabled", "1" if request.enabled else "0"), ("voice_detection_url", url), ("voice_detection_sample_seconds", str(request.sample_seconds)), ("voice_detection_positions", json.dumps(positions))):
+            db.execute("INSERT OR REPLACE INTO language_detection_settings(key,value) VALUES(?,?)", (key, value))
+    logger.info("change=voice_detection_settings enabled=%s seconds=%d positions=%s", request.enabled, request.sample_seconds, positions)
+    return voice_detection_settings()
+
+
+class AudioLanguageDetectionRequest(BaseModel):
+    path: str = Field(min_length=1, max_length=4096)
+
+
+class StreamLanguageDetectionRequest(BaseModel):
+    path: str = Field(min_length=1, max_length=4096)
+    codec_type: Literal["audio", "subtitle"]
+    type_index: int = Field(ge=-1, le=1000)
+    external: bool = False
+
+
+@app.post("/api/v79/language-detection/stream")
+def detect_stream_language(request: StreamLanguageDetectionRequest) -> dict:
+    path = str(Path(request.path).resolve())
+    with connection() as db:
+        media = db.execute("SELECT kind FROM plex_media WHERE path=?", (path,)).fetchone()
+    if not media or media["kind"] not in {"movie", "episode"} or not Path(path).is_file():
+        raise HTTPException(404, "Media is not an accessible synchronized Plex item")
+    if request.codec_type == "audio":
+        try:
+            result = tasks.process_audio_language_detection(0, {"path": path})
+        except Exception as exc:
+            raise HTTPException(422, f"Audio language detection failed: {exc}") from exc
+        selected = next((item for item in result.get("results", []) if int(item.get("type_index", -1)) == request.type_index), None)
+        return {"status": "completed", "codec_type": "audio", **(selected or {"type_index": request.type_index, "detected_language": "", "confidence": 0})}
+    source = "external" if request.external else "embedded"
+    with connection() as db:
+        row = db.execute("SELECT external_path FROM media_stream_index WHERE path=? AND stream_type='subtitle' AND source=? AND type_index=?", (path, source, request.type_index)).fetchone()
+    try:
+        if source == "external":
+            if not row or not row["external_path"]:
+                raise ValueError("External subtitle is not indexed")
+            text, _ = decode_external(Path(row["external_path"]).read_bytes()[:2_000_000])
+        else:
+            text = extracted_text(Path(path), f"0:s:{request.type_index}")
+        allowed = {value.casefold().split("-", 1)[0].split("_", 1)[0] for value in common_detection_languages()}
+        detected, confidence, evidence = detect_common_variant(text, allowed)
+    except (OSError, ValueError, TypeError) as exc:
+        raise HTTPException(422, f"Subtitle language detection failed: {exc}") from exc
+    return {"status": "completed", "codec_type": "subtitle", "detected_language": detected, "confidence": confidence, "evidence": evidence}
+
+
+@app.post("/api/v79/audio-language-detection/queue")
+def queue_audio_language_detection(request: AudioLanguageDetectionRequest) -> dict:
+    path = str(Path(request.path))
+    with connection() as db:
+        row = db.execute("SELECT kind FROM plex_media WHERE path=?", (path,)).fetchone()
+    if not row or row["kind"] not in {"movie", "episode"}:
+        raise HTTPException(404, "Media is not in the synchronized Plex catalog")
+    from app import v65 as task_queue
+    task = task_queue.enqueue("audio_language_detection", {"path": path}, "Detect audio stream languages", deduplicate=True)
+    return {"queued": True, "task_id": task["id"], "status": task["status"]}
+
+
+@app.get("/api/v79/reports/audio-language")
+def audio_language_report() -> dict:
+    with connection() as db:
+        rows = db.execute("""SELECT d.path,d.type_index,d.metadata_language,d.metadata_region,
+            d.detected_language,d.confidence,d.samples_json,p.kind,p.title
+            FROM audio_language_detection d JOIN plex_media p ON p.path=d.path
+            WHERE d.mismatch=1 ORDER BY p.title COLLATE NOCASE,d.path,d.type_index""").fetchall()
+    items=[]
+    for row in rows:
+        item=dict(row)
+        try: item["samples"]=json.loads(item.pop("samples_json") or "[]")
+        except (TypeError,ValueError,json.JSONDecodeError): item["samples"]=[]
+        item["confidence"]=round(float(item["confidence"])*100,1)
+        items.append(item)
+    return {"items":items,"media_count":len({item["path"] for item in items}),"stream_count":len(items)}
 
 
 def common_detection_languages() -> list[str]:
@@ -336,30 +515,63 @@ def core_index_with_tv(item: dict) -> None:
     inspect_portuguese_language(str(item["path"]))
 
 
-_PT_BR_WORDS = {"você", "vocês", "ônibus", "celular", "geladeira", "banheiro", "legal", "a gente", "trem"}
-_PT_PT_WORDS = {"tu", "comboio", "telemóvel", "frigorífico", "casa de banho", "fixe", "rapariga", "autocarro"}
-_EN_WORDS = {"the", "and", "you", "that", "what", "with", "this", "not", "have", "for", "are", "your"}
-_PT_BR_RE = re.compile(r"\b(?:estou|estamos|está)\s+(?:fazendo|dizendo|vendo|falando)\b", re.I)
-_PT_PT_RE = re.compile(r"\b(?:estou|estamos|está)\s+a\s+(?:fazer|dizer|ver|falar)\b", re.I)
+_PT_VARIANT_RESOURCE = Path(__file__).with_name("data") / "pt_variant_lexicon.json"
+try:
+    _PT_VARIANT_DATA = json.loads(_PT_VARIANT_RESOURCE.read_text(encoding="utf-8"))
+except (OSError, ValueError, TypeError):
+    _PT_VARIANT_DATA = {}
+_PT_BR_WORDS = set(_PT_VARIANT_DATA.get("br_words") or {"você", "vocês", "ônibus", "celular", "geladeira", "banheiro", "legal", "a gente", "trem", "arquivo", "tela", "rodoviária"})
+_PT_PT_WORDS = set(_PT_VARIANT_DATA.get("pt_words") or {"tu", "comboio", "telemóvel", "frigorífico", "casa de banho", "fixe", "rapariga", "autocarro", "ficheiro", "ecrã", "miúdo", "pequeno-almoço", "bocadinho", "se calhar", "percebido"})
+_PT_BR_PATTERNS = tuple(_PT_VARIANT_DATA.get("br_patterns") or ())
+_PT_PT_PATTERNS = tuple(_PT_VARIANT_DATA.get("pt_patterns") or ())
+# Broad stop-word profiles prevent a repeated English song from outweighing
+# an otherwise Portuguese subtitle merely because the old list was tiny.
+_PT_COMMON_WORDS = {"o", "a", "os", "as", "um", "uma", "de", "do", "da", "dos", "das", "e", "que", "em", "no", "na", "nos", "nas", "para", "por", "com", "sem", "se", "não", "sim", "eu", "ele", "ela", "eles", "elas", "me", "te", "seu", "sua", "seus", "suas", "está", "estão", "foi", "ser", "como", "mais", "mas", "ou", "já", "aqui", "isso", "esse", "essa", "onde", "quando", "porque", "vai", "vou", "tem", "têm"}
+_EN_WORDS = {"the", "and", "you", "that", "what", "with", "this", "not", "have", "for", "are", "your", "who", "is", "am", "i", "me", "my", "we", "they", "to", "of", "in", "on", "it", "was", "be", "will", "where", "why", "how", "can", "do", "does", "from", "all", "after", "before", "there", "here", "tell", "must", "never", "someone"}
+_PT_BR_RE = re.compile(r"\b(?:estou|estamos|está|estão)\s+(?:fazendo|dizendo|vendo|falando|chegando|entrando|saindo|trabalhando|ligando|tentando)\b", re.I)
+_PT_PT_RE = re.compile(r"\b(?:estou|estamos|está|estão)\s+a\s+(?:fazer|dizer|ver|falar|chegar|entrar|sair|trabalhar|ligar|tentar)\b", re.I)
+_PT_PT_CONTEXT_RE = re.compile(r"\b(?:percebido|estamos\s+a\s+chegar|estão\s+a\s+chegar|se\s+faz\s+favor|com\s+certeza)\b", re.I)
+_PT_BR_CONTEXT_RE = re.compile(r"\b(?:estou|estamos|está|estão)\s+(?:fazendo|dizendo|vendo|falando|chegando|entrando|saindo|trabalhando|ligando|tentando)\b", re.I)
+
+def _resource_pattern_count(patterns: tuple[str, ...], value: str) -> int:
+    return sum(len(re.findall(r"(?<!\w)" + re.escape(pattern.casefold()) + r"(?!\w)", value)) for pattern in patterns)
 
 
-def detect_common_variant(text: str) -> tuple[str, float, str]:
+def detect_common_variant(text: str, allowed_languages: set[str] | None = None) -> tuple[str, float, str]:
+    allowed = {str(value).casefold().replace("_", "-").split("-", 1)[0] for value in (allowed_languages or {"pt", "en"})}
     normalized = re.sub(r"\s+", " ", text.casefold())
+
     def term_count(words: set[str]) -> int:
         # Match complete words/phrases only. Raw substring counting makes the
         # PT-PT marker "tu" match inside unrelated words such as "tudo".
         return sum(len(re.findall(r"(?<!\w)" + re.escape(word) + r"(?!\w)", normalized)) for word in words)
-    br = term_count(_PT_BR_WORDS) + 2 * len(_PT_BR_RE.findall(normalized))
-    pt = term_count(_PT_PT_WORDS) + 2 * len(_PT_PT_RE.findall(normalized))
-    en = term_count(_EN_WORDS)
-    scores = [("pt-BR", br), ("pt-PT", pt), ("en", en)]
-    detected, score = max(scores, key=lambda item: item[1])
-    total = sum(value for _, value in scores)
-    if score < 3 or score == 0 or sum(1 for _, value in scores if value == score) > 1:
+
+    # Establish the dominant base language first. Regional markers are only
+    # considered after Portuguese wins, so a short English song or quotation
+    # cannot change the classification of an otherwise Portuguese subtitle.
+    pt_common = term_count(_PT_COMMON_WORDS) if "pt" in allowed else 0
+    br = (term_count(_PT_BR_WORDS) + _resource_pattern_count(_PT_BR_PATTERNS, normalized) * 2 + 2 * len(_PT_BR_RE.findall(normalized)) + 2 * len(_PT_BR_CONTEXT_RE.findall(normalized))) if "pt" in allowed else 0
+    pt = (term_count(_PT_PT_WORDS) + _resource_pattern_count(_PT_PT_PATTERNS, normalized) * 2 + 2 * len(_PT_PT_RE.findall(normalized)) + 2 * len(_PT_PT_CONTEXT_RE.findall(normalized))) if "pt" in allowed else 0
+    en = term_count(_EN_WORDS) if "en" in allowed else 0
+    portuguese = pt_common + br + pt
+    if portuguese == 0 and en < 3:
+        return "", 0.0, ""
+    if en > portuguese * 2.00 and en >= 8:
+        detected, score, total = "en", en, en + portuguese
+    elif portuguese >= 6 and portuguese >= en * 1.20 and (pt >= 2 or br >= 2):
+        # Ambiguous Portuguese is deliberately ignored instead of producing a
+        # misleading PT-BR/PT-PT mismatch report.
+        if br >= 2 and br > pt:
+            detected, score, total = "pt-BR", portuguese, portuguese + en
+        elif pt >= 2 and pt > br:
+            detected, score, total = "pt-PT", portuguese, portuguese + en
+        else:
+            return "", 0.0, ""
+    else:
         return "", 0.0, ""
     dominance = score / max(total, 1)
-    evidence_strength = min(score / 10, 1.0)
-    confidence = min(0.99, 0.60 + max(0.0, dominance - 1 / 3) * 0.40 * evidence_strength)
+    evidence_strength = min(score / 12, 1.0)
+    confidence = min(0.99, 0.60 + max(0.0, dominance - 0.50) * 0.40 * evidence_strength)
     if confidence < 0.60:
         return "", 0.0, ""
     vocabulary = _PT_BR_WORDS if detected == "pt-BR" else _PT_PT_WORDS if detected == "pt-PT" else _EN_WORDS
@@ -381,7 +593,7 @@ def inspect_portuguese_language(path: str) -> None:
             sidecars.append((subtitle["path"], subtitle_stat.st_size, subtitle_stat.st_mtime_ns))
         except OSError:
             continue
-    signature = hashlib.sha256(json.dumps(["detector-v2", stat.st_size, stat.st_mtime_ns, configured, sidecars], ensure_ascii=False).encode()).hexdigest()
+    signature = hashlib.sha256(json.dumps(["detector-v7", stat.st_size, stat.st_mtime_ns, configured, sidecars], ensure_ascii=False).encode()).hexdigest()
     with connection() as db:
         previous = db.execute("SELECT signature FROM portuguese_detection_state WHERE path=?", (path,)).fetchone()
         if previous and previous["signature"] == signature:
@@ -401,7 +613,7 @@ def inspect_portuguese_language(path: str) -> None:
                 text, _ = decode_external(raw)
             else:
                 text = extracted_text(media, f"0:s:{int(stream['type_index'])}")
-            detected, confidence, evidence = detect_common_variant(text)
+            detected, confidence, evidence = detect_common_variant(text, bases)
             if not detected or confidence <= 0.60:
                 continue
             expected = "pt-BR" if metadata_language == "pt" and str(stream["region"] or "").upper() == "BR" else "pt-PT" if metadata_language == "pt" else "en" if metadata_language == "en" else "und"
@@ -412,7 +624,7 @@ def inspect_portuguese_language(path: str) -> None:
     with connection() as db:
         db.execute("DELETE FROM portuguese_language_detection WHERE path=?", (path,))
         db.executemany("INSERT INTO portuguese_language_detection(path,source,type_index,external_path,metadata_language,metadata_region,detected_language,confidence,evidence,checked_at) VALUES(?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)", results)
-        db.execute("INSERT OR REPLACE INTO portuguese_detection_state(path,signature,detector_version,checked_at) VALUES(?,?,2,CURRENT_TIMESTAMP)", (path, signature))
+        db.execute("INSERT OR REPLACE INTO portuguese_detection_state(path,signature,detector_version,checked_at) VALUES(?,?,6,CURRENT_TIMESTAMP)", (path, signature))
 
 def subtitle_index_with_sidecars(item: dict) -> None:
     _legacy_processors["subtitles"](item)
