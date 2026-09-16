@@ -262,7 +262,11 @@ def process_filtered_stream_edit(task_id: int, payload: dict) -> dict:
     tasks.update_progress(task_id, 0, 2, prefix + "Checking current streams")
     edit, matched = tv_bulk.episode_bulk_edit(path, request)
     if not matched:
-        raise RuntimeError("No current stream matches the queued filter")
+        tasks.update_progress(task_id, 2, 2, prefix + "No matching streams remain; no change needed")
+        return {"path": path, "streams": 0, "skipped": True, "reason": "No current stream matches the queued filter"}
+    if not tv_bulk.edit_has_effective_changes(edit):
+        tasks.update_progress(task_id, 2, 2, prefix + "Already compliant; no change needed")
+        return {"path": path, "streams": matched, "skipped": True, "reason": "Media already has the requested values"}
     tasks.update_progress(task_id, 1, 2, prefix + f"Applying changes to {matched} matching stream(s)")
     result = optimized_media_edit(ReorderEditRequest.model_validate(edit))
     reindex = ["core", "previews"] if request.filters.stream_type == "external" or request.remove else ["core"]
@@ -282,8 +286,9 @@ def enqueue_filtered_movie_edits(paths: list[str], request: MovieStreamBulkEdit)
             if not targets[path]:
                 continue
             per_media = {**template, "target_keys": targets[path]}
-            payload = json.dumps({"path": path, "request": per_media}, ensure_ascii=False, separators=(",", ":"))
             task_type = 'filtered_stream_edit_now' if request.mode == 'now' else 'filtered_stream_edit'
+            payload_data = tasks.attach_media_signature(task_type, {"path": path, "request": per_media})
+            payload = json.dumps(payload_data, ensure_ascii=False, separators=(",", ":"))
             cursor = db.execute(
                 "INSERT INTO task_queue(task_type,label,payload_json,status,progress_message,created_at,updated_at) VALUES(?,?,?,'pending','Waiting',?,?)",
                 (task_type, f"Movie filtered stream edit · {Path(path).name}", payload, now, now),
@@ -298,8 +303,49 @@ def enqueue_filtered_movie_edits(paths: list[str], request: MovieStreamBulkEdit)
     return queued, task_ids
 
 
+def process_movie_bulk_preflight(task_id: int, payload: dict) -> dict:
+    request_data = dict(payload.get("request") or {})
+    paths = list(dict.fromkeys(payload.get("paths") or []))
+    request_data.update({"paths": paths, "mode": "now"})
+    request = MovieStreamBulkEdit.model_validate(request_data)
+    targets = tv_bulk.indexed_target_keys(paths, request.filters)
+    candidates: list[tuple[str, dict]] = []
+    skipped = 0
+    tasks.update_progress(task_id, 0, max(1, len(paths)), "Checking bulk changes")
+    for number, path in enumerate(paths, 1):
+        if targets.get(path):
+            per_media = {**request.model_dump(exclude={"paths", "mode"}), "target_keys": targets[path]}
+            try:
+                preview, matched = tv_bulk.episode_bulk_edit(path, tv_bulk.SeasonStreamBulkEdit.model_validate({**per_media, "paths": [path], "mode": "now"}))
+                if matched and tv_bulk.edit_has_effective_changes(preview):
+                    candidates.append((path, per_media))
+                else:
+                    skipped += 1
+            except Exception as exc:
+                logger.warning("movie_stream_bulk_preflight event=media_failed path=%s error=%s", path, str(exc).replace("\n", " ")[-300:])
+                skipped += 1
+        else:
+            skipped += 1
+        tasks.update_progress(task_id, number, max(1, len(paths)), f"Checked {number} of {len(paths)} media")
+    child_ids: list[int] = []
+    now = tasks.utc_now()
+    with connection() as db:
+        for path, per_media in candidates:
+            signed = tasks.attach_media_signature("filtered_stream_edit", {"path": path, "request": per_media})
+            cursor = db.execute("INSERT INTO task_queue(task_type,label,payload_json,status,progress_message,created_at,updated_at) VALUES(?,?,?,'pending','Waiting',?,?)", ("filtered_stream_edit", f"Movie filtered stream edit · {Path(path).name}", json.dumps(signed, ensure_ascii=False, separators=(",", ":")), now, now))
+            db.execute("INSERT OR REPLACE INTO media_change_request(task_id,path,requested_at) VALUES(?,?,?)", (cursor.lastrowid, path, now))
+            child_ids.append(int(cursor.lastrowid))
+    from app.v80 import invalidate_language_detections
+    if child_ids:
+        invalidate_language_detections([path for path, _ in candidates])
+    tasks.wake_queue()
+    logger.info("movie_stream_bulk_preflight event=completed checked=%d queued=%d skipped=%d", len(paths), len(child_ids), skipped)
+    return {"queued": len(child_ids), "skipped": skipped, "task_ids": child_ids}
+
+
 tasks.TASK_HANDLERS["filtered_stream_edit"] = process_filtered_stream_edit
 tasks.TASK_HANDLERS["filtered_stream_edit_now"] = process_filtered_stream_edit
+tasks.TASK_HANDLERS["movie_bulk_preflight"] = process_movie_bulk_preflight
 
 
 @app.post("/api/v82/movies/stream-bulk-edit")
@@ -321,10 +367,8 @@ def movie_stream_bulk_edit(request: MovieStreamBulkEdit) -> dict:
     if "track_name" in changed and request.filters.language is None and not request.filters.language_regions:
         raise HTTPException(400, "Select a language and region before changing track names in bulk")
     if request.mode == "queue":
-        queued, task_ids = enqueue_filtered_movie_edits(request.paths, request)
-        if not queued:
-            raise HTTPException(409, "No indexed streams match the selected values; refresh the filters")
-        return {"mode": "queue", "queued": queued, "task_ids": task_ids, "applied": 0, "streams": 0, "skipped": [], "failed": []}
+        preflight = tasks.enqueue("movie_bulk_preflight", {"paths": request.paths, "request": request.model_dump(exclude={"paths", "mode"}), "mode": "queue"}, "Preflight movie bulk stream change")
+        return {"mode": "queue", "queued": 1, "preflight": True, "task_ids": [preflight["id"]], "applied": 0, "streams": 0, "skipped": [], "failed": []}
     # Immediate bulk edits use the same per-media workers as queued edits so the
     # splash can report the actual episode and aggregate percentage.
     queued, task_ids = enqueue_filtered_movie_edits(request.paths, request)

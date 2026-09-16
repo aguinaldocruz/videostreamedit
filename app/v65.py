@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -8,6 +9,7 @@ import tempfile
 import threading
 import time
 import urllib.request
+import urllib.error
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -18,11 +20,13 @@ from pydantic import BaseModel, Field
 from pydantic import BaseModel, Field
 
 import app.v54 as indexes
+import app.v7 as media_editor
 from app.v7 import ReorderEditRequest
 from app.v11 import connection
 from app.v37 import MediaRenameRequest, rename_media
 from app.v43 import optimized_media_edit
 from app.v64 import app
+from app.v5 import external_subtitles
 
 
 logger = logging.getLogger("uvicorn.error")
@@ -85,7 +89,58 @@ def affected_media_path(task_type: str, payload: dict) -> str:
     return ""
 
 
+SIGNATURE_EXCLUDED_TASKS = {"audio_language_detection", "media_reindex", "index_check_prepare", "index_rebuild_prepare", "plex_sync", "plex_import_refresh"}
+
+def media_configuration_signature(path: str) -> dict:
+    media = Path(path).resolve()
+    if not media.is_file():
+        return {"path": str(media), "missing": True, "digest": ""}
+    stat = media.stat()
+    try:
+        probe = media_editor.probe(media)
+        streams = []
+        for stream in probe.get("streams", []):
+            streams.append({
+                "index": stream.get("index"), "codec_type": stream.get("codec_type"),
+                "codec_name": stream.get("codec_name"), "codec_long_name": stream.get("codec_long_name"),
+                "tags": stream.get("tags") or {}, "disposition": stream.get("disposition") or {},
+                "width": stream.get("width"), "height": stream.get("height"),
+            })
+        sidecars = []
+        for item in external_subtitles(media):
+            sidecar = Path(str(item.get("path") or item.get("external_path") or "")).resolve()
+            try:
+                side_stat = sidecar.stat()
+                sidecars.append({"path": str(sidecar), "size": side_stat.st_size, "mtime_ns": side_stat.st_mtime_ns, "metadata": item})
+            except OSError:
+                sidecars.append({"path": str(sidecar), "missing": True, "metadata": item})
+        canonical = json.dumps({"stat": [stat.st_size, stat.st_mtime_ns], "format": probe.get("format") or {}, "streams": streams, "sidecars": sidecars}, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        return {"path": str(media), "size": stat.st_size, "mtime_ns": stat.st_mtime_ns, "digest": digest}
+    except (OSError, ValueError, TypeError, subprocess.SubprocessError) as exc:
+        raise RuntimeError(f"Could not capture media signature: {exc}") from exc
+
+def attach_media_signature(task_type: str, payload: dict) -> dict:
+    if task_type in SIGNATURE_EXCLUDED_TASKS or payload.get("_media_signature"):
+        return payload
+    path = affected_media_path(task_type, payload)
+    if not path:
+        return payload
+    signed = dict(payload)
+    signed["_media_signature"] = media_configuration_signature(path)
+    return signed
+
+def validate_media_signature(task_type: str, payload: dict) -> None:
+    expected = payload.get("_media_signature")
+    if not expected or task_type in SIGNATURE_EXCLUDED_TASKS:
+        return
+    path = str(expected.get("path") or affected_media_path(task_type, payload) or "")
+    current = media_configuration_signature(path)
+    if current.get("digest") != expected.get("digest") or bool(current.get("missing")) != bool(expected.get("missing")):
+        raise RuntimeError("Media changed between queueing and execution; job refused for safety")
+
 def enqueue(task_type: str, payload: dict, label: str = "", *, deduplicate: bool = False) -> dict:
+    payload = attach_media_signature(task_type, payload)
     encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     with connection() as db:
         if deduplicate:
@@ -179,8 +234,24 @@ def _language_service_request(wav: str, service_url: str | None = None) -> dict:
             'Content-Type: audio/wav\r\n\r\n').encode() + content + f'\r\n--{boundary}--\r\n'.encode()
     url = (service_url or os.environ.get('LANGUAGE_ID_URL', 'http://language-id:9000')).rstrip('/') + '/detect-language'
     request = urllib.request.Request(url, data=body, method='POST', headers={'Content-Type': f'multipart/form-data; boundary={boundary}', 'Content-Length': str(len(body))})
-    with urllib.request.urlopen(request, timeout=180) as response:
-        return json.loads(response.read().decode('utf-8'))
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(request, timeout=180) as response:
+                return json.loads(response.read().decode('utf-8'))
+        except urllib.error.HTTPError as exc:
+            body = exc.read(500).decode('utf-8', errors='replace') if hasattr(exc, "read") else ""
+            if exc.code >= 500 and attempt < 2:
+                time.sleep(0.5 * (attempt + 1))
+                continue
+            logger.warning("audio_language_detection event=language_service_sample_failed status=%s attempt=%d detail=%s", exc.code, attempt + 1, body.replace("\n", " ")[-300:])
+            return {"language_code": "", "confidence": 0.0, "error": f"language-id HTTP {exc.code}"}
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+            if attempt < 2:
+                time.sleep(0.5 * (attempt + 1))
+                continue
+            logger.warning("audio_language_detection event=language_service_sample_failed attempt=%d detail=%s", attempt + 1, str(exc).replace("\n", " ")[-300:])
+            return {"language_code": "", "confidence": 0.0, "error": "language-id unavailable"}
+    return {"language_code": "", "confidence": 0.0, "error": "language-id unavailable"}
 
 
 def process_audio_language_detection(task_id: int, payload: dict) -> dict:
@@ -319,7 +390,12 @@ def run_queue(lane: str = "main") -> None:
         logger.info("task_queue event=task_started lane=%s id=%d type=%s attempt=%d", lane, task_id, task_type, row["attempts"] + 1)
         started = time.monotonic()
         try:
-            result = TASK_HANDLERS[task_type](task_id, json.loads(row["payload_json"]))
+            task_payload = json.loads(row["payload_json"])
+            validate_media_signature(task_type, task_payload)
+            # Private queue metadata is persisted for validation but must not
+            # be passed to strict Pydantic task request models.
+            handler_payload = {key: value for key, value in task_payload.items() if not str(key).startswith("_")}
+            result = TASK_HANDLERS[task_type](task_id, handler_payload)
             with connection() as db:
                 db.execute(
                     "UPDATE task_queue SET status='succeeded',result_json=?,progress_message='Completed',finished_at=?,updated_at=? WHERE id=?",
@@ -417,7 +493,8 @@ def list_queue(limit: int = 200, status: str | None = None, task_type: str | Non
     with connection() as db:
         rows = db.execute(f"SELECT * FROM task_queue{where} ORDER BY CASE status WHEN 'running' THEN 0 WHEN 'pending' THEN 1 WHEN 'failed' THEN 2 ELSE 3 END,id DESC LIMIT ?", params).fetchall()
         counts = {row["status"]: row["amount"] for row in db.execute("SELECT status,count(*) amount FROM task_queue GROUP BY status")}
-        pending_rows = db.execute("SELECT task_type,count(*) amount FROM task_queue WHERE status='pending' GROUP BY task_type").fetchall()
+        type_status = status if status in {"pending", "failed", "succeeded", "cancelled"} else None
+        pending_rows = db.execute("SELECT task_type,count(*) amount FROM task_queue WHERE status=? GROUP BY task_type", (type_status,)).fetchall() if type_status else []
     priority = {value: index for index, value in enumerate(task_priority_order())}
     pending_types = sorted(({"task_type": str(row["task_type"]), "count": row["amount"]} for row in pending_rows), key=lambda row: (priority.get(row["task_type"], 999999), row["task_type"]))
     items = []
@@ -426,7 +503,7 @@ def list_queue(limit: int = 200, status: str | None = None, task_type: str | Non
         item["payload"] = json.loads(item.pop("payload_json"))
         item.pop("result_json", None)
         items.append(item)
-    return {"paused": queue_paused(), "counts": counts, "pending_types": pending_types, "items": items}
+    return {"paused": queue_paused(), "counts": counts, "type_status": type_status, "pending_types": pending_types, "items": items}
 
 
 @app.post("/api/v65/queue/status")
@@ -452,6 +529,34 @@ def control_queue(request: QueueAction) -> dict:
     wake_queue()
     return {"paused": paused}
 
+
+@app.post("/api/v65/queue/bulk")
+def bulk_queue_action(request: dict) -> dict:
+    action = str(request.get("action") or "").strip().lower()
+    status = str(request.get("status") or "").strip().lower()
+    task_type = str(request.get("task_type") or "").strip()
+    if action not in {"delete", "retry"} or status not in {"pending", "failed", "succeeded", "cancelled"}:
+        raise HTTPException(400, "Bulk action requires a finished/pending status filter")
+    if action == "retry" and status != "failed":
+        raise HTTPException(400, "Only failed tasks can be retried")
+    clauses = ["status=?"]
+    params: list[Any] = [status]
+    if task_type:
+        clauses.append("task_type=?")
+        params.append(task_type)
+    where = " AND ".join(clauses)
+    with connection() as db:
+        if action == "retry":
+            changed = db.execute(f"UPDATE task_queue SET status='pending',error=NULL,finished_at=NULL,progress_current=0,progress_total=0,progress_message='Waiting',updated_at=? WHERE {where}", [utc_now(), *params]).rowcount
+        else:
+            ids = [int(row["id"]) for row in db.execute(f"SELECT id FROM task_queue WHERE {where}", params).fetchall()]
+            changed = db.execute(f"DELETE FROM task_queue WHERE {where}", params).rowcount
+            if ids:
+                db.executemany("DELETE FROM media_change_request WHERE task_id=?", [(task_id,) for task_id in ids])
+    logger.info("task_queue event=bulk_%s status=%s task_type=%s count=%d", action, status, task_type or "all", changed)
+    if action == "retry":
+        wake_queue()
+    return {"action": action, "status": status, "task_type": task_type, "count": changed}
 
 @app.post("/api/v65/queue/{task_id}/retry")
 def retry_queue_item(task_id: int) -> dict:

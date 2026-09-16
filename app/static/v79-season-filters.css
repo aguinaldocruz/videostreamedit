@@ -5,3 +5,8 @@
 .episode-heading{position:relative;display:grid!important;grid-template-columns:1fr auto 1fr;justify-content:initial}.episode-heading>.tv-show-navigation{position:static}.episode-heading>#tv-show-navigation-left{grid-column:1;justify-self:start;align-self:center}.episode-heading>.tv-show-title-block{grid-column:2;grid-row:1;text-align:center;justify-self:center;min-width:0}.episode-heading>#tv-show-navigation-right{grid-column:3;justify-self:end;align-self:center}.episode-heading>.page-tools{position:absolute;right:4.75rem;top:50%;transform:translateY(-50%);z-index:1}.episode-heading .tv-show-title-block h3{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:min(42vw,34rem)}@media(max-width:760px){.episode-heading>.page-tools{right:4rem}.episode-heading .tv-show-title-block h3{max-width:34vw}}
 
 .episode-pane table thead th:last-child .season-tools{display:inline-flex;vertical-align:middle;margin-right:.35rem}.episode-pane table thead th:last-child .season-tools select{max-width:12rem;padding:.25rem .45rem;font-size:.75rem}
+
+/* Keep the compact season/filter controls together in the episode header row. */
+.episode-pane table thead th:last-child{white-space:nowrap;text-align:right;vertical-align:middle}
+.episode-pane table thead th:last-child>.season-stream-toggle,.episode-pane table thead th:last-child>.refresh,.episode-pane table thead th:last-child>.season-tools{display:inline-flex;vertical-align:middle;align-items:center}
+.episode-pane table thead th:last-child>.season-stream-toggle,.episode-pane table thead th:last-child>.refresh{margin-left:.35rem}

@@ -24,7 +24,8 @@ import app.v11 as plex
 import app.v19 as titles
 import app.v54 as indexes
 import app.v65 as tasks
-from app.v51 import SubtitleCleanup, apply_subtitle_cleanup
+from app.v51 import SubtitleCleanup, apply_subtitle_cleanup, TEXT_SUBTITLE_CODECS, complete_extracted_text, HTML_TAG
+from app.v2 import probe
 from app.v67 import app
 
 
@@ -327,6 +328,37 @@ def process_plex_sync(task_id: int, payload: dict) -> dict:
         plex_sync_lock.release()
 
 
+def process_subtitle_html_preflight(task_id: int, payload: dict) -> dict:
+    request = SubtitleCleanup.model_validate(payload)
+    if request.external_path:
+        suffix = Path(request.external_path).suffix.lower().lstrip(".")
+        if suffix not in {"srt", "ass", "ssa", "vtt", "webvtt", "sub", "txt"}:
+            tasks.update_progress(task_id, 1, 1, "Skipped: external subtitle is not text")
+            return {"queued": 0, "skipped": True, "reason": "Only text subtitles can have markup removed"}
+    else:
+        streams = probe(Path(request.path)).get("streams", [])
+        subtitles = [stream for stream in streams if stream.get("codec_type") == "subtitle"]
+        index = request.type_index if request.type_index is not None else -1
+        codec = str(subtitles[index].get("codec_name") or "").lower() if 0 <= index < len(subtitles) else ""
+        if codec not in TEXT_SUBTITLE_CODECS:
+            tasks.update_progress(task_id, 1, 1, "Skipped: subtitle is not text")
+            return {"queued": 0, "skipped": True, "reason": "Only text subtitles can have markup removed"}
+        # Codec metadata alone is not sufficient: some damaged/unsupported
+        # text tracks cannot be extracted by ffmpeg.  Do this check in the
+        # asynchronous preflight so the child cleanup task is never created
+        # for a stream that would inevitably fail.
+        text = complete_extracted_text(Path(request.path), f"0:s:{index}")
+        if not text:
+            tasks.update_progress(task_id, 1, 1, "Skipped: subtitle text could not be extracted")
+            return {"queued": 0, "skipped": True, "reason": "Subtitle text could not be extracted"}
+        if not HTML_TAG.search(text):
+            tasks.update_progress(task_id, 1, 1, "Skipped: no HTML tags found")
+            return {"queued": 0, "skipped": True, "reason": "No HTML tags found"}
+    child = tasks.enqueue("subtitle_html_cleanup", request.model_dump(), "Remove subtitle HTML tags", deduplicate=True)
+    tasks.update_progress(task_id, 1, 1, "HTML cleanup queued")
+    return {"queued": 1, "task_id": child["id"]}
+
+
 def process_subtitle_html(task_id: int, payload: dict) -> dict:
     tasks.update_progress(task_id, 0, 2, "Removing subtitle HTML tags")
     result = apply_subtitle_cleanup(SubtitleCleanup.model_validate(payload))
@@ -338,6 +370,7 @@ def process_subtitle_html(task_id: int, payload: dict) -> dict:
 
 
 tasks.TASK_HANDLERS["plex_sync"] = process_plex_sync
+tasks.TASK_HANDLERS["subtitle_html_preflight"] = process_subtitle_html_preflight
 tasks.TASK_HANDLERS["subtitle_html_cleanup"] = process_subtitle_html
 
 _TESS_LANGUAGES = {"pt": "por", "pt-br": "por", "pt-pt": "por", "en": "eng", "es": "spa", "fr": "fra", "de": "deu", "it": "ita"}
@@ -894,4 +927,4 @@ def update_plex_schedule(request: PlexSyncSchedule) -> dict:
 @app.post("/api/v68/subtitle-html-cleanup")
 def queue_subtitle_html_cleanup(request: SubtitleCleanup) -> dict:
     name = Path(request.external_path).name if request.external_path else f"subtitle {request.type_index}"
-    return tasks.enqueue("subtitle_html_cleanup", request.model_dump(), f"Remove HTML tags from {name}")
+    return tasks.enqueue("subtitle_html_preflight", request.model_dump(), f"Preflight HTML cleanup for {name}")

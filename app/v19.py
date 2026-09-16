@@ -89,6 +89,8 @@ def _extract_subtitle_text(media: Path, index: int, codec: str) -> str:
 
 @app.post("/api/v19/stream/evaluate-forced")
 def evaluate_forced_subtitles(request: ForcedEvaluationRequest) -> dict:
+    from app.v79 import analyze_sdh, common_detection_languages, detect_common_variant
+
     media = plex_authorized_file(request.path)
     info = probe(media)
     duration = float((info.get("format") or {}).get("duration") or 0)
@@ -101,7 +103,10 @@ def evaluate_forced_subtitles(request: ForcedEvaluationRequest) -> dict:
         codec = str(stream.get("codec_name") or "unknown")
         text = _extract_subtitle_text(media, subtitle_index, codec)
         metrics = _subtitle_metrics(text, duration)
-        subtitles.append({"source": "embedded", "type_index": subtitle_index, "codec": codec, "language": tags.get("language") or "", "title": tags.get("title") or "", "forced": bool((stream.get("disposition") or {}).get("forced")), "default": bool((stream.get("disposition") or {}).get("default")), **metrics})
+        sdh_label, sdh_confidence, sdh_evidence = analyze_sdh(text)
+        allowed = {value.casefold().split("-", 1)[0].split("_", 1)[0] for value in common_detection_languages()}
+        detected_language, language_confidence, language_evidence = detect_common_variant(text, allowed) if text else ("", 0.0, "")
+        subtitles.append({"detected_language": detected_language, "language_confidence": language_confidence, "language_evidence": language_evidence, "source": "embedded", "type_index": subtitle_index, "codec": codec, "language": tags.get("language") or "", "title": tags.get("title") or "", "forced": bool((stream.get("disposition") or {}).get("forced")), "default": bool((stream.get("disposition") or {}).get("default")), "sdh_label": sdh_label, "sdh_confidence": sdh_confidence, "sdh_evidence": sdh_evidence, **metrics})
         subtitle_index += 1
     for item in external_subtitles(media):
         path = Path(str(item.get("path") or item.get("external_path") or ""))
@@ -110,7 +115,10 @@ def evaluate_forced_subtitles(request: ForcedEvaluationRequest) -> dict:
             try: text = path.read_text(encoding="utf-8", errors="replace")
             except OSError: text = ""
         metrics = _subtitle_metrics(text, duration)
-        subtitles.append({"source": "external", "path": str(path), "codec": path.suffix.lstrip(".") or "unknown", "language": item.get("language") or "", "title": item.get("title") or path.name, "forced": bool(item.get("forced")), "default": bool(item.get("default")), **metrics})
+        sdh_label, sdh_confidence, sdh_evidence = analyze_sdh(text)
+        allowed = {value.casefold().split("-", 1)[0].split("_", 1)[0] for value in common_detection_languages()}
+        detected_language, language_confidence, language_evidence = detect_common_variant(text, allowed) if text else ("", 0.0, "")
+        subtitles.append({"detected_language": detected_language, "language_confidence": language_confidence, "language_evidence": language_evidence, "source": "external", "path": str(path), "codec": path.suffix.lstrip(".") or "unknown", "language": item.get("language") or "", "title": item.get("title") or path.name, "forced": bool(item.get("forced")), "default": bool(item.get("default")), "sdh_label": sdh_label, "sdh_confidence": sdh_confidence, "sdh_evidence": sdh_evidence, **metrics})
     text_items = [item for item in subtitles if item["text_available"]]
     for item in subtitles:
         if item["text_available"]:
@@ -449,12 +457,21 @@ def html_subtitle_report(kind: str) -> dict:
     if kind not in {"tv", "movies"}:
         raise HTTPException(400, "Kind must be tv or movies")
     with connection() as db:
+        # HTML cleanup is valid only for text subtitle codecs.  Older index
+        # rows (or a stale codec inspection) may contain markup metadata for a
+        # graphical stream, but those must never appear as actionable HTML
+        # cleanup entries.  Also hide both the preflight and child task while
+        # either is waiting, so the report cannot enqueue a duplicate request.
+        text_codecs = ("subrip", "srt", "ass", "ssa", "webvtt", "mov_text", "text")
+        placeholders = ",".join("?" for _ in text_codecs)
         rows = db.execute(
             "SELECT path,source,type_index,external_path,codec FROM subtitle_extended_index "
-            "WHERE markup LIKE '%HTML tags%' "
+            "WHERE markup LIKE ? AND lower(codec) IN (" + placeholders + ") "
             "AND path NOT IN (SELECT json_extract(payload_json, '$.path') FROM task_queue "
-            "WHERE task_type='subtitle_html_cleanup' AND status IN ('pending','running')) "
-            "ORDER BY path,type_index,external_path"
+            "WHERE task_type IN ('subtitle_html_preflight','subtitle_html_cleanup') "
+            "AND status IN ('pending','running')) "
+            "ORDER BY path,type_index,external_path",
+            ("%HTML tags%", *text_codecs),
         ).fetchall()
     refs_by_path = {}
     for row in rows:
@@ -477,6 +494,36 @@ def html_subtitle_report(kind: str) -> dict:
     return {"kind": kind, "items": items, "title_count": len(items), "media_count": sum(item["media_count"] for item in items)}
 
 
+@app.post("/api/v19/reports/html-subtitles/revalidate")
+def revalidate_html_subtitle_report(kind: str = "all") -> dict:
+    """Reinspect media currently represented by the HTML report.
+
+    The report is backed by a cache; this schedules the subtitle index worker
+    against those paths so codec, extraction and markup are rebuilt from the
+    current file before the next report load.
+    """
+    if kind not in {"all", "tv", "movies"}:
+        raise HTTPException(400, "Kind must be all, tv or movies")
+    from app.v80 import enqueue as enqueue_index
+    media_kind = {"tv": "episode", "movies": "movie"}.get(kind)
+    with connection() as db:
+        if media_kind:
+            rows = db.execute(
+                "SELECT DISTINCT s.path FROM subtitle_extended_index s JOIN plex_media p ON p.path=s.path "
+                "WHERE s.markup LIKE '%HTML tags%' AND lower(s.codec) IN ('subrip','srt','ass','ssa','webvtt','mov_text','text') AND p.kind=?",
+                (media_kind,),
+            ).fetchall()
+        else:
+            rows = db.execute(
+                "SELECT DISTINCT s.path FROM subtitle_extended_index s JOIN plex_media p ON p.path=s.path "
+                "WHERE s.markup LIKE '%HTML tags%' AND lower(s.codec) IN ('subrip','srt','ass','ssa','webvtt','mov_text','text')"
+            ).fetchall()
+    queued = 0
+    for row in rows:
+        if enqueue_index("subtitles", str(row[0]), "Revalidate HTML subtitle report"):
+            queued += 1
+    logger.info("index_queue event=html_report_revalidation kind=%s discovered=%d queued=%d", kind, len(rows), queued)
+    return {"discovered": len(rows), "queued": queued, "kind": kind}
 
 
 @app.post("/api/v19/reports/subtitle-action")
@@ -498,7 +545,7 @@ def queue_report_subtitle_action(request: ReportSubtitleActionRequest) -> dict:
         seen.add(key)
         if request.action == "html_cleanup":
             payload = {"path": path, "type_index": type_index if source != "external" else None, "external_path": external_path or None}
-            task_queue.enqueue("subtitle_html_cleanup", payload, "Remove HTML tags from report match", deduplicate=True)
+            task_queue.enqueue("subtitle_html_preflight", payload, "Preflight HTML cleanup from report match", deduplicate=True)
             queued += 1
             continue
         language = str(raw.get("language") or "").strip()
@@ -519,13 +566,13 @@ def portuguese_language_report(kind: str) -> dict:
         raise HTTPException(400, "Kind must be tv or movies")
     with connection() as db:
         rows = db.execute(
-            "SELECT d.path,d.source,d.type_index,d.external_path,d.metadata_language,d.detected_language,d.confidence,d.metadata_region,d.evidence "
+            "SELECT d.path,d.source,d.type_index,d.external_path,d.metadata_language,d.detected_language,d.confidence,d.metadata_region,d.evidence,d.sdh_label,d.sdh_confidence,d.sdh_evidence "
             "FROM portuguese_language_detection d JOIN plex_media p ON p.path=d.path "
             "WHERE d.confidence>=0.60 ORDER BY d.path"
         ).fetchall()
     by_path = {}
     for row in rows:
-        by_path.setdefault(str(row["path"]), []).append({"source": row["source"], "type_index": int(row["type_index"]), "external_path": row["external_path"], "metadata_language": row["metadata_language"], "metadata_region": row["metadata_region"], "detected_language": row["detected_language"], "confidence": round(float(row["confidence"]) * 100, 1), "evidence": row["evidence"]})
+        by_path.setdefault(str(row["path"]), []).append({"source": row["source"], "type_index": int(row["type_index"]), "external_path": row["external_path"], "metadata_language": row["metadata_language"], "metadata_region": row["metadata_region"], "detected_language": row["detected_language"], "confidence": round(float(row["confidence"]) * 100, 1), "evidence": row["evidence"], "sdh_label": row["sdh_label"] or "", "sdh_confidence": round(float(row["sdh_confidence"] or 0) * 100, 1), "sdh_evidence": row["sdh_evidence"] or ""})
     items = []
     if kind == "movies":
         for movie in plex_movies():

@@ -1,6 +1,6 @@
 # Performance and Indexing Roadmap
 
-Last reviewed: 2026-09-04
+Last reviewed: 2026-09-16
 
 This document is the durable performance plan for VideoStreamEdit. Review it whenever the media catalog, queue model, preview implementation, or index schema changes.
 
@@ -33,13 +33,13 @@ The preview cache occupied approximately 1.2 GB for 3,269 indexed media and proj
 - Structural media changes invalidate only the affected medium.
 - Preview rebuild now means clear stored preview data and does not enqueue the catalog.
 
-### 3. On-demand subtitle content inspection
+### 3. Incremental subtitle inspection
 
-- Scheduled/full-library HTML and styling detection is retired.
-- Existing extended subtitle analysis data is removed during migration.
-- Text/markup is inspected from the subtitle preview the user explicitly opens.
-- Formatting-tag removal remains an explicit confirmed edit and is never inferred merely because markup exists.
-- Subtitle rebuild now means clear stored analysis and does not enqueue the catalog.
+- Subtitle inspection remains a separate incremental index queue because reports and filters need codec, markup, encoding, and external-subtitle data.
+- Work is fingerprinted by media size/mtime and is requested only for new or changed media.
+- HTML reports are validated against the current codec and complete FFmpeg extraction before cleanup jobs are created; graphical subtitles are never treated as HTML text.
+- Subtitle preview text is read from the media on demand. There is no subtitle-content preview cache.
+- Formatting-tag removal remains an explicit queued edit and is never inferred merely because markup exists.
 
 ### 4. Batched external-subtitle discovery
 
@@ -76,7 +76,7 @@ Do not implement these until overall performance is measured after this release:
 3. Consolidate the three external-sidecar state rows per media into one compact record with per-consumer versions.
 4. Add automatic retention/aggregation for old successful queue history.
 5. Add a single resource governor that pauses low-priority probing while edits, imports, or interactive previews are running.
-6. Cache requested internal subtitle text pages and graphical subtitle event timestamps only after access.
+6. Add a bounded resource governor for low-priority subtitle inspection when interactive edits are active.
 
 ## Review method
 

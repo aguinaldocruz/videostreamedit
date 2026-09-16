@@ -96,7 +96,9 @@ def ensure_tv_stream_index() -> None:
                 path TEXT NOT NULL, source TEXT NOT NULL, type_index INTEGER NOT NULL DEFAULT -1,
                 external_path TEXT NOT NULL DEFAULT '', metadata_language TEXT NOT NULL DEFAULT '',
                 metadata_region TEXT NOT NULL DEFAULT '', detected_language TEXT NOT NULL,
-                confidence REAL NOT NULL, evidence TEXT NOT NULL DEFAULT '', checked_at TEXT NOT NULL,
+                confidence REAL NOT NULL, evidence TEXT NOT NULL DEFAULT '',
+                sdh_label TEXT NOT NULL DEFAULT '', sdh_confidence REAL NOT NULL DEFAULT 0,
+                sdh_evidence TEXT NOT NULL DEFAULT '', checked_at TEXT NOT NULL,
                 PRIMARY KEY(path,source,type_index,external_path)
             );
             CREATE INDEX IF NOT EXISTS portuguese_detection_path ON portuguese_language_detection(path);
@@ -122,6 +124,12 @@ def ensure_tv_stream_index() -> None:
         db.execute("INSERT OR IGNORE INTO language_detection_settings(key,value) VALUES('voice_detection_sample_seconds','30')")
         db.execute("INSERT OR IGNORE INTO language_detection_settings(key,value) VALUES('voice_detection_positions','[0.1,0.5,0.9]')")
         db.execute("INSERT OR IGNORE INTO language_detection_settings(key,value) VALUES('incremental_detection_enabled','1')")
+        for column, definition in (("sdh_label", "TEXT NOT NULL DEFAULT ''"), ("sdh_confidence", "REAL NOT NULL DEFAULT 0"), ("sdh_evidence", "TEXT NOT NULL DEFAULT ''")):
+            try:
+                db.execute(f"ALTER TABLE portuguese_language_detection ADD COLUMN {column} {definition}")
+            except Exception as exc:
+                if "duplicate column" not in str(exc).lower():
+                    raise
         try:
             db.execute("ALTER TABLE portuguese_detection_state ADD COLUMN detector_version INTEGER NOT NULL DEFAULT 1")
         except Exception as exc:
@@ -579,6 +587,31 @@ def detect_common_variant(text: str, allowed_languages: set[str] | None = None) 
     return detected, confidence, evidence
 
 
+_SDH_SOUND_RE = re.compile(r"(?:\[[^\]]{1,120}\]|\([^\)]{1,120}\)|♪|♫|\b(?:music|singing|song|laughs?|crying|sobbing|sighs?|gasps?|door|phone|telephone|alarm|applause|inaudible|música|cantando|risos?|choro|suspiro|porta|telefone|alarme|aplausos|inaudível)\b)", re.I)
+_SDH_SPEAKER_RE = re.compile(r"(?:^|\n)\s*(?:\[[^\]]{1,60}\]|[A-ZÀ-Ý][A-ZÀ-Ý .'-]{2,}\s*:)", re.M)
+
+def analyze_sdh(text: str) -> tuple[str, float, str]:
+    normalized = re.sub(r"\s+", " ", text or "")
+    if not normalized.strip():
+        return "Cannot evaluate", 0.0, "No readable subtitle text"
+    cues = max(1, len(re.findall(r"-->[^\n]*", text or "")))
+    sound_hits = len(_SDH_SOUND_RE.findall(normalized))
+    speaker_hits = len(_SDH_SPEAKER_RE.findall(text or ""))
+    music_hits = len(re.findall(r"[♪♫]|\b(?:music|song|música|canção)\b", normalized, re.I))
+    score = min(0.99, sound_hits / max(cues * 0.18, 1) * 0.45 + speaker_hits / max(cues * 0.12, 1) * 0.35 + music_hits / max(cues * 0.08, 1) * 0.20)
+    if score >= 0.72:
+        label = "Likely SDH"
+    elif score <= 0.18 and sound_hits == 0 and speaker_hits == 0:
+        label = "Likely dialogue-only"
+    else:
+        label = "Uncertain"
+    evidence = []
+    if sound_hits: evidence.append(f"{sound_hits} sound/description cue(s)")
+    if speaker_hits: evidence.append(f"{speaker_hits} speaker label(s)")
+    if music_hits: evidence.append(f"{music_hits} music cue(s)")
+    return label, round(score, 3), ", ".join(evidence) or "No distinctive SDH markers"
+
+
 def inspect_portuguese_language(path: str) -> None:
     media = Path(path)
     if not media.is_file():
@@ -593,7 +626,7 @@ def inspect_portuguese_language(path: str) -> None:
             sidecars.append((subtitle["path"], subtitle_stat.st_size, subtitle_stat.st_mtime_ns))
         except OSError:
             continue
-    signature = hashlib.sha256(json.dumps(["detector-v7", stat.st_size, stat.st_mtime_ns, configured, sidecars], ensure_ascii=False).encode()).hexdigest()
+    signature = hashlib.sha256(json.dumps(["detector-v8-sdh", stat.st_size, stat.st_mtime_ns, configured, sidecars], ensure_ascii=False).encode()).hexdigest()
     with connection() as db:
         previous = db.execute("SELECT signature FROM portuguese_detection_state WHERE path=?", (path,)).fetchone()
         if previous and previous["signature"] == signature:
@@ -614,17 +647,18 @@ def inspect_portuguese_language(path: str) -> None:
             else:
                 text = extracted_text(media, f"0:s:{int(stream['type_index'])}")
             detected, confidence, evidence = detect_common_variant(text, bases)
+            sdh_label, sdh_confidence, sdh_evidence = analyze_sdh(text)
             if not detected or confidence <= 0.60:
                 continue
             expected = "pt-BR" if metadata_language == "pt" and str(stream["region"] or "").upper() == "BR" else "pt-PT" if metadata_language == "pt" else "en" if metadata_language == "en" else "und"
             if metadata_language in {"", "und"} or detected.casefold() != expected.casefold():
-                results.append((path, str(stream["source"]), int(stream["type_index"]), str(stream["external_path"] or ""), str(stream["language"] or ""), str(stream["region"] or ""), detected, confidence, evidence))
+                results.append((path, str(stream["source"]), int(stream["type_index"]), str(stream["external_path"] or ""), str(stream["language"] or ""), str(stream["region"] or ""), detected, confidence, evidence, sdh_label, sdh_confidence, sdh_evidence))
         except (OSError, ValueError, TypeError):
             continue
     with connection() as db:
         db.execute("DELETE FROM portuguese_language_detection WHERE path=?", (path,))
-        db.executemany("INSERT INTO portuguese_language_detection(path,source,type_index,external_path,metadata_language,metadata_region,detected_language,confidence,evidence,checked_at) VALUES(?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)", results)
-        db.execute("INSERT OR REPLACE INTO portuguese_detection_state(path,signature,detector_version,checked_at) VALUES(?,?,6,CURRENT_TIMESTAMP)", (path, signature))
+        db.executemany("INSERT INTO portuguese_language_detection(path,source,type_index,external_path,metadata_language,metadata_region,detected_language,confidence,evidence,sdh_label,sdh_confidence,sdh_evidence,checked_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)", results)
+        db.execute("INSERT OR REPLACE INTO portuguese_detection_state(path,signature,detector_version,checked_at) VALUES(?,?,7,CURRENT_TIMESTAMP)", (path, signature))
 
 def subtitle_index_with_sidecars(item: dict) -> None:
     _legacy_processors["subtitles"](item)
@@ -798,7 +832,10 @@ def filter_matches(stream: dict, filters: SeasonStreamFilter) -> bool:
 def episode_bulk_edit(path: str, request: SeasonStreamBulkEdit) -> tuple[dict, int]:
     details = media_details_with_ietf(path)
     tracks, external_changes, order, remove = [], [], [], []
-    tags = {"default_audio": None, "forced_audio": None, "default_subtitle": None, "forced_subtitle": None}
+    # Preserve tag state unless this request actually changes it. This lets
+    # bulk preflight discard media that is already compliant.
+    tags = {"default_audio": "__preserve__", "forced_audio": "__preserve__", "default_subtitle": "__preserve__", "forced_subtitle": "__preserve__"}
+    current_tags = {"default_audio": None, "forced_audio": None, "default_subtitle": None, "forced_subtitle": None}
     matches = 0
     matched_keys: list[str] = []
     changed = set(request.changed_fields)
@@ -809,9 +846,9 @@ def episode_bulk_edit(path: str, request: SeasonStreamBulkEdit) -> tuple[dict, i
         key = f"embedded:{stream_type}:{type_index}"
         order.append({"source": "embedded", "codec_type": stream_type, "type_index": type_index})
         if stream.get("default"):
-            tags[f"default_{stream_type}"] = key
+            current_tags[f"default_{stream_type}"] = key
         if stream.get("forced"):
-            tags[f"forced_{stream_type}"] = key
+            current_tags[f"forced_{stream_type}"] = key
         if targets is not None and key not in targets:
             continue
         if targets is None and not filter_matches(stream, request.filters):
@@ -827,7 +864,8 @@ def episode_bulk_edit(path: str, request: SeasonStreamBulkEdit) -> tuple[dict, i
             update["region"] = request.region if "region" in changed else str(stream.get("region") or "")
         if "track_name" in changed:
             update["title"] = request.track_name
-        tracks.append(update)
+        if any(update.get(field) != str(stream.get(source) or "") for field, source in (("language", "language"), ("region", "region"), ("title", "title")) if field in update):
+            tracks.append(update)
         matches += 1
     for stream in details.get("external_subtitles", []):
         external_path = str(stream["path"])
@@ -861,16 +899,24 @@ def episode_bulk_edit(path: str, request: SeasonStreamBulkEdit) -> tuple[dict, i
     if request.default_action != "unchanged":
         for stream_type in ("audio", "subtitle"):
             matches_for_type = [key for key in matched_keys if key.startswith(f"embedded:{stream_type}:")]
-            tags[f"default_{stream_type}"] = (f"embedded:{stream_type}:{matches_for_type[-1].rsplit(":", 1)[-1]}" if request.default_action == "set" and matches_for_type else None)
+            desired = f"embedded:{stream_type}:{matches_for_type[-1].rsplit(":", 1)[-1]}" if request.default_action == "set" and matches_for_type else None
+            if current_tags[f"default_{stream_type}"] != desired:
+                tags[f"default_{stream_type}"] = desired
         if request.filters.stream_type in {"audio", "subtitle"}:
             tags[f"default_{"subtitle" if request.filters.stream_type == "audio" else "audio"}"] = "__preserve__"
     if request.forced_action != "unchanged":
         for stream_type in ("audio", "subtitle"):
             matches_for_type = [key for key in matched_keys if key.startswith(f"embedded:{stream_type}:")]
-            tags[f"forced_{stream_type}"] = (f"embedded:{stream_type}:{matches_for_type[-1].rsplit(":", 1)[-1]}" if request.forced_action == "set" and matches_for_type else None)
+            desired = f"embedded:{stream_type}:{matches_for_type[-1].rsplit(":", 1)[-1]}" if request.forced_action == "set" and matches_for_type else None
+            if current_tags[f"forced_{stream_type}"] != desired:
+                tags[f"forced_{stream_type}"] = desired
         if request.filters.stream_type in {"audio", "subtitle"}:
             tags[f"forced_{"subtitle" if request.filters.stream_type == "audio" else "audio"}"] = "__preserve__"
     return {"path": path, "tracks": tracks, "external_subtitles": external_changes, "order": order, **tags, "remove": remove}, matches
+
+
+def edit_has_effective_changes(edit: dict) -> bool:
+    return bool(edit.get("tracks") or edit.get("external_subtitles") or edit.get("remove") or any(edit.get(name) != "__preserve__" for name in ("default_audio", "forced_audio", "default_subtitle", "forced_subtitle")))
 
 
 def process_tv_filtered_stream_edit(task_id: int, payload: dict) -> dict:
@@ -884,7 +930,11 @@ def process_tv_filtered_stream_edit(task_id: int, payload: dict) -> dict:
     tasks.update_progress(task_id, 0, 2, prefix + "Checking current streams")
     edit, matched = episode_bulk_edit(path, request)
     if not matched:
-        raise RuntimeError("No current stream matches the queued filter; refresh the filters and try again")
+        tasks.update_progress(task_id, 2, 2, prefix + "No matching streams remain; no change needed")
+        return {"path": path, "streams": 0, "skipped": True, "reason": "No current stream matches the queued filter"}
+    if not edit_has_effective_changes(edit):
+        tasks.update_progress(task_id, 2, 2, prefix + "Already compliant; no change needed")
+        return {"path": path, "streams": matched, "skipped": True, "reason": "Media already has the requested values"}
     tasks.update_progress(task_id, 1, 2, prefix + f"Applying changes to {matched} matching stream(s)")
     result = optimized_media_edit(ReorderEditRequest.model_validate(edit))
     from app.v80 import request_media_indexes
@@ -927,8 +977,9 @@ def enqueue_tv_filtered_edits(paths: list[str], request: SeasonStreamBulkEdit) -
             if not targets[path]:
                 continue
             per_media = {**template, "target_keys": targets[path]}
-            payload = json.dumps({"path": path, "request": per_media}, ensure_ascii=False, separators=(",", ":"))
             task_type = 'tv_filtered_stream_edit_now' if request.mode == 'now' else 'tv_filtered_stream_edit'
+            payload_data = tasks.attach_media_signature(task_type, {"path": path, "request": per_media})
+            payload = json.dumps(payload_data, ensure_ascii=False, separators=(",", ":"))
             cursor = db.execute(
                 "INSERT INTO task_queue(task_type,label,payload_json,status,progress_message,created_at,updated_at) VALUES(?,?,?,'pending','Waiting',?,?)",
                 (task_type, f"TV filtered stream edit · {Path(path).name}", payload, now, now),
@@ -942,8 +993,50 @@ def enqueue_tv_filtered_edits(paths: list[str], request: SeasonStreamBulkEdit) -
     return len(task_ids), task_ids
 
 
+def process_tv_bulk_preflight(task_id: int, payload: dict) -> dict:
+    request_data = dict(payload.get("request") or {})
+    paths = list(dict.fromkeys(payload.get("paths") or []))
+    request_data.update({"paths": paths, "mode": "now"})
+    request = SeasonStreamBulkEdit.model_validate(request_data)
+    targets = indexed_target_keys(paths, request.filters)
+    candidates: list[tuple[str, dict]] = []
+    skipped = 0
+    task_type = "tv_filtered_stream_edit_now" if str(payload.get("mode") or "queue") == "now" else "tv_filtered_stream_edit"
+    tasks.update_progress(task_id, 0, max(1, len(paths)), "Checking bulk changes")
+    for number, path in enumerate(paths, 1):
+        if targets.get(path):
+            per_media = {**request.model_dump(exclude={"paths", "mode"}), "target_keys": targets[path]}
+            try:
+                preview, matched = episode_bulk_edit(path, SeasonStreamBulkEdit.model_validate({**per_media, "paths": [path], "mode": "now"}))
+                if matched and edit_has_effective_changes(preview):
+                    candidates.append((path, per_media))
+                else:
+                    skipped += 1
+            except Exception as exc:
+                logger.warning("tv_stream_bulk_preflight event=media_failed path=%s error=%s", path, str(exc).replace("\n", " ")[-300:])
+                skipped += 1
+        else:
+            skipped += 1
+        tasks.update_progress(task_id, number, max(1, len(paths)), f"Checked {number} of {len(paths)} media")
+    child_ids: list[int] = []
+    now = tasks.utc_now()
+    with connection() as db:
+        for path, per_media in candidates:
+            signed = tasks.attach_media_signature(task_type, {"path": path, "request": per_media})
+            cursor = db.execute("INSERT INTO task_queue(task_type,label,payload_json,status,progress_message,created_at,updated_at) VALUES(?,?,?,'pending','Waiting',?,?)", (task_type, f"TV filtered stream edit · {Path(path).name}", json.dumps(signed, ensure_ascii=False, separators=(",", ":")), now, now))
+            db.execute("INSERT OR REPLACE INTO media_change_request(task_id,path,requested_at) VALUES(?,?,?)", (cursor.lastrowid, path, now))
+            child_ids.append(int(cursor.lastrowid))
+    from app.v80 import invalidate_language_detections
+    if child_ids:
+        invalidate_language_detections([path for path, _ in candidates])
+    tasks.wake_queue()
+    logger.info("tv_stream_bulk_preflight event=completed checked=%d queued=%d skipped=%d", len(paths), len(child_ids), skipped)
+    return {"queued": len(child_ids), "skipped": skipped, "task_ids": child_ids}
+
+
 tasks.TASK_HANDLERS["tv_filtered_stream_edit"] = process_tv_filtered_stream_edit
 tasks.TASK_HANDLERS["tv_filtered_stream_edit_now"] = process_tv_filtered_stream_edit
+tasks.TASK_HANDLERS["tv_bulk_preflight"] = process_tv_bulk_preflight
 
 @app.post("/api/v79/tv/season-stream-bulk-edit")
 def season_stream_bulk_edit(request: SeasonStreamBulkEdit) -> dict:
@@ -964,10 +1057,8 @@ def season_stream_bulk_edit(request: SeasonStreamBulkEdit) -> dict:
     if "track_name" in changed and request.filters.language is None and not request.filters.language_regions:
         raise HTTPException(400, "Select a language and region before changing track names in bulk")
     if request.mode == "queue":
-        queued, task_ids = enqueue_tv_filtered_edits(request.paths, request)
-        if not queued:
-            raise HTTPException(409, "No indexed streams match the selected values; refresh the filters")
-        return {"mode": "queue", "queued": queued, "task_ids": task_ids, "applied": 0, "streams": 0, "skipped": [], "failed": []}
+        preflight = tasks.enqueue("tv_bulk_preflight", {"paths": request.paths, "request": request.model_dump(exclude={"paths", "mode"}), "mode": "queue"}, "Preflight TV bulk stream change")
+        return {"mode": "queue", "queued": 1, "preflight": True, "task_ids": [preflight["id"]], "applied": 0, "streams": 0, "skipped": [], "failed": []}
     # Immediate bulk edits use the same per-media workers as queued edits so the
     # splash can report the actual episode and aggregate percentage.
     queued, task_ids = enqueue_tv_filtered_edits(request.paths, request)

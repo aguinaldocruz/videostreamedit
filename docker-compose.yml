@@ -18,11 +18,38 @@ services:
       TZ: "America/Sao_Paulo"
       PUID: "1000"
       PGID: "1000"
+      LANGUAGE_ID_URL: "http://language-id:9000"
 
     volumes:
       - /media/:/media
-      - ./config:/config
+      - /home/docker/videostreamedit:/config
 
     security_opt:
       - no-new-privileges:true
 
+
+
+  # Dedicated spoken-language identification service.
+  # It replaces the Whisper container for this project's language checks.
+  language-id:
+    build:
+      context: ./language-id
+    image: videostreamedit-language-id:local
+    container_name: videostreamedit-language-id
+    restart: unless-stopped
+    init: true
+
+    ports:
+      - "9000:9000"
+
+    environment:
+      TZ: "America/Sao_Paulo"
+      HF_HOME: "/models/huggingface"
+      TRANSFORMERS_CACHE: "/models/huggingface"
+      SPEECHBRAIN_CACHE: "/models/speechbrain"
+
+    volumes:
+      - /home/docker/videostreamedit/language-id-models:/models
+
+    security_opt:
+      - no-new-privileges:true

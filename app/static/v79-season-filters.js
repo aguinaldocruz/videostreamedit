@@ -105,7 +105,7 @@
   }
   function updateLanguageButton(){
     const button=filterContent.querySelector('[data-season-language-removal]'); if(!button)return;
-    const values=availableExtraLanguages(); button.hidden=values.audio.size<=2&&values.subtitle.size<=2&&values.commonUsed.size<2;
+    const values=availableExtraLanguages(); button.hidden=values.audio.size<=2&&values.subtitle.size<=2;
     button.title=`Remove uncommon languages (common in use: ${[...values.commonUsed].sort().join(', ')||'none'}; audio: ${values.audio.size}, subtitles: ${values.subtitle.size})`;
   }
   async function openLanguageRemoval(){

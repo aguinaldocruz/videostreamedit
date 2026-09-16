@@ -2,6 +2,8 @@
 
 VideoStreamEdit is a self-hosted intranet web application for browsing Plex movie and TV libraries and editing audio and subtitle stream metadata directly in the underlying media files.
 
+The project is intended for a trusted home network. Plex remains the source of catalog metadata while VideoStreamEdit keeps a local SQLite catalog and indexes so normal browsing does not repeatedly scan the filesystem or query every Plex item.
+
 It provides an MP3Tag-style workflow for language, region, track name, default/forced flags, stream order, external subtitle integration, stream removal, reusable values, and compatible change templates. A separate Movie Import workflow copies new movies into a chosen library folder and applies stream edits during import.
 
 > [!CAUTION]
@@ -21,6 +23,9 @@ It provides an MP3Tag-style workflow for language, region, track name, default/f
 - Bulk cloning for compatible TV episodes.
 - Movie Import with source/destination browsing and optional source cleanup.
 - Encrypted Plex token storage.
+- Dashboard with collection counts and language distributions.
+- Reports for image subtitles, HTML subtitles, forced streams, and language or voice-detection findings.
+- Multi-purpose task queue with priorities, retries, progress, signatures, and separate incremental index queues.
 
 ## Requirements
 
@@ -44,6 +49,8 @@ It provides an MP3Tag-style workflow for language, region, track name, default/f
 
 4. Open `http://localhost:8383`.
 5. In **Setup**, enter the Plex server URL and token, select libraries, and synchronize the catalog.
+
+The first sync can take time. Subsequent syncs are incremental. The application must be able to access media using the exact paths returned by Plex.
 
 No `.env` file is required or used by the supplied Compose configuration.
 
@@ -75,6 +82,20 @@ VideoStreamEdit uses FFmpeg stream copying, so audio and video payloads are not 
 
 Some operations can still take a long time because the complete container must be rewritten. Free space is required on the same filesystem during processing.
 
+Queued media changes capture a file signature before execution. If a file changes or moves while waiting, the task is rejected safely instead of applying an operation to the wrong media. Bulk requests use a lightweight preflight that creates child jobs only when a real change is required.
+
+Subtitle HTML cleanup validates the current codec, complete FFmpeg extraction, and actual HTML tags before creating a cleanup job. Graphical subtitles are excluded from the HTML report and handled by the image-subtitle workflow.
+
+## Background work
+
+Setup exposes the generic **Tasks** queue and incremental **Indexes** queues:
+
+- **Core** — stream metadata and fast filter values.
+- **Subtitles** — extended subtitle properties and HTML inspection.
+- **Previews** — audio preview cache work.
+
+Index checks are incremental by media fingerprint. A rebuild is only needed after an intentional catalog/index reset.
+
 ## Useful commands
 
 ```console
@@ -103,6 +124,8 @@ For the optional standalone spoken-language checker, see [docs/AUDIO_LANGUAGE_AU
 
 For the standalone damaged-text subtitle scanner, see [docs/SUBTITLE_CORRUPTION_AUDIT.md](docs/SUBTITLE_CORRUPTION_AUDIT.md).
 
+For the maintenance checklist and runtime module map, see [docs/MAINTENANCE.md](docs/MAINTENANCE.md).
+
 ## License
 
-No open-source license has been selected yet. All rights are reserved; choose and add an explicit license before accepting outside contributions or presenting the project as open source.
+The repository currently uses the all-rights-reserved notice in [LICENSE](LICENSE). Choose an open-source license before accepting outside contributions or publishing the project for general redistribution.
