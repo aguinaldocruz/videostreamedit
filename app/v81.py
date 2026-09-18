@@ -52,7 +52,9 @@ def monitor_performance() -> None:
     logger.info("performance_monitor event=worker_started")
     while True:
         try:
-            risks = tuple(performance_snapshot()["risks"])
+            snapshot = performance_snapshot()
+            preview_cache.enforce_lru()
+            risks = tuple(snapshot["risks"])
             if risks != last_risks:
                 if risks:
                     logger.warning("performance_monitor event=risk_detected details=%s", " | ".join(risks))

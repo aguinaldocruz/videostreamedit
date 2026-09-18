@@ -1,0 +1,25 @@
+
+/* Phase 5 Stream Properties visual layer. Layout dimensions remain owned by v26/v87. */
+.stream-dialog{background:var(--vse-surface,#151b22);color:var(--vse-text,#e7edf5);border:1px solid var(--vse-border,#303947);border-radius:var(--vse-radius-lg,12px);box-shadow:0 18px 60px rgba(0,0,0,.48)}
+.stream-dialog .dialog-title{border-bottom:1px solid var(--vse-border,#303947);background:var(--vse-surface-raised,#202833)}
+.stream-dialog .dialog-title h2{color:var(--vse-text,#e7edf5);letter-spacing:.01em}
+.stream-dialog #selected-file{color:var(--vse-muted,#9aa6b2);font-size:.78rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.stream-dialog .stream-content{background:var(--vse-surface-subtle,#12171d);scrollbar-color:var(--vse-border,#303947) transparent}
+.stream-dialog .stream-note,.stream-dialog .stream-order-note{border:1px solid color-mix(in srgb,var(--vse-accent,#62b0ff) 24%,var(--vse-border,#303947));border-radius:var(--vse-radius-sm,8px);background:color-mix(in srgb,var(--vse-accent,#62b0ff) 7%,var(--vse-surface,#151b22));padding:.55rem .7rem;color:var(--vse-muted,#9aa6b2)}
+.stream-dialog .stream-grid.v7.head{border:1px solid var(--vse-border,#303947);border-radius:var(--vse-radius-sm,8px) var(--vse-radius-sm,8px) 0 0;background:var(--vse-surface-raised,#202833);color:var(--vse-muted,#9aa6b2);font-size:.72rem;font-weight:700;letter-spacing:.03em;text-transform:uppercase}
+.stream-dialog .stream-grid.v7.stream-row{border:1px solid var(--vse-border,#303947);border-top:0;background:var(--vse-surface,#151b22);transition:background .15s ease,border-color .15s ease}
+.stream-dialog .stream-grid.v7.stream-row:hover{background:var(--vse-surface-hover,#273343);border-color:color-mix(in srgb,var(--vse-accent,#62b0ff) 38%,var(--vse-border,#303947))}
+.stream-dialog .stream-grid.v7.stream-row.marked-remove{background:color-mix(in srgb,var(--vse-danger,#ef7272) 10%,var(--vse-surface,#151b22));border-color:color-mix(in srgb,var(--vse-danger,#ef7272) 38%,var(--vse-border,#303947))}
+.stream-dialog .stream-grid.v7 input[type=text],.stream-dialog .stream-grid.v7 select{border-color:var(--vse-border,#303947);background:var(--vse-surface-subtle,#12171d);color:var(--vse-text,#e7edf5);border-radius:var(--vse-radius-sm,8px)}
+.stream-dialog .stream-grid.v7 input[type=text]:focus,.stream-dialog .stream-grid.v7 select:focus{border-color:var(--vse-accent,#62b0ff);box-shadow:0 0 0 2px color-mix(in srgb,var(--vse-accent,#62b0ff) 22%,transparent);outline:0}
+.stream-dialog .stream-kind strong{color:var(--vse-text,#e7edf5)}
+.stream-dialog .stream-kind small,.stream-dialog .tag-cell,.stream-dialog .move-cell{color:var(--vse-muted,#9aa6b2)}
+.stream-dialog .drag-handle{color:var(--vse-muted,#9aa6b2);border-radius:var(--vse-radius-sm,8px)}
+.stream-dialog .drag-handle:hover{color:var(--vse-accent,#62b0ff);background:color-mix(in srgb,var(--vse-accent,#62b0ff) 12%,transparent)}
+.stream-dialog .dialog-actions{border-top:1px solid var(--vse-border,#303947);background:var(--vse-surface-raised,#202833);display:flex;align-items:center;gap:.45rem}
+.stream-dialog .dialog-actions button{min-height:2.1rem;border:1px solid var(--vse-border,#303947);border-radius:var(--vse-radius-sm,8px);background:var(--vse-surface,#151b22);color:var(--vse-text,#e7edf5);padding:.35rem .7rem}
+.stream-dialog .dialog-actions button:hover{border-color:var(--vse-accent,#62b0ff);background:var(--vse-surface-hover,#273343)}
+.stream-dialog .dialog-actions button.primary{border-color:var(--vse-accent,#62b0ff);background:var(--vse-accent,#62b0ff);color:#091018;font-weight:750}
+.stream-dialog .dialog-actions button:disabled{opacity:.55;cursor:wait}
+.stream-dialog .icon-close{border:0!important;background:transparent!important;color:var(--vse-muted,#9aa6b2)!important;font-size:1.25rem}
+.stream-dialog .icon-close:hover{color:var(--vse-text,#e7edf5)!important}

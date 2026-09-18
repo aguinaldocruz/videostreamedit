@@ -7,9 +7,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import time
-import secrets
 from pathlib import Path
-from typing import Literal
 
 from fastapi import HTTPException, Request
 from fastapi.responses import HTMLResponse
@@ -63,6 +61,7 @@ def initialize_plex() -> None:
             );
             CREATE INDEX IF NOT EXISTS plex_media_kind ON plex_media(kind);
             CREATE INDEX IF NOT EXISTS plex_media_show ON plex_media(show_title, season_number, episode_number);
+            CREATE INDEX IF NOT EXISTS plex_media_tv_summary ON plex_media(kind, library_key, show_title, library_name);
         """)
         if not column_exists(db, "plex_config", "auth_method"):
             db.execute("ALTER TABLE plex_config ADD COLUMN auth_method TEXT NOT NULL DEFAULT 'manual'")
@@ -267,8 +266,13 @@ def plex_movies() -> list[dict]:
 
 
 @app.get("/api/v11/tv")
-def plex_tv() -> list[dict]:
-    with connection() as db: rows=db.execute("SELECT * FROM plex_media WHERE kind='episode' ORDER BY show_title COLLATE NOCASE,season_number,episode_number,title COLLATE NOCASE").fetchall()
+def plex_tv(show_id: str | None = None) -> list[dict]:
+    with connection() as db:
+        if show_id and ":" in show_id:
+            library_key, show_title = show_id.split(":", 1)
+            rows = db.execute("SELECT * FROM plex_media WHERE kind='episode' AND library_key=? AND show_title=? ORDER BY season_number,episode_number,title COLLATE NOCASE", (library_key, show_title)).fetchall()
+        else:
+            rows = db.execute("SELECT * FROM plex_media WHERE kind='episode' ORDER BY show_title COLLATE NOCASE,season_number,episode_number,title COLLATE NOCASE").fetchall()
     shows={}
     for r in rows:
         show_name=r["show_title"] or "Unknown show"; show=shows.setdefault((r["library_key"],show_name),{"id":r["library_key"]+":"+show_name,"name":show_name,"root_name":r["library_name"],"episode_count":0,"seasons":{}}); season_no=r["season_number"] or 0; season=show["seasons"].setdefault(season_no,{"name":f"Season {season_no}","episodes":[]}); code=f"S{season_no:02d}E{(r['episode_number'] or 0):02d}"; fake=code+" "+r["title"]+Path(r["path"]).suffix; season["episodes"].append({"path":r["path"],"name":fake,"relative_path":fake,"size":r["size"],"modified":r["modified"]});show["episode_count"]+=1

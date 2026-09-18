@@ -11,11 +11,13 @@ from typing import Literal
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse
+from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel, Field
 
 from app.pg_compat import connect as postgres_connect
 
 CONFIG_DIR = Path(os.getenv("CONFIG_DIR", "/config"))
+DATA_DIR = Path(os.getenv("DATA_DIR", "/data"))
 DB_PATH = CONFIG_DIR / "videostreamedit.db"
 STATIC_DIR = Path(__file__).parent / "static"
 MEDIA_EXTENSIONS = {".mkv", ".mp4", ".m4v", ".avi", ".mov", ".webm", ".ts", ".m2ts"}
@@ -24,6 +26,7 @@ TYPE_SPECIFIER = {"video": "v", "audio": "a", "subtitle": "s"}
 SEASON_PATTERN = re.compile(r"(?:season|series|s)[ ._-]*(\d+)", re.IGNORECASE)
 
 app = FastAPI(title="VideoStreamEdit", version="0.2.0")
+app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=5)
 
 
 class RootCreate(BaseModel):
@@ -285,6 +288,34 @@ def batch_probe(request: BatchProbeRequest) -> dict:
     return {"file_count": len(paths), "streams": serialized, "failures": failures}
 
 
+def _schedule_smart_followups(path: Path, updates: list[StreamUpdate], streams: list[dict]) -> None:
+    """Apply the unified dependency planner to this compatibility endpoint."""
+    tracks = []
+    counters = {"audio": 0, "subtitle": 0}
+    for stream in streams:
+        codec = stream.get("codec_type")
+        if codec not in counters:
+            continue
+        type_index = counters[codec]; counters[codec] += 1
+        for update in updates:
+            if update.codec_type != codec or int(update.type_index) != type_index:
+                continue
+            item = {"codec_type": codec, "type_index": type_index}
+            if update.language is not None: item["language"] = update.language
+            if update.region is not None: item["region"] = update.region
+            if update.title is not None: item["title"] = update.title
+            tracks.append(item)
+    if not tracks:
+        return
+    try:
+        from app.v80 import detection_scope_for_edit, media_indexes_for_edit, request_media_indexes
+        edit = {"path": str(path), "tracks": tracks, "remove": [], "order": [], "external_subtitles": []}
+        request_media_indexes(str(path), media_indexes_for_edit(edit), "Compatibility media edit completed", detection_scope=detection_scope_for_edit(edit))
+    except Exception as exc:
+        logger.warning("change=compatibility_followup_failed file=%s error=%s", str(path).replace("\n", "\\n"), str(exc).replace("\n", " ")[-500:])
+
+
+
 def make_language(language: str | None, region: str | None) -> str:
     language = (language or "").strip().lower()
     region = (region or "").strip().upper()
@@ -323,6 +354,7 @@ def edit_media(request: EditRequest) -> dict:
             os.chmod(temporary, original.st_mode)
             os.utime(temporary, ns=(original.st_atime_ns, original.st_mtime_ns))
             os.replace(temporary, source)
+            _schedule_smart_followups(source, applicable, probe(source).get("streams", []))
             edited.append(str(source))
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
             temporary.unlink(missing_ok=True)

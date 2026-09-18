@@ -1,0 +1,34 @@
+
+/* Phase 5 Movies/TV listing visual layer. Existing filter and navigation behavior is unchanged. */
+#movies .page-title,#tv .page-title{padding-bottom:.8rem;border-bottom:1px solid var(--vse-border,#303947)}
+#movies .page-title h2,#tv .page-title h2{color:var(--vse-text,#e7edf5);letter-spacing:.01em}
+#movies .page-title p,#tv .page-title p{color:var(--vse-muted,#9aa6b2)}
+#movies .movie-content-header,#tv .episode-heading{background:var(--vse-surface-raised,#202833);border:1px solid var(--vse-border,#303947);border-radius:var(--vse-radius-lg,12px);padding:.55rem .7rem;gap:.6rem}
+#movies .movie-content-header input.search,#tv input.search{border-color:var(--vse-border,#303947);background:var(--vse-surface-subtle,#12171d);color:var(--vse-text,#e7edf5);border-radius:var(--vse-radius-sm,8px)}
+#movies .movie-content-header input.search:focus,#tv input.search:focus{border-color:var(--vse-accent,#62b0ff);box-shadow:0 0 0 2px color-mix(in srgb,var(--vse-accent,#62b0ff) 22%,transparent);outline:0}
+#movies .movie-content-header .refresh,#tv .episode-heading .refresh{border:1px solid var(--vse-border,#303947);border-radius:var(--vse-radius-sm,8px);background:var(--vse-surface,#151b22);color:var(--vse-text,#e7edf5)}
+#movies .movie-content-header .refresh:hover,#tv .episode-heading .refresh:hover{border-color:var(--vse-accent,#62b0ff);background:var(--vse-surface-hover,#273343)}
+#movies .list-filters,#tv .show-heading .list-filters{gap:.35rem}
+#movies .list-filters label,#tv .show-heading .list-filters label{border:1px solid var(--vse-border,#303947);border-radius:var(--vse-radius-sm,8px);background:var(--vse-surface,#151b22);padding:.2rem .35rem}
+#movies .list-card,#tv .show-pane,#tv .episode-pane{background:var(--vse-surface,#151b22);border:1px solid var(--vse-border,#303947);border-radius:var(--vse-radius-lg,12px);box-shadow:0 8px 24px rgba(0,0,0,.12)}
+#movies .list-card{overflow:auto}
+#movies .list-card table,#tv .episode-pane table{border-collapse:separate;border-spacing:0;width:100%}
+#movies .list-card thead th,#tv .episode-pane thead th{background:var(--vse-surface-raised,#202833);color:var(--vse-muted,#9aa6b2);font-size:.72rem;letter-spacing:.03em;text-transform:uppercase;border-bottom:1px solid var(--vse-border,#303947)}
+#movies .list-card tbody tr,#tv .episode-pane tbody tr{transition:background .15s ease}
+#movies .list-card tbody tr:hover,#tv .episode-pane tbody tr:hover{background:var(--vse-surface-hover,#273343)}
+#movies .list-card tbody td,#tv .episode-pane tbody td{border-bottom:1px solid color-mix(in srgb,var(--vse-border,#303947) 75%,transparent)}
+#movies .list-card tbody tr:last-child td,#tv .episode-pane tbody tr:last-child td{border-bottom:0}
+#movies .list-card a,#tv .episode-pane a{color:var(--vse-accent,#62b0ff)}
+#movies .empty,#tv .empty{color:var(--vse-muted,#9aa6b2);padding:1.5rem}
+#tv .tv-layout{gap:.8rem}
+#tv .show-pane{padding:.7rem}
+#tv .show-heading{border-bottom:1px solid var(--vse-border,#303947);padding-bottom:.55rem;margin-bottom:.55rem}
+#tv .show-heading h3,#tv .episode-heading h3{color:var(--vse-text,#e7edf5)}
+#tv #show-list{scrollbar-color:var(--vse-border,#303947) transparent}
+#tv #show-list button,#tv #show-list a{border-radius:var(--vse-radius-sm,8px)}
+#tv #show-list button:hover,#tv #show-list a:hover{background:var(--vse-surface-hover,#273343)}
+#tv .episode-pane{overflow:auto}
+#tv .episode-heading{margin:0;border-radius:var(--vse-radius-lg,12px) var(--vse-radius-lg,12px) 0 0;border-bottom:0}
+#tv .episode-pane table{border-top:1px solid var(--vse-border,#303947)}
+#tv .season-tools select{border-color:var(--vse-border,#303947);background:var(--vse-surface-subtle,#12171d);color:var(--vse-text,#e7edf5);border-radius:var(--vse-radius-sm,8px)}
+@media(max-width:760px){#movies .movie-content-header,#tv .episode-heading{border-radius:var(--vse-radius-sm,8px)}#movies .list-card,#tv .show-pane,#tv .episode-pane{border-radius:var(--vse-radius-sm,8px)}}

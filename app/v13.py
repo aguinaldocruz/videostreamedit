@@ -8,7 +8,7 @@ from fastapi import Request
 from fastapi.responses import HTMLResponse
 
 from app.v2 import probe
-from app.v5 import canonical_language, external_subtitles, split_tag, plex_language_pair
+from app.v5 import external_subtitles, split_tag, plex_language_pair
 from app.v11 import STATIC_DIR, app, asset, connection, plex_authorized_file
 
 
@@ -82,7 +82,7 @@ def media_details_with_ietf(path: str) -> dict:
         })
     with connection() as db:
         detections = [dict(row) for row in db.execute(
-            "SELECT source,type_index,external_path,metadata_language,detected_language,confidence,evidence "
+            "SELECT source,type_index,external_path,metadata_language,detected_language,confidence,evidence,analysis_status,analysis_reason,cue_count,text_chars,text_coverage,markup_count,damage "
             "FROM portuguese_language_detection WHERE path=?", (str(media),)
         ).fetchall()]
         try:

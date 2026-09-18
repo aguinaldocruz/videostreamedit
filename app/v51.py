@@ -5,7 +5,6 @@ import logging
 import os
 import re
 import subprocess
-import sqlite3
 import tempfile
 import uuid
 from pathlib import Path
@@ -134,7 +133,9 @@ def damage_kind(text: str) -> str:
     return " + ".join(dict.fromkeys(issues)) or "None"
 
 
-def inspect_extended(path: Path) -> list[tuple]:
+def inspect_extended(path: Path, text_cache: dict | None = None) -> list[tuple]:
+    """Inspect subtitle health, reusing extracted text when supplied."""
+    text_cache = text_cache if text_cache is not None else {}
     found = []
     subtitle_index = 0
     for stream in probe(path).get("streams", []):
@@ -142,7 +143,11 @@ def inspect_extended(path: Path) -> list[tuple]:
             continue
         codec = str(stream.get("codec_name") or "unknown")
         if codec in TEXT_SUBTITLE_CODECS:
-            text = extracted_text(path, f"0:s:{subtitle_index}")
+            cache_key = ("embedded", subtitle_index)
+            text = text_cache.get(cache_key)
+            if text is None:
+                text = extracted_text(path, f"0:s:{subtitle_index}")
+                text_cache[cache_key] = text
             encoding, markup = "UTF-8 (container)", markup_kind(text)
             damage = damage_kind(text)
         else:
@@ -151,8 +156,12 @@ def inspect_extended(path: Path) -> list[tuple]:
         subtitle_index += 1
     for item in external_subtitles(path):
         subtitle = Path(item["path"])
-        raw = subtitle.read_bytes()[:512_000]
-        text, encoding = decode_external(raw)
+        cache_key = ("external", str(subtitle))
+        cached = text_cache.get(cache_key)
+        if cached is None:
+            cached = decode_external(subtitle.read_bytes()[:2_000_000])
+            text_cache[cache_key] = cached
+        text, encoding = cached
         found.append((str(path), "external", -1, str(subtitle), item.get("codec") or subtitle.suffix.lstrip("."), encoding, markup_kind(text), damage_kind(text)))
     return found
 
@@ -189,8 +198,8 @@ movie_index._run_index = extended_run_index
 def filter_values() -> dict:
     base = movie_index.movie_stream_filter_values()
     with connection() as db:
-        base["subtitle_encodings"] = [row[0] for row in db.execute("SELECT DISTINCT encoding FROM subtitle_extended_index WHERE encoding!='' ORDER BY encoding COLLATE NOCASE")]
-        base["subtitle_markup"] = [row[0] for row in db.execute("SELECT DISTINCT markup FROM subtitle_extended_index WHERE markup!='' ORDER BY markup COLLATE NOCASE")]
+        base["subtitle_encodings"] = sorted({row[0] for row in db.execute("SELECT DISTINCT encoding FROM subtitle_extended_index WHERE encoding!=''")}, key=str.casefold)
+        base["subtitle_markup"] = sorted({row[0] for row in db.execute("SELECT DISTINCT markup FROM subtitle_extended_index WHERE markup!=''")}, key=str.casefold)
     return base
 
 

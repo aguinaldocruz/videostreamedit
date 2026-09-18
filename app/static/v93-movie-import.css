@@ -1,0 +1,24 @@
+
+/* Phase 5 Movie Import visual layer. Source/destination semantics and copy flow remain unchanged. */
+#movie-import .page-title{border-bottom:1px solid var(--vse-border,#303947);padding-bottom:.8rem}
+#movie-import .page-title button{border:1px solid var(--vse-border,#303947);border-radius:var(--vse-radius-sm,8px);background:var(--vse-surface,#151b22);color:var(--vse-text,#e7edf5)}
+#movie-import .page-title button:hover{border-color:var(--vse-accent,#62b0ff)}
+#movie-import .movie-import-layout{gap:.8rem}
+#movie-import .movie-import-layout>article{background:var(--vse-surface,#151b22);border-color:var(--vse-border,#303947);border-radius:var(--vse-radius-lg,12px);box-shadow:0 8px 24px rgba(0,0,0,.12)}
+#movie-import .movie-import-layout h3{color:var(--vse-text,#e7edf5)}
+#movie-import .import-path{background:var(--vse-surface-subtle,#12171d);border:1px solid var(--vse-border,#303947);border-radius:var(--vse-radius-sm,8px);color:var(--vse-muted,#9aa6b2)}
+#movie-import .import-browser,#movie-import .import-destinations{scrollbar-color:var(--vse-border,#303947) transparent}
+#movie-import .import-browser-row{border-radius:var(--vse-radius-sm,8px);color:var(--vse-text,#e7edf5)}
+#movie-import .import-browser-row:hover,#movie-import .import-browser-row.active{background:var(--vse-surface-hover,#273343)}
+#movie-import .import-browser-row small{color:var(--vse-muted,#9aa6b2)}
+#movie-import .import-destination{background:var(--vse-surface-raised,#202833);border-color:var(--vse-border,#303947);border-radius:var(--vse-radius-sm,8px)}
+#movie-import .import-destination:hover{border-color:var(--vse-accent,#62b0ff)}
+#movie-import .import-destination small{color:var(--vse-muted,#9aa6b2)}
+#movie-import .import-selection-summary{border-top:1px solid var(--vse-border,#303947);padding-top:.7rem;color:var(--vse-muted,#9aa6b2)}
+#movie-import #import-edit-copy,#movie-import .browse-output-folder{border-radius:var(--vse-radius-sm,8px)}
+#movie-import #import-edit-copy:disabled{opacity:.55}
+#setup .import-setup-grid>article{background:var(--vse-surface,#151b22);border-color:var(--vse-border,#303947);border-radius:var(--vse-radius-lg,12px)}
+#setup .template-maintenance-item,#setup .saved-property-item{border-color:var(--vse-border,#303947)}
+#setup .template-maintenance-item button,#setup .saved-property-item button{border-radius:var(--vse-radius-sm,8px)}
+#setup .import-setup-grid hr{border-color:var(--vse-border,#303947)}
+@media(max-width:800px){#movie-import .movie-import-layout{gap:.6rem}}

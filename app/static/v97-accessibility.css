@@ -1,0 +1,12 @@
+
+/* Phase 5 accessibility/responsive layer. No control semantics or handlers are changed. */
+:where(button,a,input,select,textarea,[tabindex]):focus-visible{outline:2px solid var(--vse-accent,#62b0ff);outline-offset:2px}
+:where(button,a,input,select,textarea):disabled{cursor:not-allowed}
+.vse-status[data-status="running"],.vse-status.status-running{color:var(--vse-info,#7fc3ff)}
+.vse-status[data-status="pending"],.vse-status.status-pending{color:var(--vse-warning,#e7bd64)}
+.vse-status[data-status="succeeded"],.vse-status.status-succeeded{color:var(--vse-success,#70d99a)}
+.vse-status[data-status="failed"],.vse-status.status-failed{color:var(--vse-danger,#ef7272)}
+.vse-status[data-status="stale"],.vse-status.status-stale{color:var(--vse-warning,#e7bd64)}
+@media(prefers-reduced-motion:reduce){*,*::before,*::after{scroll-behavior:auto!important;animation-duration:.001ms!important;animation-iteration-count:1!important;transition-duration:.001ms!important}}
+@media(max-width:700px){header{padding-inline:12px}header nav{gap:.3rem}header nav button{padding:.45rem .55rem;font-size:.78rem}main{padding:14px}.page-title{gap:.6rem}.page-title h2{font-size:1.15rem}.page-title p{font-size:.78rem}}
+@media(max-width:480px){header nav button{font-size:.72rem;padding:.4rem .45rem}.page-title{align-items:flex-start}.page-title h2{font-size:1.05rem}}

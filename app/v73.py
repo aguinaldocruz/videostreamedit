@@ -3,7 +3,7 @@ import logging
 import app.v28 as movie_import
 import app.v65 as tasks
 from app.v28 import ImportCleanupRequest, MovieImportRequest
-from app.v72 import app
+from app.v72 import app  # noqa: F401 - importing this layer registers startup hooks
 
 
 logger = logging.getLogger("uvicorn.error")

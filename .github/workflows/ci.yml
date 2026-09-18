@@ -17,6 +17,18 @@ jobs:
           python-version: "3.13"
       - name: Compile Python sources
         run: python -m compileall -q app
+      - name: Validate production smoke check
+        run: python -m py_compile scripts/production_smoke.py
+      - name: Validate recovery smoke check
+        run: python -m py_compile scripts/recovery_smoke.py
+      - name: Validate functional approval gate
+        run: python -m py_compile scripts/approval_gate.py
+      - name: Validate performance gate
+        run: python -m py_compile scripts/performance_gate.py
+      - name: Validate legacy audit
+        run: python -m py_compile scripts/legacy_audit.py
+      - name: Validate preview benchmark tools
+        run: python -m py_compile scripts/preview_cache_benchmark.py scripts/preview_cache_gate.py
       - name: Validate Docker Compose
         run: docker compose config -q
       - name: Build image

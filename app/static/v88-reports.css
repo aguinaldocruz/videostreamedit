@@ -12,3 +12,19 @@
 .report-item[data-dup-row] .report-item-action,.report-item[data-dup-row] [data-dup-ignore]{width:auto;min-width:0;padding:.2rem .45rem;font-size:.72rem;line-height:1.15;white-space:nowrap}
 .report-item[data-dup-row]>span:nth-child(2){font-size:.76rem;white-space:nowrap}
 @media(max-width:700px){.report-item[data-dup-row]{grid-template-columns:minmax(0,1fr) auto}.report-item[data-dup-row]>span:nth-child(2){grid-column:2;grid-row:1}.report-item[data-dup-row] .report-item-action,.report-item[data-dup-row] [data-dup-ignore]{grid-row:2}}
+
+/* Phase 5 shared visual identity: reports retain their dense, navigable layout. */
+.reports-groups .reports-group{background:var(--vse-surface,#151b22);border-color:var(--vse-border,#303947);border-radius:var(--vse-radius-lg,12px);box-shadow:var(--vse-shadow,0 8px 24px rgba(0,0,0,.14))}
+.reports-group-actions .vse-btn{min-height:2rem}
+.report-item.vse-panel{background:var(--vse-surface,#151b22);border-color:var(--vse-border,#303947);border-radius:var(--vse-radius-sm,8px);box-shadow:none}
+.report-item.vse-panel + .report-item.vse-panel{margin-top:.45rem}
+.report-item .vse-link{font-weight:650}
+.report-item .vse-btn{border-radius:var(--vse-radius-sm,8px);border:1px solid var(--vse-border,#303947);background:var(--vse-surface-raised,#202833);color:var(--vse-text,#e7edf5);padding:.35rem .6rem;cursor:pointer}
+.report-item .vse-btn:hover{border-color:var(--vse-accent,#62b0ff);background:var(--vse-surface-hover,#273343)}
+.report-item .vse-btn:disabled{opacity:.55;cursor:wait}
+.report-item .vse-link{color:var(--vse-accent,#62b0ff)}
+.report-item .vse-status{border:0;background:transparent;padding:0}
+.report-details{padding:.1rem 0}
+.reports-loading,.reports-empty,.reports-error{border:1px dashed var(--vse-border,#303947);border-radius:var(--vse-radius-sm,8px);background:var(--vse-surface-subtle,#12171d);margin:.5rem 0}
+.forced-exclusion-row .vse-btn,.forced-exclusion-add .vse-btn{min-height:1.9rem}
+\n.language-detection-no-confidence{display:inline-flex;align-items:center;justify-content:center;width:.72rem;height:.72rem;min-width:.72rem;margin-left:.3rem;border-radius:50%;background:#c95f68;color:#fff;font-size:.62rem;font-weight:800;line-height:1;vertical-align:middle;box-shadow:0 0 0 1px #0008;cursor:help}\n

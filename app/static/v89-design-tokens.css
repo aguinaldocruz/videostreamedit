@@ -1,0 +1,43 @@
+/* Phase 5 shared visual tokens. Existing screens opt in incrementally. */
+:root {
+  --vse-space-1: 4px;
+  --vse-space-2: 8px;
+  --vse-space-3: 12px;
+  --vse-space-4: 16px;
+  --vse-radius-sm: 6px;
+  --vse-radius-md: 10px;
+  --vse-surface-1: #181e25;
+  --vse-surface-2: #202832;
+  --vse-border: #2b3540;
+  --vse-text: #e8edf3;
+  --vse-muted: #91a0ae;
+  --vse-accent: #59c3b4;
+  --vse-warning: #e6b75c;
+  --vse-danger: #ff8e8e;
+  --vse-success: #72d19a;
+}
+.vse-panel {
+  background: var(--vse-surface-1);
+  border: 1px solid var(--vse-border);
+  border-radius: var(--vse-radius-md);
+}
+.vse-btn {
+  min-height: 34px;
+  border: 1px solid var(--vse-border);
+  border-radius: var(--vse-radius-sm);
+  padding: var(--vse-space-2) var(--vse-space-3);
+  transition: border-color .15s ease, background .15s ease, opacity .15s ease;
+}
+.vse-btn:hover { border-color: var(--vse-accent); }
+.vse-btn:disabled, .vse-btn[aria-disabled="true"] { opacity: .48; cursor: not-allowed; }
+.vse-status { display: inline-flex; align-items: center; gap: var(--vse-space-1); border-radius: 999px; padding: 2px 8px; font-size: .78rem; }
+.vse-status[data-status="running"], .vse-status[data-status="pending"] { color: var(--vse-warning); background: color-mix(in srgb, var(--vse-warning) 16%, transparent); }
+.vse-status[data-status="succeeded"], .vse-status[data-status="current"] { color: var(--vse-success); background: color-mix(in srgb, var(--vse-success) 16%, transparent); }
+.vse-status[data-status="failed"], .vse-status[data-status="stale"] { color: var(--vse-danger); background: color-mix(in srgb, var(--vse-danger) 16%, transparent); }
+.vse-muted { color: var(--vse-muted); }
+.vse-details { border: 1px solid var(--vse-border); border-radius: var(--vse-radius-sm); background: var(--vse-surface-1); }
+.vse-details > summary { cursor: pointer; padding: var(--vse-space-3); color: var(--vse-text); }
+.vse-details[open] > summary { border-bottom: 1px solid var(--vse-border); }
+.vse-busy-layer { position: fixed; inset: 0; z-index: 1000; display: grid; place-items: center; background: rgb(8 11 14 / 72%); }
+.vse-busy-card { width: min(520px, calc(100vw - 32px)); padding: var(--vse-space-4); border: 1px solid var(--vse-border); border-radius: var(--vse-radius-md); background: var(--vse-surface-1); box-shadow: 0 18px 60px rgb(0 0 0 / 35%); }
+@media (prefers-reduced-motion: reduce) { .vse-btn { transition: none; } }

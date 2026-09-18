@@ -11,14 +11,15 @@ from pathlib import Path
 from fastapi import HTTPException
 
 import app.v38 as legacy_index
-from app.v2 import CONFIG_DIR, probe
+from app.v2 import CONFIG_DIR, DATA_DIR, probe
 from app.v11 import connection, column_exists
 from app.v51 import inspect_extended
 from app.v53 import app
 
 
 logger = logging.getLogger("uvicorn.error")
-CACHE_DIR = CONFIG_DIR / "preview-cache"
+CACHE_DIR = DATA_DIR / "preview-cache"
+LEGACY_CACHE_DIR = CONFIG_DIR / "preview-cache"
 JOBS = ("core", "subtitles", "previews")
 locks = {name: threading.Lock() for name in JOBS}
 states = {name: {"running": False, "total": 0, "completed": 0, "errors": 0, "current": ""} for name in JOBS}
@@ -86,7 +87,7 @@ def index_core(item: dict) -> None:
 
 def index_subtitles(item: dict) -> None:
     path = Path(item["path"])
-    values = inspect_extended(path)
+    values = inspect_extended(path, item.get("_subtitle_text_cache"))
     with connection() as db:
         db.execute("DELETE FROM subtitle_extended_index WHERE path=?", (str(path),))
         db.executemany("INSERT INTO subtitle_extended_index(path,source,type_index,external_path,codec,encoding,markup,damage) VALUES(?,?,?,?,?,?,?,?)", values)

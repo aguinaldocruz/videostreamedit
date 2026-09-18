@@ -142,8 +142,10 @@ window.waitForGlobalTasks = async function (taskIds) {
     while (true) {
       const response = await originalFetch('/api/v65/queue/status', {method: 'POST', headers: {'Content-Type': 'application/json', Accept: 'application/json'}, body: JSON.stringify({task_ids: ids})});
       if (!response.ok) throw new Error('Unable to read bulk operation progress');
-      const state = updateBusyTaskProgress((await response.json()).items || [], ids.length);
-      if (state.finished) return state;
+      const body = await response.json();
+      const items = body.items || [];
+      const state = updateBusyTaskProgress(items, ids.length);
+      if (state.finished) return {...state, items};
       await new Promise(resolve => setTimeout(resolve, 350));
     }
   } finally { endGlobalBusy(); }

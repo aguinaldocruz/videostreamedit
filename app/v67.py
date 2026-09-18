@@ -82,6 +82,10 @@ def run_scheduler() -> None:
             schedules = [dict(row) for row in db.execute("SELECT job,frequency,time_of_day,last_run FROM index_job_schedule WHERE frequency!='disabled'")]
         for schedule in schedules:
             job = schedule["job"]
+            if job == "previews":
+                # Preview media work is on-demand; this legacy schedule row is
+                # retained only for compatibility with existing Setup data.
+                continue
             try:
                 if not schedule_due(schedule["frequency"], schedule["time_of_day"], schedule["last_run"], now):
                     continue

@@ -34,11 +34,12 @@ def matching_index_paths(request: BulkMovieTrackNameRequest) -> set[str]:
             rows = db.execute(
                 f"""SELECT DISTINCT media.path
                       FROM plex_media media
-                      JOIN movie_stream_index_value value ON value.path=media.path
-                     WHERE media.kind='movie' AND value.stream_type=?
+                      JOIN media_stream_index value ON value.path=media.path
+                     WHERE media.kind='movie'
+                       AND (value.stream_type=? OR (?='subtitle' AND value.stream_type='external'))
                        AND value.language=? AND value.track_name=?
                        AND media.path IN ({placeholders})""",
-                [request.stream_type, request.language, request.track_name, *paths],
+                [request.stream_type, request.stream_type, request.language, request.track_name, *paths],
             ).fetchall()
             result.update(row["path"] for row in rows)
     return result

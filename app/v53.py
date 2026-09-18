@@ -18,8 +18,8 @@ def groups(rows, field: str) -> dict[str, list[str]]:
 @app.get("/api/v53/movies/stream-filter-values")
 def stable_extended_filter_values() -> dict:
     with connection() as db:
-        languages = db.execute("SELECT DISTINCT stream_type,language FROM movie_stream_index_value WHERE language!=''").fetchall()
-        names = db.execute("SELECT DISTINCT stream_type,track_name FROM movie_stream_index_value WHERE track_name!=''").fetchall()
-        encodings = [row[0] for row in db.execute("SELECT DISTINCT encoding FROM subtitle_extended_index WHERE encoding!='' ORDER BY encoding COLLATE NOCASE")]
-        markup = [row[0] for row in db.execute("SELECT DISTINCT markup FROM subtitle_extended_index WHERE markup!='' ORDER BY markup COLLATE NOCASE")]
+        languages = db.execute("SELECT DISTINCT CASE WHEN stream_type='external' THEN 'subtitle' ELSE stream_type END AS stream_type,language FROM media_stream_index WHERE language!=''").fetchall()
+        names = db.execute("SELECT DISTINCT CASE WHEN stream_type='external' THEN 'subtitle' ELSE stream_type END AS stream_type,track_name FROM media_stream_index WHERE track_name!=''").fetchall()
+        encodings = sorted({row[0] for row in db.execute("SELECT DISTINCT encoding FROM subtitle_extended_index WHERE encoding!=''")}, key=str.casefold)
+        markup = sorted({row[0] for row in db.execute("SELECT DISTINCT markup FROM subtitle_extended_index WHERE markup!=''")}, key=str.casefold)
     return {"languages": groups(languages, "language"), "track_names": groups(names, "track_name"), "subtitle_encodings": encodings, "subtitle_markup": markup, "status": index_status()}

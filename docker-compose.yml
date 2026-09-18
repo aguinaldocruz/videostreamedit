@@ -39,6 +39,7 @@ services:
     container_name: videostreamedit
     restart: unless-stopped
     init: true
+    stop_grace_period: 90s
     depends_on:
       postgres:
         condition: service_healthy
@@ -53,6 +54,9 @@ services:
       # Internal PostgreSQL is the default. For external PostgreSQL, set DATABASE_URL to its URL and disable the postgres service/depends_on.
       DATABASE_BACKEND: "postgres"
       DATABASE_URL: "${DATABASE_URL:-postgresql://videostreamedit:change-this-local-password@postgres:5432/videostreamedit}"
+      # Preview extraction is on-demand. Keep concurrency at 1 unless benchmarked safely.
+      PREVIEW_MAX_CONCURRENT: "${PREVIEW_MAX_CONCURRENT:-1}"
+      PREVIEW_MIN_FREE_GB: "${PREVIEW_MIN_FREE_GB:-1}"
 
     volumes:
       - /media/:/media
@@ -99,6 +103,7 @@ services:
     container_name: videostreamedit-all-in-one
     restart: unless-stopped
     init: true
+    stop_grace_period: 90s
     ports:
       - "8383:8080"
     environment:

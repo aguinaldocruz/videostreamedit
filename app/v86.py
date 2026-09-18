@@ -7,7 +7,7 @@ from app.v11 import connection, column_exists
 from app.v85 import app
 from app.postgres_store import (
     initialize_schema as initialize_postgres_workflow_schema,
-    workflow_details, rollback_workflow,
+    workflow_details, rollback_workflow, recover_luws, luw_details, luw_read_model, workflow_read_model, read_model_state, read_model_summary,
 )
 
 logger = logging.getLogger("videostreamedit")
@@ -55,12 +55,107 @@ def initialize_language_region_usage() -> None:
             db.execute("ALTER TABLE media_notes ADD COLUMN plex_sync_change INTEGER NOT NULL DEFAULT 0")
 
 
+@app.on_event("startup")
+def remove_legacy_projection_schema() -> None:
+    """Final startup guard: old projection tables cannot be recreated by legacy imports."""
+    with connection() as db:
+        removed = []
+        for table in ("movie_stream_index_value", "movie_stream_index", "tv_stream_index_value", "tv_stream_index_media"):
+            db.execute(f"DROP TABLE IF EXISTS {table}")
+            removed.append(table)
+    logger.info("canonical_index event=legacy_projection_schema_removed tables=%s", ",".join(removed))
+
+
 @app.get("/api/v86/workflows/{group_id}")
 def get_workflow(group_id: str) -> dict:
     """Read staged group, stage, artifact, and lock state for task review."""
     details = workflow_details(group_id)
     if not details:
         raise HTTPException(404, "Workflow group not found")
+    return details
+
+
+@app.get("/api/v86/luws")
+def list_luws(limit: int = 200, status: str | None = None, resource: str | None = None) -> dict:
+    """Return summary-first durable operation state for the redesigned task UI."""
+    try:
+        return luw_read_model(limit=limit, status=status, resource=resource)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.get("/api/v86/operational-summary")
+def get_operational_summary() -> dict:
+    """Return constant-size queue/workflow/read-model counts for diagnostics."""
+    try:
+        with connection() as db:
+            task_rows = db.execute("SELECT status, count(*) AS amount FROM task_queue GROUP BY status").fetchall()
+            index_rows = db.execute("SELECT job, status, count(*) AS amount FROM index_task_queue GROUP BY job, status").fetchall()
+            workflow_rows = db.execute("SELECT status, count(*) AS amount FROM workflow_groups GROUP BY status").fetchall()
+        return {
+            "tasks": {str(row["status"]): int(row["amount"]) for row in task_rows},
+            "indexes": _group_counts(index_rows, "job", "status"),
+            "workflows": {str(row["status"]): int(row["amount"]) for row in workflow_rows},
+            "read_models": read_model_summary(),
+        }
+    except Exception as exc:
+        raise HTTPException(503, f"Operational summary unavailable: {str(exc)[:240]}") from exc
+
+
+def _group_counts(rows, outer: str, inner: str) -> dict:
+    result = {}
+    for row in rows:
+        result.setdefault(str(row[outer]), {})[str(row[inner])] = int(row["amount"])
+    return result
+
+
+@app.get("/api/v86/readiness")
+def get_readiness() -> dict:
+    """Compact readiness probe for the redesigned PostgreSQL/LUW/read-model stack."""
+    checks = {"database": "ok", "workflow_schema": "ok", "read_models": "ok"}
+    try:
+        with connection() as db:
+            db.execute("SELECT 1").fetchone()
+            db.execute("SELECT 1 FROM workflow_luws LIMIT 1").fetchone()
+    except Exception as exc:
+        checks["database"] = "error"
+        checks["workflow_schema"] = "error"
+        return {"status": "not_ready", "checks": checks, "error": str(exc)[:240]}
+    try:
+        summary = read_model_summary()
+    except Exception as exc:
+        checks["read_models"] = "error"
+        return {"status": "degraded", "checks": checks, "error": str(exc)[:240]}
+    return {"status": "ready", "checks": checks, "read_models": summary}
+
+
+@app.get("/api/v86/read-model-summary")
+def get_read_model_summary() -> dict:
+    """Return aggregate index freshness without scanning media in the browser."""
+    return read_model_summary()
+
+
+@app.get("/api/v86/read-model-state")
+def get_read_model_state(limit: int = 200, resource: str | None = None) -> dict:
+    """Return per-media index freshness for incremental filter/report updates."""
+    return {"items": read_model_state(resource=resource, limit=limit)}
+
+
+@app.get("/api/v86/workflow-read-model")
+def list_workflow_read_model(limit: int = 100, status: str | None = None) -> dict:
+    """Return parent workflow/stage summaries for queue progress views."""
+    try:
+        return workflow_read_model(limit=limit, status=status)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.get("/api/v86/luws/{luw_id}")
+def get_luw(luw_id: str) -> dict:
+    """Return one LUW, its lifecycle events, and minimal rollback journal."""
+    details = luw_details(luw_id)
+    if not details:
+        raise HTTPException(404, "LUW not found")
     return details
 
 
@@ -185,6 +280,9 @@ def initialize_postgres_workflow() -> None:
     for attempt in range(5):
         try:
             initialize_postgres_workflow_schema()
+            recovered = recover_luws()
+            if recovered:
+                logger.warning("luw event=recovered_after_restart count=%d", recovered)
             break
         except Exception as exc:
             if "deadlock detected" not in str(exc).lower() or attempt == 4:

@@ -1,0 +1,19 @@
+
+/* Phase 5 shared dialog/popup/notification visual layer. Interaction and keyboard handlers are unchanged. */
+dialog:not(#global-busy-overlay){background:var(--vse-surface,#151b22);color:var(--vse-text,#e7edf5);border:1px solid var(--vse-border,#303947);border-radius:var(--vse-radius-lg,12px);box-shadow:0 18px 60px rgba(0,0,0,.48)}
+dialog:not(#global-busy-overlay)::backdrop{background:rgba(4,8,12,.7);backdrop-filter:blur(1px)}
+dialog:not(#global-busy-overlay) .dialog-title{background:var(--vse-surface-raised,#202833);border-bottom:1px solid var(--vse-border,#303947)}
+dialog:not(#global-busy-overlay) .dialog-title h2{color:var(--vse-text,#e7edf5)}
+dialog:not(#global-busy-overlay) .dialog-title p{color:var(--vse-muted,#9aa6b2)}
+dialog:not(#global-busy-overlay) .dialog-actions{background:var(--vse-surface-raised,#202833);border-top:1px solid var(--vse-border,#303947)}
+dialog:not(#global-busy-overlay) .dialog-actions button{border:1px solid var(--vse-border,#303947);border-radius:var(--vse-radius-sm,8px);background:var(--vse-surface,#151b22);color:var(--vse-text,#e7edf5);min-height:2rem}
+dialog:not(#global-busy-overlay) .dialog-actions button:hover{border-color:var(--vse-accent,#62b0ff);background:var(--vse-surface-hover,#273343)}
+dialog:not(#global-busy-overlay) .dialog-actions button.primary{background:var(--vse-accent,#62b0ff);border-color:var(--vse-accent,#62b0ff);color:#091018;font-weight:750}
+dialog:not(#global-busy-overlay) .icon-close{border:0!important;background:transparent!important;color:var(--vse-muted,#9aa6b2)!important}
+dialog:not(#global-busy-overlay) .icon-close:hover{color:var(--vse-text,#e7edf5)!important}
+.saved-value-menu{border-color:var(--vse-border,#303947);border-radius:var(--vse-radius-sm,8px);background:var(--vse-surface-raised,#202833);box-shadow:0 14px 36px rgba(0,0,0,.45)}
+.saved-value-option{border-radius:var(--vse-radius-sm,8px);color:var(--vse-text,#e7edf5)}
+.saved-value-option:hover,.saved-value-option.current{background:var(--vse-surface-hover,#273343)}
+#toast{background:var(--vse-surface-raised,#202833);border:1px solid var(--vse-border,#303947);border-radius:var(--vse-radius-sm,8px);color:var(--vse-text,#e7edf5);box-shadow:0 12px 36px rgba(0,0,0,.38);z-index:2147483640}
+.clone-choice-content,.template-choice-list,.bulk-clone-content,.bulk-audio-content{background:var(--vse-surface-subtle,#12171d)}
+.task-detail-dialog pre{background:#0d1217;border-color:var(--vse-border,#303947);border-radius:var(--vse-radius-sm,8px)}

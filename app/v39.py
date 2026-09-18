@@ -20,7 +20,7 @@ def index_status(include_pending: bool = True) -> dict:
     with index._index_lock:
         state = dict(index._index_state)
     with connection() as db:
-        state["indexed"] = db.execute("SELECT count(*) FROM movie_stream_index").fetchone()[0]
+        state["indexed"] = db.execute("SELECT count(*) FROM media_stream_index WHERE path IN (SELECT path FROM plex_media WHERE kind='movie')").fetchone()[0]
         state["movies"] = db.execute("SELECT count(*) FROM plex_media WHERE kind='movie'").fetchone()[0]
     state["pending"] = len(index._pending_movies()) if include_pending and not state["running"] else max(0, state["total"] - state["completed"])
     return state
@@ -53,8 +53,8 @@ def rebuild_movie_index() -> dict:
 @app.get("/api/v39/movies/stream-filter-values")
 def stable_movie_stream_filter_values() -> dict:
     with connection() as db:
-        language_rows = db.execute("SELECT DISTINCT stream_type,language FROM movie_stream_index_value WHERE language != ''").fetchall()
-        name_rows = db.execute("SELECT DISTINCT stream_type,track_name FROM movie_stream_index_value WHERE track_name != ''").fetchall()
+        language_rows = db.execute("SELECT DISTINCT CASE WHEN stream_type='external' THEN 'subtitle' ELSE stream_type END AS stream_type,language FROM media_stream_index WHERE language != ''").fetchall()
+        name_rows = db.execute("SELECT DISTINCT CASE WHEN stream_type='external' THEN 'subtitle' ELSE stream_type END AS stream_type,track_name FROM media_stream_index WHERE track_name != ''").fetchall()
     return {
         "languages": index._value_groups(language_rows, "language"),
         "track_names": index._value_groups(name_rows, "track_name"),
@@ -70,15 +70,6 @@ def refresh_one_movie_filter(payload: RefreshMovieIndex) -> dict:
     path = Path(item["path"])
     if not path.is_file():
         raise HTTPException(404, "Movie file is not accessible")
-    values = index._inspect_movie(path)
-    with connection() as db:
-        db.execute("DELETE FROM movie_stream_index_value WHERE path=?", (str(path),))
-        db.executemany(
-            "INSERT INTO movie_stream_index_value(path,stream_type,language,track_name) VALUES(?,?,?,?)",
-            [(str(path), *value) for value in values],
-        )
-        db.execute(
-            "INSERT OR REPLACE INTO movie_stream_index(path,modified,size,indexed_at) VALUES(?,?,?,datetime('now'))",
-            (str(path), item["modified"], item["size"]),
-        )
-    return {"indexed": True}
+    from app.v80 import enqueue
+    added = enqueue("core", str(path), "Legacy refresh requested; canonical core index", None)
+    return {"indexed": False, "queued": bool(added), "path": str(path)}

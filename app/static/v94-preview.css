@@ -1,0 +1,20 @@
+
+/* Phase 5 preview visual layer. Preview remains lazy and user-triggered. */
+.stream-preview-dialog,.subtitle-stage-review{background:var(--vse-surface,#151b22);color:var(--vse-text,#e7edf5);border:1px solid var(--vse-border,#303947);border-radius:var(--vse-radius-lg,12px);box-shadow:0 18px 60px rgba(0,0,0,.48)}
+.stream-preview-dialog .dialog-title,.subtitle-stage-review .dialog-title{background:var(--vse-surface-raised,#202833);border-bottom:1px solid var(--vse-border,#303947)}
+.stream-preview-dialog .dialog-title h2,.subtitle-stage-review .dialog-title h2{color:var(--vse-text,#e7edf5)}
+.stream-preview-dialog .dialog-title p,.subtitle-stage-review .dialog-title p{color:var(--vse-muted,#9aa6b2)}
+.stream-preview-content,.subtitle-stage-columns{background:var(--vse-surface-subtle,#12171d)}
+.stream-preview-content audio{accent-color:var(--vse-accent,#62b0ff)}
+.stream-preview-navigation{background:var(--vse-surface-raised,#202833);border-color:var(--vse-border,#303947)}
+.stream-preview-navigation span{color:var(--vse-muted,#9aa6b2);font-variant-numeric:tabular-nums}
+.stream-preview-navigation button,.stream-preview-dialog .dialog-actions button,.subtitle-stage-review .dialog-actions button{border:1px solid var(--vse-border,#303947);border-radius:var(--vse-radius-sm,8px);background:var(--vse-surface,#151b22);color:var(--vse-text,#e7edf5)}
+.stream-preview-navigation button:hover,.stream-preview-dialog .dialog-actions button:hover,.subtitle-stage-review .dialog-actions button:hover{border-color:var(--vse-accent,#62b0ff);background:var(--vse-surface-hover,#273343)}
+.stream-preview-dialog .dialog-actions,.subtitle-stage-review .dialog-actions{background:var(--vse-surface-raised,#202833);border-top:1px solid var(--vse-border,#303947)}
+.stream-preview-dialog .icon-close,.subtitle-stage-review .icon-close{border:0!important;background:transparent!important;color:var(--vse-muted,#9aa6b2)!important}
+.stream-preview-dialog .icon-close:hover,.subtitle-stage-review .icon-close:hover{color:var(--vse-text,#e7edf5)!important}
+.subtitle-preview-text,.subtitle-stage-columns pre{background:#0d1217;border-color:var(--vse-border,#303947);border-radius:var(--vse-radius-sm,8px);color:var(--vse-text,#e7edf5)}
+.graphical-subtitle-preview{border:1px solid var(--vse-border,#303947);box-shadow:0 8px 28px rgba(0,0,0,.28)}
+.subtitle-maintenance{background:var(--vse-surface-raised,#202833);border-color:var(--vse-border,#303947)}
+.subtitle-maintenance select{border-color:var(--vse-border,#303947);background:var(--vse-surface-subtle,#12171d);color:var(--vse-text,#e7edf5);border-radius:var(--vse-radius-sm,8px)}
+.subtitle-maintenance button{border-radius:var(--vse-radius-sm,8px)}

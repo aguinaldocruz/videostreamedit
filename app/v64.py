@@ -2,14 +2,13 @@ from __future__ import annotations
 
 import logging
 import shutil
-import subprocess
 from pathlib import Path
 
 import app.v54 as jobs
 import app.v63 as cache
 from app.v2 import probe
 from app.v11 import connection
-from app.v63 import app
+from app.v63 import app  # noqa: F401 - importing this layer registers its routes and handlers
 
 
 logger = logging.getLogger("uvicorn.error")
@@ -48,7 +47,7 @@ def preview_index_with_encoding_fallback(item: dict) -> None:
                 (str(path), item["modified"], item["size"], audio_files, 0, sum(file.stat().st_size for file in files)),
             )
         for file in files:
-            cache.register_file(str(path), file, True)
+            cache.register_file(str(path), file, True, cache.preview_media_signature(path), duration)
         cache.enforce_lru()
     except Exception:
         shutil.rmtree(temporary, ignore_errors=True)

@@ -1,0 +1,11 @@
+
+/* Phase 5 global busy visual layer. Locking/progress semantics remain in v33-global-busy.js. */
+#global-busy-overlay{background:rgba(4,8,12,.68);backdrop-filter:blur(2px)}
+#global-busy-overlay .busy-card{width:min(440px,calc(100vw - 32px));min-height:220px;padding:var(--vse-space-5,1.25rem);border:1px solid var(--vse-border,#303947);border-radius:var(--vse-radius-lg,12px);background:var(--vse-surface-1,#151b22);color:var(--vse-text,#e7edf5);box-shadow:0 18px 60px rgba(0,0,0,.5)}
+#global-busy-overlay .busy-ring{width:96px;height:96px;margin:0 auto 1rem;background:conic-gradient(var(--vse-accent,#62b0ff) var(--busy-progress,18%),var(--vse-border,#303947) 0);box-shadow:0 0 0 1px color-mix(in srgb,var(--vse-accent,#62b0ff) 20%,transparent)}
+#global-busy-overlay .busy-ring::before{background:var(--vse-surface-1,#151b22)}
+#global-busy-overlay .busy-ring span{color:var(--vse-accent,#62b0ff)}
+#global-busy-overlay .busy-card strong{min-height:2.4rem;display:grid;place-items:center;color:var(--vse-text,#e7edf5);font-size:.9rem;line-height:1.2}
+#global-busy-overlay .busy-card p{height:2.7rem;display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:2;line-clamp:2;overflow:hidden;color:var(--vse-muted,#9aa6b2);font-size:.78rem;line-height:1.35}
+body.app-busy button,body.app-busy input,body.app-busy select,body.app-busy textarea,body.app-busy a{opacity:.45}
+body.app-busy::before,body.app-busy::after{display:none!important}

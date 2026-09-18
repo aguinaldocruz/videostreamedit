@@ -17,18 +17,19 @@
     card.querySelector('h3').textContent=title;
     card.querySelector('p').textContent=description;
     const check=card.querySelector('[data-index-check]');if(check&&job==='previews')check.hidden=true;
-    if(job==='subtitles'){if(check)check.textContent='Run incremental';const rebuildButton=card.querySelector('[data-index-rebuild]');if(rebuildButton)rebuildButton.textContent='Start from scratch';card.querySelector('.index-maintenance-actions').insertAdjacentHTML('beforeend','<button type="button" data-index-clear>Clear data</button>');const clear=card.querySelector('[data-index-clear]');clear.onclick=async()=>{if(!confirm('Clear all subtitle inspection data and queued subtitle inspection work?'))return;clear.disabled=true;try{await api('/api/v80/setup/index/subtitles/clear',{method:'POST',body:'{}'});toast('Subtitle inspection data cleared')}catch(error){toast(error.message,true)}finally{clear.disabled=false}}}
+    if(job==='subtitles'){if(check){check.textContent='Run incremental';check.title='Inspect only new or changed media and affected subtitle streams.'}const actions=card.querySelector('.index-maintenance-actions');actions.insertAdjacentHTML('beforeend','<button type="button" data-index-clear title="Delete stored subtitle analysis and cancel pending subtitle inspections; do not queue new work.">Clear stored results</button>');const clear=card.querySelector('[data-index-clear]');clear.onclick=async()=>{if(!confirm('Delete stored subtitle inspection results and cancel pending subtitle inspections? No new inspection work will be queued.'))return;clear.disabled=true;try{await api('/api/v80/setup/index/subtitles/clear',{method:'POST',body:'{}'});toast('Stored subtitle results cleared; no rebuild was queued.')}catch(error){toast(error.message,true)}finally{clear.disabled=false}};const rebuildButton=card.querySelector('[data-index-rebuild]');if(rebuildButton){rebuildButton.textContent='Rebuild full index';rebuildButton.title='Clear the subtitle inspection index and queue every media for a complete rebuild.'}}
     const rebuild=card.querySelector('[data-index-rebuild]');
     if(rebuild){
-      rebuild.textContent=job==='subtitles'?'Clear inspection data':'Clear preview cache';
+      rebuild.textContent=job==='subtitles'?'Rebuild full index':'Clear preview cache';
       rebuild.onclick=async()=>{
-        if(!confirm(`Clear stored ${job==='subtitles'?'subtitle inspection data':'preview files'}? New information will be generated only when requested.`))return;
-        try{const task=await api(`/api/v80/setup/index/${job}/rebuild`,{method:'POST',body:'{}'});toast(`Cleanup queued as job #${task.id}.`)}catch(error){toast(error.message,true)}
+        const message=job==='subtitles'?'Queue a complete subtitle inspection rebuild? Existing subtitle results will be cleared when the rebuild starts, then every catalog media will be queued.':'Clear preview files? New preview segments will be generated on demand.';
+        if(!confirm(message))return;
+        try{const task=await api(`/api/v80/setup/index/${job}/rebuild`,{method:'POST',body:'{}'});toast(job==='subtitles'?`Full subtitle rebuild queued as job #${task.id}.`:`Preview cleanup queued as job #${task.id}.`)}catch(error){toast(error.message,true)}
       };
     }
     if(job==='previews')card.querySelector('.index-schedule')?.classList.add('hidden');
   }
-  core?.insertAdjacentHTML('beforeend','<section id="performance-health"><h3>Performance health</h3><p data-performance-summary>Load Setup to check current risks.</p><div class="index-maintenance-actions"><button type="button" data-prune-history>Clean all finished queue history</button></div></section>');
+  core?.insertAdjacentHTML('beforeend','<section id="performance-health"><h3>Performance health</h3><p data-performance-summary>Load Setup to check current risks.</p><div class="index-maintenance-actions"><div class="index-action-group" data-action-group="history"><span class="index-action-label">History</span><button type="button" data-prune-history>Clean all finished queue history</button></div></div></section>');
   const cacheInput=maintenance.querySelector('[data-cache-limit]');if(cacheInput){cacheInput.min='0.25';cacheInput.step='0.25'}
   const prune=maintenance.querySelector("[data-prune-history]");if(prune)prune.onclick=async()=>{try{const result=await api("/api/v82/setup/queues/prune",{method:"POST",body:"{}"});toast(`Removed ${result.generic+result.index} finished queue entries`);refresh();document.querySelector('[data-index-tab][aria-selected="true"]')?.click()}catch(error){toast(error.message,true)}};
   const summary=document.querySelector('[data-performance-summary]');

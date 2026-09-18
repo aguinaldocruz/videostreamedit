@@ -14,15 +14,16 @@ import app.v54 as indexes
 import app.v65 as tasks
 from app.v11 import connection, column_exists
 from app.v13 import media_details_with_ietf
-from app.v51 import decode_external, extracted_text
+from app.v51 import damage_kind, decode_external, extracted_text
 from app.v43 import optimized_media_edit
-from app.v5 import SUBTITLE_EXTENSIONS, canonical_language, external_filename_metadata, external_subtitles, plex_language_pair
+from app.v5 import SUBTITLE_EXTENSIONS, external_filename_metadata, external_subtitles, plex_language_pair
 from app.v78 import app
 from app.v7 import ReorderEditRequest
 
 
 logger = logging.getLogger("videostreamedit")
 _legacy_processors = dict(indexes.processors)
+from app.subtitle_detector_config import SUBTITLE_DETECTOR_VERSION
 
 
 class SeasonStreamRequest(BaseModel):
@@ -61,90 +62,11 @@ class SeasonStreamBulkEdit(BaseModel):
 
 
 def ensure_tv_stream_index() -> None:
-    with connection() as db:
-        db.executescript("""
-            CREATE TABLE IF NOT EXISTS tv_stream_index_media (
-                path TEXT PRIMARY KEY, modified INTEGER NOT NULL, size INTEGER NOT NULL,
-                indexed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-            );
-            CREATE TABLE IF NOT EXISTS tv_stream_index_value (
-                path TEXT NOT NULL, stream_type TEXT NOT NULL,
-                language TEXT NOT NULL DEFAULT '', region TEXT NOT NULL DEFAULT '',
-                track_name TEXT NOT NULL DEFAULT ''
-            );
-            CREATE INDEX IF NOT EXISTS tv_stream_index_value_path ON tv_stream_index_value(path);
-            CREATE INDEX IF NOT EXISTS tv_stream_index_value_filter
-                ON tv_stream_index_value(stream_type,language,region,track_name);
-            CREATE TABLE IF NOT EXISTS tv_stream_index_settings (
-                key TEXT PRIMARY KEY, value TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS external_subtitle_index (
-                media_path TEXT NOT NULL, external_path TEXT NOT NULL,
-                codec TEXT NOT NULL DEFAULT '', language TEXT NOT NULL DEFAULT '',
-                region TEXT NOT NULL DEFAULT '', track_name TEXT NOT NULL DEFAULT '',
-                forced INTEGER NOT NULL DEFAULT 0, filename_tags TEXT NOT NULL DEFAULT '[]',
-                size INTEGER NOT NULL DEFAULT 0, modified_ns INTEGER NOT NULL DEFAULT 0,
-                PRIMARY KEY(media_path,external_path)
-            );
-            CREATE INDEX IF NOT EXISTS external_subtitle_index_media ON external_subtitle_index(media_path);
-            CREATE TABLE IF NOT EXISTS external_sidecar_index_state (
-                job TEXT NOT NULL, path TEXT NOT NULL, signature TEXT NOT NULL,
-                indexed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY(job,path)
-            );
-            CREATE TABLE IF NOT EXISTS portuguese_language_detection (
-                path TEXT NOT NULL, source TEXT NOT NULL, type_index INTEGER NOT NULL DEFAULT -1,
-                external_path TEXT NOT NULL DEFAULT '', metadata_language TEXT NOT NULL DEFAULT '',
-                metadata_region TEXT NOT NULL DEFAULT '', detected_language TEXT NOT NULL,
-                confidence REAL NOT NULL, evidence TEXT NOT NULL DEFAULT '',
-                sdh_label TEXT NOT NULL DEFAULT '', sdh_confidence REAL NOT NULL DEFAULT 0,
-                sdh_evidence TEXT NOT NULL DEFAULT '', checked_at TEXT NOT NULL,
-                PRIMARY KEY(path,source,type_index,external_path)
-            );
-            CREATE INDEX IF NOT EXISTS portuguese_detection_path ON portuguese_language_detection(path);
-            CREATE TABLE IF NOT EXISTS language_detection_settings (
-                key TEXT PRIMARY KEY, value TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS portuguese_detection_state (
-                path TEXT PRIMARY KEY, signature TEXT NOT NULL, checked_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS audio_language_detection (
-                path TEXT NOT NULL, type_index INTEGER NOT NULL,
-                metadata_language TEXT NOT NULL DEFAULT '', metadata_region TEXT NOT NULL DEFAULT '',
-                detected_language TEXT NOT NULL, confidence REAL NOT NULL DEFAULT 0,
-                samples_json TEXT NOT NULL DEFAULT '[]', mismatch INTEGER NOT NULL DEFAULT 0,
-                checked_at TEXT NOT NULL,
-                PRIMARY KEY(path,type_index)
-            );
-            CREATE INDEX IF NOT EXISTS audio_language_detection_mismatch ON audio_language_detection(mismatch,confidence);
-        """)
-        db.execute("INSERT OR IGNORE INTO language_detection_settings(key,value) VALUES('common_languages',?)", (json.dumps(["pt", "pt-BR", "en"], ensure_ascii=False),))
-        db.execute("INSERT OR IGNORE INTO language_detection_settings(key,value) VALUES('voice_detection_enabled','1')")
-        db.execute("INSERT OR IGNORE INTO language_detection_settings(key,value) VALUES('voice_detection_url','http://language-id:9000')")
-        db.execute("INSERT OR IGNORE INTO language_detection_settings(key,value) VALUES('voice_detection_sample_seconds','30')")
-        db.execute("INSERT OR IGNORE INTO language_detection_settings(key,value) VALUES('voice_detection_positions','[0.1,0.5,0.9]')")
-        db.execute("INSERT OR IGNORE INTO language_detection_settings(key,value) VALUES('voice_detection_sample_count','3')")
-        db.execute("INSERT OR IGNORE INTO language_detection_settings(key,value) VALUES('incremental_detection_enabled','1')")
-        for column, definition in (("sdh_label", "TEXT NOT NULL DEFAULT ''"), ("sdh_confidence", "REAL NOT NULL DEFAULT 0"), ("sdh_evidence", "TEXT NOT NULL DEFAULT ''")):
-            if not column_exists(db, "portuguese_language_detection", column):
-                db.execute(f"ALTER TABLE portuguese_language_detection ADD COLUMN {column} {definition}")
-        if not column_exists(db, "portuguese_detection_state", "detector_version"):
-            db.execute("ALTER TABLE portuguese_detection_state ADD COLUMN detector_version INTEGER NOT NULL DEFAULT 1")
+    """Legacy no-op retained only for old route call sites.
 
-
-@app.get("/api/v79/language-detection/settings")
-def get_language_detection_settings() -> dict:
-    with connection() as db:
-        row = db.execute("SELECT value FROM language_detection_settings WHERE key='common_languages'").fetchone()
-    try:
-        values = json.loads(row["value"]) if row else ["pt", "pt-BR", "en"]
-    except (TypeError, ValueError, json.JSONDecodeError):
-        values = ["pt", "pt-BR", "en"]
-    return {"common_languages": values}
-
-
-class LanguageDetectionSettings(BaseModel):
-    common_languages: list[str] = Field(default_factory=lambda: ["pt", "pt-BR", "en"], min_length=1, max_length=30)
+    TV stream filters now read the canonical media_stream_index tables.
+    """
+    return
 
 
 def update_language_detection_settings(request: LanguageDetectionSettings) -> dict:
@@ -358,7 +280,6 @@ def common_detection_languages() -> list[str]:
     return [str(value).strip() for value in values if str(value).strip()]
 
 
-@app.on_event("startup")
 def initialize_tv_stream_index() -> None:
     ensure_tv_stream_index()
     with connection() as db:
@@ -374,6 +295,7 @@ def initialize_tv_stream_index() -> None:
         db.execute("DELETE FROM external_sidecar_index_state WHERE path NOT IN (SELECT path FROM plex_media)")
         db.execute("DELETE FROM portuguese_language_detection WHERE path NOT IN (SELECT path FROM plex_media)")
         db.execute("DELETE FROM portuguese_detection_state WHERE path NOT IN (SELECT path FROM plex_media)")
+        db.execute("DELETE FROM subtitle_detection_stream_state WHERE path NOT IN (SELECT path FROM plex_media)")
 
 
 def external_sidecar_data(path: str, candidates: list[Path] | None = None) -> tuple[list[dict], str]:
@@ -472,16 +394,25 @@ def pending_external_sidecars(job: str) -> list[dict]:
 
 
 def pending_episode_rows() -> list[dict]:
+    """Return stale episodes from canonical filesystem freshness state."""
     ensure_tv_stream_index()
     with connection() as db:
-        return [dict(row) for row in db.execute("""
-            SELECT media.path,media.modified,media.size,media.title
+        rows = [dict(row) for row in db.execute("""
+            SELECT media.path,media.title,state.modified_ns,state.size
               FROM plex_media media
-              LEFT JOIN tv_stream_index_media cached ON cached.path=media.path
+              LEFT JOIN media_stream_index_state state ON state.path=media.path
              WHERE media.kind='episode'
-               AND (cached.path IS NULL OR cached.modified!=media.modified OR cached.size!=media.size)
              ORDER BY media.title COLLATE NOCASE,media.path
         """)]
+    pending = []
+    for row in rows:
+        try:
+            stat = Path(row["path"]).stat()
+            if row["modified_ns"] is None or int(row["modified_ns"]) != int(stat.st_mtime_ns) or int(row["size"] or -1) != int(stat.st_size):
+                pending.append({"path": row["path"], "title": row["title"], "modified": int(stat.st_mtime), "size": int(stat.st_size)})
+        except OSError:
+            pending.append({"path": row["path"], "title": row["title"], "modified": 0, "size": 0})
+    return pending
 
 
 def inspect_embedded_streams(path: str) -> list[tuple[str, str, str, str]]:
@@ -526,7 +457,6 @@ def core_index_with_tv(item: dict) -> None:
     else:
         _legacy_processors["core"](item)
         persist_external_sidecars("core", str(item["path"]))
-    inspect_portuguese_language(str(item["path"]))
 
 
 _PT_VARIANT_RESOURCE = Path(__file__).with_name("data") / "pt_variant_lexicon.json"
@@ -538,6 +468,8 @@ _PT_BR_WORDS = set(_PT_VARIANT_DATA.get("br_words") or {"você", "vocês", "ôni
 _PT_PT_WORDS = set(_PT_VARIANT_DATA.get("pt_words") or {"tu", "comboio", "telemóvel", "frigorífico", "casa de banho", "fixe", "rapariga", "autocarro", "ficheiro", "ecrã", "miúdo", "pequeno-almoço", "bocadinho", "se calhar", "percebido"})
 _PT_BR_PATTERNS = tuple(_PT_VARIANT_DATA.get("br_patterns") or ())
 _PT_PT_PATTERNS = tuple(_PT_VARIANT_DATA.get("pt_patterns") or ())
+_PT_BR_SPELLING = set(_PT_VARIANT_DATA.get("br_spelling") or ())
+_PT_PT_SPELLING = set(_PT_VARIANT_DATA.get("pt_spelling") or ())
 # Broad stop-word profiles prevent a repeated English song from outweighing
 # an otherwise Portuguese subtitle merely because the old list was tiny.
 _PT_COMMON_WORDS = {"o", "a", "os", "as", "um", "uma", "de", "do", "da", "dos", "das", "e", "que", "em", "no", "na", "nos", "nas", "para", "por", "com", "sem", "se", "não", "sim", "eu", "ele", "ela", "eles", "elas", "me", "te", "seu", "sua", "seus", "suas", "está", "estão", "foi", "ser", "como", "mais", "mas", "ou", "já", "aqui", "isso", "esse", "essa", "onde", "quando", "porque", "vai", "vou", "tem", "têm"}
@@ -548,7 +480,10 @@ _PT_PT_CONTEXT_RE = re.compile(r"\b(?:percebido|estamos\s+a\s+chegar|estão\s+a\
 _PT_BR_CONTEXT_RE = re.compile(r"\b(?:estou|estamos|está|estão)\s+(?:fazendo|dizendo|vendo|falando|chegando|entrando|saindo|trabalhando|ligando|tentando)\b", re.I)
 
 def _resource_pattern_count(patterns: tuple[str, ...], value: str) -> int:
-    return sum(len(re.findall(r"(?<!\w)" + re.escape(pattern.casefold()) + r"(?!\w)", value)) for pattern in patterns)
+    # Repetition is common in songs, credits and malformed OCR. Cap each
+    # marker's contribution so one repeated phrase cannot manufacture high
+    # language confidence.
+    return sum(min(3, len(re.findall(r"(?<!\w)" + re.escape(pattern.casefold()) + r"(?!\w)", value))) for pattern in patterns)
 
 
 def detect_common_variant(text: str, allowed_languages: set[str] | None = None) -> tuple[str, float, str]:
@@ -558,14 +493,14 @@ def detect_common_variant(text: str, allowed_languages: set[str] | None = None) 
     def term_count(words: set[str]) -> int:
         # Match complete words/phrases only. Raw substring counting makes the
         # PT-PT marker "tu" match inside unrelated words such as "tudo".
-        return sum(len(re.findall(r"(?<!\w)" + re.escape(word) + r"(?!\w)", normalized)) for word in words)
+        return sum(min(3, len(re.findall(r"(?<!\w)" + re.escape(word) + r"(?!\w)", normalized))) for word in words)
 
     # Establish the dominant base language first. Regional markers are only
     # considered after Portuguese wins, so a short English song or quotation
     # cannot change the classification of an otherwise Portuguese subtitle.
     pt_common = term_count(_PT_COMMON_WORDS) if "pt" in allowed else 0
-    br = (term_count(_PT_BR_WORDS) + _resource_pattern_count(_PT_BR_PATTERNS, normalized) * 2 + 2 * len(_PT_BR_RE.findall(normalized)) + 2 * len(_PT_BR_CONTEXT_RE.findall(normalized))) if "pt" in allowed else 0
-    pt = (term_count(_PT_PT_WORDS) + _resource_pattern_count(_PT_PT_PATTERNS, normalized) * 2 + 2 * len(_PT_PT_RE.findall(normalized)) + 2 * len(_PT_PT_CONTEXT_RE.findall(normalized))) if "pt" in allowed else 0
+    br = (term_count(_PT_BR_WORDS) + _resource_pattern_count(_PT_BR_PATTERNS, normalized) * 2 + 2 * term_count(_PT_BR_SPELLING) + 2 * min(3, len(_PT_BR_RE.findall(normalized))) + 2 * min(3, len(_PT_BR_CONTEXT_RE.findall(normalized)))) if "pt" in allowed else 0
+    pt = (term_count(_PT_PT_WORDS) + _resource_pattern_count(_PT_PT_PATTERNS, normalized) * 2 + 2 * term_count(_PT_PT_SPELLING) + 2 * min(3, len(_PT_PT_RE.findall(normalized))) + 2 * min(3, len(_PT_PT_CONTEXT_RE.findall(normalized)))) if "pt" in allowed else 0
     en = term_count(_EN_WORDS) if "en" in allowed else 0
     portuguese = pt_common + br + pt
     if portuguese == 0 and en < 3:
@@ -582,6 +517,12 @@ def detect_common_variant(text: str, allowed_languages: set[str] | None = None) 
         else:
             return "", 0.0, ""
     else:
+        # A subtitle containing substantial evidence for both Portuguese and
+        # English is often a bilingual/dual-language track or an OCR/credit
+        # mixture. Do not force either language; preserve an actionable reason
+        # for the no-confidence report instead of silently discarding evidence.
+        if portuguese >= 6 and en >= 6 and 0.45 <= portuguese / max(en, 1) <= 2.20:
+            return "", 0.0, "Mixed Portuguese/English subtitle evidence"
         return "", 0.0, ""
     dominance = score / max(total, 1)
     evidence_strength = min(score / 12, 1.0)
@@ -618,59 +559,199 @@ def analyze_sdh(text: str) -> tuple[str, float, str]:
     return label, round(score, 3), ", ".join(evidence) or "No distinctive SDH markers"
 
 
-def inspect_portuguese_language(path: str) -> None:
+def calibrate_subtitle_confidence(confidence: float, cue_count: int, text_chars: int, text_coverage: float) -> float:
+    """Cap confidence when a subtitle has too little readable evidence."""
+    value = max(0.0, min(0.99, float(confidence or 0.0)))
+    if cue_count < 3 or text_chars < 120:
+        return min(value, 0.60)
+    if text_coverage < 0.12:
+        return min(value, 0.60)
+    return value
+
+
+def subtitle_quality_issue(text: str, damage: str = "") -> str:
+    """Return a conservative user-facing quality issue, if one is present."""
+    if str(damage or "") not in {"", "None"}:
+        return f"Subtitle text flagged as {damage}"
+    if re.search(r"(?:https?://|www\.|\b(?:discord|t\.me|telegram)\b)", text or "", re.I):
+        return "Subtitle contains advertising or link-like text"
+    return ""
+
+
+def _subtitle_analysis_signature(path: str, stream: dict, configured: list[str], stat, detector_version: int = SUBTITLE_DETECTOR_VERSION) -> str:
+    """Return a stream-level fingerprint for incremental subtitle analysis."""
+    external = str(stream.get("external_path") or "")
+    external_state = None
+    if external:
+        try:
+            item = Path(external).stat()
+            external_state = (item.st_size, item.st_mtime_ns)
+        except OSError:
+            external_state = ("missing",)
+    payload = [detector_version, str(path), stream.get("source"), int(stream.get("type_index") or -1),
+               external, str(stream.get("codec") or ""), str(stream.get("language") or ""),
+               str(stream.get("region") or ""), stat.st_size, stat.st_mtime_ns, external_state, configured]
+    return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
+
+
+def normalized_evidence_sample(text: str, limit: int = 280) -> str:
+    """Return a small diagnostic excerpt, never a subtitle preview cache."""
+    value = text or ""
+    value = re.sub(r"(?m)^\s*\d+\s*$", " ", value)
+    value = re.sub(r"(?m)^\s*\d{1,2}:\d{2}:\d{2}[,.]\d{1,3}\s+-->.*$", " ", value)
+    value = re.sub(r"<[^>]{1,200}>", " ", value)
+    value = re.sub(r"\s+", " ", value).strip()
+    return value[:max(0, int(limit))]
+
+
+def _subtitle_metrics(text: str) -> dict:
+    value = text or ""
+    cues = len(re.findall(r"-->[^\n]*", value))
+    payload = re.sub(r"(?m)^\s*\d+\s*$|^\s*\d{1,2}:\d{2}:\d{2}[,.]\d{1,3}\s+-->.*$", " ", value)
+    readable = re.sub(r"\s+", " ", payload).strip()
+    markup_count = len(re.findall(r"<\s*/?\s*[a-zA-Z][^>]*>", value))
+    return {
+        "cue_count": cues,
+        "text_chars": len(readable),
+        "text_coverage": round(min(1.0, len(readable) / max(cues * 40, 1)), 4) if cues else 0.0,
+        "markup_count": markup_count,
+        "damage": damage_kind(value),
+    }
+
+
+def inspect_portuguese_language(path: str, detection_scope: dict | None = None, text_cache: dict | None = None) -> None:
     media = Path(path)
     if not media.is_file():
         return
+    detection_scope = detection_scope or {}
+    requested = detection_scope.get("subtitle_indices")
+    force_targeted = bool(requested)
     stat = media.stat()
     configured = common_detection_languages()
     bases = {value.casefold().split("-", 1)[0].split("_", 1)[0] for value in configured}
-    sidecars = []
-    for subtitle in external_subtitles(media):
-        try:
-            subtitle_stat = Path(subtitle["path"]).stat()
-            sidecars.append((subtitle["path"], subtitle_stat.st_size, subtitle_stat.st_mtime_ns))
-        except OSError:
-            continue
-    signature = hashlib.sha256(json.dumps(["detector-v8-sdh", stat.st_size, stat.st_mtime_ns, configured, sidecars], ensure_ascii=False).encode()).hexdigest()
     with connection() as db:
-        previous = db.execute("SELECT signature FROM portuguese_detection_state WHERE path=?", (path,)).fetchone()
-        if previous and previous["signature"] == signature:
-            return
-        streams = db.execute(
-            "SELECT source,type_index,external_path,language,region FROM media_stream_index "
+        stream_rows = db.execute(
+            "SELECT source,type_index,external_path,codec,language,region FROM media_stream_index "
             "WHERE path=? AND stream_type IN ('subtitle','external')", (path,)
         ).fetchall()
-    results = []
+        existing = {
+            (str(row["source"]), int(row["type_index"]), str(row["external_path"] or "")): dict(row)
+            for row in db.execute("SELECT * FROM portuguese_language_detection WHERE path=?", (path,)).fetchall()
+        }
+        states = {
+            (str(row["source"]), int(row["type_index"]), str(row["external_path"] or "")): dict(row)
+            for row in db.execute("SELECT * FROM subtitle_detection_stream_state WHERE path=?", (path,)).fetchall()
+        }
+    wanted = {int(item) for item in requested} if requested and requested != "all" else None
+    streams = [dict(row) for row in stream_rows]
+    if wanted is not None:
+        streams = [stream for stream in streams if stream["source"] == "embedded" and int(stream["type_index"]) in wanted]
+    cache = text_cache if text_cache is not None else {}
+    results: list[dict] = []
     for stream in streams:
+        key = (str(stream["source"]), int(stream["type_index"]), str(stream["external_path"] or ""))
+        stream_signature = _subtitle_analysis_signature(path, stream, configured, stat)
+        prior_state = states.get(key)
+        prior_row = existing.get(key)
+        if prior_state and prior_row and prior_state.get("signature") == stream_signature and not force_targeted:
+            results.append(prior_row)
+            continue
         metadata_language = str(stream["language"] or "").strip().casefold()
+        base = {
+            "path": path, "source": key[0], "type_index": key[1], "external_path": key[2],
+            "metadata_language": str(stream["language"] or ""), "metadata_region": str(stream["region"] or ""),
+            "detected_language": "", "confidence": 0.0, "evidence": "", "sdh_label": "",
+            "sdh_confidence": 0.0, "sdh_evidence": "", "evidence_sample": "", "analysis_status": "complete",
+            "analysis_reason": "", "analysis_signature": stream_signature, "detector_version": SUBTITLE_DETECTOR_VERSION,
+            "cue_count": 0, "text_chars": 0, "text_coverage": 0.0, "markup_count": 0, "damage": "",
+        }
         if metadata_language and metadata_language not in bases and metadata_language != "und":
+            base.update(analysis_status="skipped_non_common", analysis_reason="Metadata language is outside configured common languages")
+            results.append(base)
             continue
         try:
+            codec = str(stream.get("codec") or "").casefold()
             if stream["source"] == "external":
-                raw = Path(stream["external_path"]).read_bytes()[:2_000_000]
-                text, _ = decode_external(raw)
+                text_key = ("external", key[2])
+                cached = cache.get(text_key)
+                if cached is None:
+                    cached = decode_external(Path(key[2]).read_bytes()[:2_000_000])
+                    cache[text_key] = cached
+                text, _ = cached
+            elif (codec in {"subrip", "srt", "ass", "ssa", "webvtt", "mov_text", "text", "subtitles"}
+                  or any(token in codec for token in ("subrip", "srt", "ass", "ssa", "webvtt", "mov_text"))
+                  or not codec):
+                text_key = ("embedded", key[1])
+                text = cache.get(text_key)
+                if text is None:
+                    text = extracted_text(media, f"0:s:{key[1]}")
+                    cache[text_key] = text
             else:
-                text = extracted_text(media, f"0:s:{int(stream['type_index'])}")
+                text = ""
+                base.update(analysis_status="no_confidence", analysis_reason=f"Unsupported graphical subtitle codec: {codec or 'unknown'}")
+            base.update(_subtitle_metrics(text))
+            base["evidence_sample"] = normalized_evidence_sample(text)
             detected, confidence, evidence = detect_common_variant(text, bases)
+            confidence = calibrate_subtitle_confidence(confidence, int(base.get("cue_count") or 0), int(base.get("text_chars") or 0), float(base.get("text_coverage") or 0.0))
             sdh_label, sdh_confidence, sdh_evidence = analyze_sdh(text)
-            if not detected or confidence <= 0.60:
-                continue
-            expected = "pt-BR" if metadata_language == "pt" and str(stream["region"] or "").upper() == "BR" else "pt-PT" if metadata_language == "pt" else "en" if metadata_language == "en" else "und"
-            if metadata_language in {"", "und"} or detected.casefold() != expected.casefold():
-                results.append((path, str(stream["source"]), int(stream["type_index"]), str(stream["external_path"] or ""), str(stream["language"] or ""), str(stream["region"] or ""), detected, confidence, evidence, sdh_label, sdh_confidence, sdh_evidence))
-        except (OSError, ValueError, TypeError):
-            continue
+            base.update(detected_language=detected, confidence=confidence, evidence=evidence,
+                        sdh_label=sdh_label, sdh_confidence=sdh_confidence, sdh_evidence=sdh_evidence)
+            # Quality problems take precedence over language confidence. A
+            # subtitle can contain enough Portuguese/English vocabulary to
+            # score highly while still being unusable (OCR gibberish,
+            # mojibake, malformed timing, or an advertising payload). These
+            # findings must remain actionable instead of being reported as a
+            # healthy match or a language mismatch.
+            quality_issue = subtitle_quality_issue(text, str(base.get("damage") or ""))
+            if quality_issue:
+                base.update(analysis_status="no_confidence", analysis_reason=quality_issue)
+            elif not detected or confidence <= 0.60:
+                # Keep the reason specific enough for a user to act on. In
+                # particular, an unsupported graphical stream must not be
+                # overwritten by the generic language-scoring message.
+                if str(base.get("analysis_reason") or "").startswith("Unsupported graphical"):
+                    reason = str(base["analysis_reason"])
+                elif int(base.get("cue_count") or 0) == 0 or int(base.get("text_chars") or 0) == 0:
+                    reason = "No readable subtitle cues"
+                elif int(base.get("text_chars") or 0) < 40:
+                    reason = "Too little subtitle text for reliable language detection"
+                else:
+                    reason = evidence or "No confident common language detected"
+                base.update(analysis_status="no_confidence", analysis_reason=reason)
+            else:
+                expected = "pt-BR" if metadata_language == "pt" and str(stream["region"] or "").upper() == "BR" else "pt-PT" if metadata_language == "pt" else "en" if metadata_language == "en" else "und"
+                if metadata_language in {"", "und"} or detected.casefold() != expected.casefold():
+                    base.update(analysis_status="mismatch", analysis_reason=evidence or "Detected language differs from metadata")
+                else:
+                    base.update(analysis_status="complete", analysis_reason="Detected language agrees with metadata")
+        except (OSError, ValueError, TypeError) as exc:
+            base.update(analysis_status="unreadable", analysis_reason=f"Subtitle text could not be read: {str(exc)[:240]}")
+        results.append(base)
+    columns = ["path", "source", "type_index", "external_path", "metadata_language", "metadata_region", "detected_language", "confidence", "evidence", "sdh_label", "sdh_confidence", "sdh_evidence", "evidence_sample", "analysis_status", "analysis_reason", "analysis_signature", "detector_version", "cue_count", "text_chars", "text_coverage", "markup_count", "damage"]
+    placeholders = ",".join("?" for _ in columns)
     with connection() as db:
-        db.execute("DELETE FROM portuguese_language_detection WHERE path=?", (path,))
-        db.executemany("INSERT INTO portuguese_language_detection(path,source,type_index,external_path,metadata_language,metadata_region,detected_language,confidence,evidence,sdh_label,sdh_confidence,sdh_evidence,checked_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)", results)
-        db.execute("INSERT OR REPLACE INTO portuguese_detection_state(path,signature,detector_version,checked_at) VALUES(?,?,7,CURRENT_TIMESTAMP)", (path, signature))
+        if wanted is not None:
+            marks = ",".join("?" for _ in wanted)
+            db.execute(f"DELETE FROM portuguese_language_detection WHERE path=? AND source='embedded' AND type_index IN ({marks})", [path, *wanted])
+            db.execute(f"DELETE FROM subtitle_detection_stream_state WHERE path=? AND source='embedded' AND type_index IN ({marks})", [path, *wanted])
+        else:
+            db.execute("DELETE FROM portuguese_language_detection WHERE path=?", (path,))
+            db.execute("DELETE FROM subtitle_detection_stream_state WHERE path=?", (path,))
+        db.executemany(f"INSERT INTO portuguese_language_detection({','.join(columns)},checked_at) VALUES({placeholders},CURRENT_TIMESTAMP)", [[row.get(column, "") for column in columns] for row in results])
+        db.executemany("INSERT INTO subtitle_detection_stream_state(path,source,type_index,external_path,signature,status,reason,checked_at) VALUES(?,?,?,?,?,?,?,CURRENT_TIMESTAMP)", [(row["path"], row["source"], row["type_index"], row["external_path"], row["analysis_signature"], row["analysis_status"], row["analysis_reason"]) for row in results])
+        full_signature = hashlib.sha256(json.dumps(["detector-v9-phase1", stat.st_size, stat.st_mtime_ns, configured, [(row["source"], row["type_index"], row["external_path"], row["analysis_signature"]) for row in results]], ensure_ascii=False, sort_keys=True).encode()).hexdigest()
+        db.execute("INSERT OR REPLACE INTO portuguese_detection_state(path,signature,detector_version,checked_at) VALUES(?,?,?,CURRENT_TIMESTAMP)", (path, full_signature, SUBTITLE_DETECTOR_VERSION))
 
 def subtitle_index_with_sidecars(item: dict) -> None:
-    _legacy_processors["subtitles"](item)
     path = str(item["path"])
+    text_cache = {}
+    indexed_item = dict(item)
+    indexed_item["_subtitle_text_cache"] = text_cache
+    _legacy_processors["subtitles"](indexed_item)
     persist_external_sidecars("subtitles", path)
-    inspect_portuguese_language(path)
+    scope = item.get("detection_scope") or {}
+    if not scope.get("skip_detection"):
+        inspect_portuguese_language(path, scope, text_cache)
 
 
 def preview_index_with_sidecars(item: dict) -> None:
@@ -706,8 +787,8 @@ def _queue_recoverable_stale_indexes(paths: set[str]) -> set[str]:
         return set()
     from app.v80 import enqueue
     with connection() as db:
-        active = {row["path"] for row in db.execute("SELECT path FROM index_task_queue WHERE job=\"core\" AND status IN (\"pending\",\"running\")").fetchall()}
-        failed = {row["path"] for row in db.execute("SELECT path FROM index_task_queue WHERE job=\"core\" AND status=\"failed\"").fetchall()}
+        active = {row["path"] for row in db.execute("SELECT path FROM index_task_queue WHERE job=\'core\' AND status IN (\'pending\',\'running\')").fetchall()}
+        failed = {row["path"] for row in db.execute("SELECT path FROM index_task_queue WHERE job=\'core\' AND status=\'failed\'").fetchall()}
     queued = set()
     for path in paths:
         if path in active or path in failed or not Path(path).is_file():
@@ -776,14 +857,20 @@ def season_stream_values(request: SeasonStreamRequest) -> dict:
             current = None
         if not old or current is None or (int(old["modified_ns"]), int(old["size"])) != current:
             pending.append(item)
+    # Listing and filter expansion must remain read-only and responsive. The
+    # old implementation indexed stale episodes synchronously here, which
+    # caused long waits, request timeouts and competing writes while the user
+    # was merely opening a season. Queue stale snapshots and let the next
+    # refresh publish them atomically.
+    queued = 0
+    if pending:
+        from app.v80 import enqueue_many
+        queued = enqueue_many("core", pending, "Season filter requested a stale core index")
+        logger.info(
+            "tv_season_index event=stale_queued episodes=%d queued=%d",
+            len(pending), queued,
+        )
     errors = []
-    for number, item in enumerate(pending, 1):
-        try:
-            index_episode(item)
-        except Exception as exc:
-            errors.append({"path": item["path"], "error": str(getattr(exc, "detail", exc))[-500:]})
-        if number == 1 or number == len(pending) or number % 10 == 0:
-            logger.info("tv_season_index event=progress completed=%d total=%d errors=%d", number, len(pending), len(errors))
     paths = [item["path"] for item in items]
     values = []
     with connection() as db:
@@ -801,8 +888,18 @@ def season_stream_values(request: SeasonStreamRequest) -> dict:
                 except (TypeError, json.JSONDecodeError):
                     value["filename_tags"] = []
                 values.append(value)
-    logger.info("tv_season_index event=ready episodes=%d inspected=%d values=%d errors=%d", len(items), len(pending), len(values), len(errors))
-    return {"values": values, "episodes": len(items), "inspected": len(pending), "errors": errors}
+    logger.info(
+        "tv_season_index event=ready episodes=%d inspected=0 queued=%d values=%d errors=0",
+        len(items), queued, len(values),
+    )
+    return {
+        "values": values,
+        "episodes": len(items),
+        "inspected": 0,
+        "queued": queued,
+        "pending": len(pending),
+        "errors": errors,
+    }
 
 
 def comparable_language(value: str) -> str:
@@ -992,8 +1089,6 @@ def enqueue_tv_filtered_edits(paths: list[str], request: SeasonStreamBulkEdit) -
             )
             db.execute("INSERT OR REPLACE INTO media_change_request(task_id,path,requested_at) VALUES(?,?,?)", (cursor.lastrowid, path, now))
             task_ids.append(int(cursor.lastrowid))
-    from app.v80 import invalidate_language_detections
-    invalidate_language_detections([path for path in paths if targets.get(path)])
     tasks.wake_queue()
     logger.info("tv_stream_bulk_edit event=batch_queued media=%d first_id=%s last_id=%s", len(task_ids), task_ids[0] if task_ids else "none", task_ids[-1] if task_ids else "none")
     return len(task_ids), task_ids
@@ -1032,9 +1127,6 @@ def process_tv_bulk_preflight(task_id: int, payload: dict) -> dict:
             cursor = db.execute("INSERT INTO task_queue(task_type,label,payload_json,status,progress_message,created_at,updated_at) VALUES(?,?,?,'pending','Waiting',?,?)", (task_type, f"TV filtered stream edit · {Path(path).name}", json.dumps(signed, ensure_ascii=False, separators=(",", ":")), now, now))
             db.execute("INSERT OR REPLACE INTO media_change_request(task_id,path,requested_at) VALUES(?,?,?)", (cursor.lastrowid, path, now))
             child_ids.append(int(cursor.lastrowid))
-    from app.v80 import invalidate_language_detections
-    if child_ids:
-        invalidate_language_detections([path for path, _ in candidates])
     tasks.wake_queue()
     logger.info("tv_stream_bulk_preflight event=completed checked=%d queued=%d skipped=%d", len(paths), len(child_ids), skipped)
     return {"queued": len(child_ids), "skipped": skipped, "task_ids": child_ids}
@@ -1062,12 +1154,8 @@ def season_stream_bulk_edit(request: SeasonStreamBulkEdit) -> dict:
         raise HTTPException(400, "Remove cannot be combined with metadata changes")
     if "track_name" in changed and request.filters.language is None and not request.filters.language_regions:
         raise HTTPException(400, "Select a language and region before changing track names in bulk")
-    if request.mode == "queue":
-        preflight = tasks.enqueue("tv_bulk_preflight", {"paths": request.paths, "request": request.model_dump(exclude={"paths", "mode"}), "mode": "queue"}, "Preflight TV bulk stream change")
-        return {"mode": "queue", "queued": 1, "preflight": True, "task_ids": [preflight["id"]], "applied": 0, "streams": 0, "skipped": [], "failed": []}
-    # Immediate bulk edits use the same per-media workers as queued edits so the
-    # splash can report the actual episode and aggregate percentage.
-    queued, task_ids = enqueue_tv_filtered_edits(request.paths, request)
-    if not queued:
-        raise HTTPException(409, "No indexed streams match the selected values; refresh the filters")
-    return {"mode": "now", "queued": queued, "task_ids": task_ids, "applied": 0, "streams": 0, "skipped": [], "failed": []}
+    # Both modes use an asynchronous preflight. Signature capture and current
+    # stream verification can be expensive for large shows; keeping them in the
+    # queue makes the response immediate and gives the user a real progress view.
+    preflight = tasks.enqueue("tv_bulk_preflight", {"paths": request.paths, "request": request.model_dump(exclude={"paths", "mode"}), "mode": request.mode}, "Preflight TV bulk stream change")
+    return {"mode": request.mode, "queued": 1, "preflight": True, "task_ids": [preflight["id"]], "applied": 0, "streams": 0, "skipped": [], "failed": []}

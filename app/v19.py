@@ -19,6 +19,7 @@ from app.v16 import STATIC_DIR, app, asset
 
 
 logger = logging.getLogger("videostreamedit")
+from app.subtitle_detector_config import SUBTITLE_DETECTOR_VERSION
 
 
 @app.on_event("startup")
@@ -91,7 +92,8 @@ def _extract_subtitle_text(media: Path, index: int, codec: str) -> str:
 
 @app.post("/api/v19/stream/evaluate-forced")
 def evaluate_forced_subtitles(request: ForcedEvaluationRequest) -> dict:
-    from app.v79 import analyze_sdh, common_detection_languages, detect_common_variant
+    from app.v51 import damage_kind
+    from app.v79 import analyze_sdh, calibrate_subtitle_confidence, common_detection_languages, detect_common_variant, normalized_evidence_sample, subtitle_quality_issue
 
     media = plex_authorized_file(request.path)
     info = probe(media)
@@ -108,7 +110,9 @@ def evaluate_forced_subtitles(request: ForcedEvaluationRequest) -> dict:
         sdh_label, sdh_confidence, sdh_evidence = analyze_sdh(text)
         allowed = {value.casefold().split("-", 1)[0].split("_", 1)[0] for value in common_detection_languages()}
         detected_language, language_confidence, language_evidence = detect_common_variant(text, allowed) if text else ("", 0.0, "")
-        subtitles.append({"detected_language": detected_language, "language_confidence": language_confidence, "language_evidence": language_evidence, "source": "embedded", "type_index": subtitle_index, "codec": codec, "language": tags.get("language") or "", "title": tags.get("title") or "", "forced": bool((stream.get("disposition") or {}).get("forced")), "default": bool((stream.get("disposition") or {}).get("default")), "sdh_label": sdh_label, "sdh_confidence": sdh_confidence, "sdh_evidence": sdh_evidence, **metrics})
+        language_confidence = calibrate_subtitle_confidence(language_confidence, int(metrics.get("cues") or 0), len(re.sub(r"\s+", " ", text).strip()), float(metrics.get("coverage") or 0.0))
+        quality_issue = subtitle_quality_issue(text, damage_kind(text))
+        subtitles.append({"detected_language": detected_language, "language_confidence": language_confidence, "language_evidence": language_evidence, "quality_issue": quality_issue, "evidence_sample": normalized_evidence_sample(text), "source": "embedded", "type_index": subtitle_index, "codec": codec, "language": tags.get("language") or "", "title": tags.get("title") or "", "forced": bool((stream.get("disposition") or {}).get("forced")), "default": bool((stream.get("disposition") or {}).get("default")), "sdh_label": sdh_label, "sdh_confidence": sdh_confidence, "sdh_evidence": sdh_evidence, **metrics})
         subtitle_index += 1
     for item in external_subtitles(media):
         path = Path(str(item.get("path") or item.get("external_path") or ""))
@@ -120,10 +124,14 @@ def evaluate_forced_subtitles(request: ForcedEvaluationRequest) -> dict:
         sdh_label, sdh_confidence, sdh_evidence = analyze_sdh(text)
         allowed = {value.casefold().split("-", 1)[0].split("_", 1)[0] for value in common_detection_languages()}
         detected_language, language_confidence, language_evidence = detect_common_variant(text, allowed) if text else ("", 0.0, "")
-        subtitles.append({"detected_language": detected_language, "language_confidence": language_confidence, "language_evidence": language_evidence, "source": "external", "path": str(path), "codec": path.suffix.lstrip(".") or "unknown", "language": item.get("language") or "", "title": item.get("title") or path.name, "forced": bool(item.get("forced")), "default": bool(item.get("default")), "sdh_label": sdh_label, "sdh_confidence": sdh_confidence, "sdh_evidence": sdh_evidence, **metrics})
+        language_confidence = calibrate_subtitle_confidence(language_confidence, int(metrics.get("cues") or 0), len(re.sub(r"\s+", " ", text).strip()), float(metrics.get("coverage") or 0.0))
+        quality_issue = subtitle_quality_issue(text, damage_kind(text))
+        subtitles.append({"detected_language": detected_language, "language_confidence": language_confidence, "language_evidence": language_evidence, "quality_issue": quality_issue, "evidence_sample": normalized_evidence_sample(text), "source": "external", "path": str(path), "codec": path.suffix.lstrip(".") or "unknown", "language": item.get("language") or "", "title": item.get("title") or path.name, "forced": bool(item.get("forced")), "default": bool(item.get("default")), "sdh_label": sdh_label, "sdh_confidence": sdh_confidence, "sdh_evidence": sdh_evidence, **metrics})
     text_items = [item for item in subtitles if item["text_available"]]
     for item in subtitles:
-        if item["text_available"]:
+        if item.get("quality_issue"):
+            item["recommendation"] = "Review subtitle quality first"
+        elif item["text_available"]:
             if item["score"] >= 0.70: item["recommendation"] = "Likely forced"
             elif item["score"] <= 0.25 and item["coverage"] >= 0.45: item["recommendation"] = "Likely full subtitle"
             else: item["recommendation"] = "Uncertain"
@@ -315,25 +323,99 @@ def audio_detection_by_path() -> dict[str, dict]:
     return result
 
 
+def subtitle_detection_by_path() -> dict[str, dict]:
+    """Aggregate mismatch and no-confidence subtitle findings per media path."""
+    with connection() as db:
+        rows = db.execute(
+            "SELECT path,metadata_language,detected_language,confidence,analysis_status FROM portuguese_language_detection"
+        ).fetchall()
+    result: dict[str, dict] = {}
+    for row in rows:
+        path = str(row["path"])
+        confidence = float(row["confidence"] or 0)
+        detected = str(row["detected_language"] or "")
+        item = result.setdefault(path, {
+            "confidence": 0.0,
+            "metadata_language": "",
+            "detected_language": "",
+            "no_confidence": False,
+        })
+        if str(row["analysis_status"] or "") in {"no_confidence", "unreadable"}:
+            item["no_confidence"] = True
+            continue
+        if confidence > float(item["confidence"]):
+            item.update({
+                "confidence": confidence,
+                "metadata_language": str(row["metadata_language"] or ""),
+                "detected_language": detected,
+            })
+    return result
+
+
 @app.get("/api/v19/movies")
 def plex_movies_with_alternatives() -> list[dict]:
     aliases = aliases_by_path()
     requested = change_requests_by_path()
     audio_detection = audio_detection_by_path()
+    detection = subtitle_detection_by_path()
+    return [{**movie, "alternative_titles": aliases.get(movie["path"], []), "change_requested": movie["path"] in requested, "change_requests": requested.get(movie["path"], []), "portuguese_detection_confidence": (detection.get(str(movie["path"])) or {}).get("confidence"), "portuguese_detection_metadata": (detection.get(str(movie["path"])) or {}).get("metadata_language"), "portuguese_detection_language": (detection.get(str(movie["path"])) or {}).get("detected_language"), "portuguese_detection_no_confidence": bool((detection.get(str(movie["path"])) or {}).get("no_confidence")), "audio_detection_confidence": (audio_detection.get(str(movie["path"])) or {}).get("confidence"), "audio_detection_metadata": (audio_detection.get(str(movie["path"])) or {}).get("metadata_language"), "audio_detection_language": (audio_detection.get(str(movie["path"])) or {}).get("detected_language")} for movie in plex_movies()]
+
+
+
+def _tv_summary_payload() -> list[dict]:
+    aliases = aliases_by_path()
     with connection() as db:
-        detection = {}
-        for row in db.execute("SELECT path,metadata_language,detected_language,confidence FROM portuguese_language_detection").fetchall():
-            current = detection.get(str(row["path"]))
-            if current is None or float(row["confidence"]) > current["confidence"]:
-                detection[str(row["path"])] = {"confidence": float(row["confidence"]), "metadata_language": str(row["metadata_language"] or ""), "detected_language": str(row["detected_language"] or "")}
-    return [{**movie, "alternative_titles": aliases.get(movie["path"], []), "change_requested": movie["path"] in requested, "change_requests": requested.get(movie["path"], []), "portuguese_detection_confidence": (detection.get(str(movie["path"])) or {}).get("confidence"), "portuguese_detection_metadata": (detection.get(str(movie["path"])) or {}).get("metadata_language"), "portuguese_detection_language": (detection.get(str(movie["path"])) or {}).get("detected_language"), "audio_detection_confidence": (audio_detection.get(str(movie["path"])) or {}).get("confidence"), "audio_detection_metadata": (audio_detection.get(str(movie["path"])) or {}).get("metadata_language"), "audio_detection_language": (audio_detection.get(str(movie["path"])) or {}).get("detected_language")} for movie in plex_movies()]
+        rows = db.execute("SELECT library_key,library_name,show_title,count(*) AS episode_count FROM plex_media WHERE kind='episode' GROUP BY library_key,library_name,show_title ORDER BY show_title COLLATE NOCASE").fetchall()
+        path_rows = db.execute("SELECT library_key,show_title,path FROM plex_media WHERE kind='episode'").fetchall()
+        note_rows = db.execute("SELECT entity_key,note,reviewed,plex_sync_change FROM media_notes WHERE entity_type='tv'").fetchall()
+        busy_paths = {str(row['path']) for row in db.execute("SELECT DISTINCT path FROM index_task_queue WHERE status IN ('pending','running','failed')").fetchall()}
+        detection_rows = db.execute("SELECT path,metadata_language,detected_language,confidence,analysis_status FROM portuguese_language_detection").fetchall()
+        audio_rows = db.execute("SELECT path,metadata_language,detected_language,confidence FROM audio_language_detection WHERE mismatch=1").fetchall()
+    notes = {str(row['entity_key']): row for row in note_rows}
+    paths_by_key: dict[str, list[str]] = {}
+    for row in path_rows:
+        key = f"{row['library_key']}:{row['show_title'] or 'Unknown show'}"
+        paths_by_key.setdefault(key, []).append(str(row['path']))
+    def strongest(rows):
+        result = {}
+        for row in rows:
+            path = str(row['path'])
+            value = float(row['confidence'] or 0)
+            if path not in result or value > result[path]['confidence']:
+                result[path] = {'confidence': value, 'metadata_language': str(row['metadata_language'] or ''), 'detected_language': str(row['detected_language'] or ''), 'no_confidence': False}
+            keys = row.keys() if hasattr(row, 'keys') else ()
+            status = str(row['analysis_status'] or '') if 'analysis_status' in keys else ''
+            if status in {'no_confidence', 'unreadable'}:
+                result.setdefault(path, {'confidence': 0.0, 'metadata_language': '', 'detected_language': '', 'no_confidence': False})['no_confidence'] = True
+        return result
+    detections = strongest(detection_rows)
+    audio_detections = strongest(audio_rows)
+    result = []
+    for row in rows:
+        key = f"{row['library_key']}:{row['show_title'] or 'Unknown show'}"
+        paths = paths_by_key.get(key, [])
+        top = max((detections[path] for path in paths if path in detections), key=lambda item: item['confidence'], default=None)
+        top_audio = max((audio_detections[path] for path in paths if path in audio_detections), key=lambda item: item['confidence'], default=None)
+        note = notes.get(key)
+        result.append({
+            "id": key, "name": row['show_title'] or "Unknown show", "root_name": row['library_name'],
+            "episode_count": int(row['episode_count']), "alternative_titles": next((aliases[path] for path in paths if aliases.get(path)), []),
+            "seasons": [], "index_busy": any(path in busy_paths for path in paths),
+            "note": str(note['note']) if note else "", "reviewed": bool(note['reviewed']) if note else False, "plex_sync_change": bool(note['plex_sync_change']) if note else False,
+            "portuguese_detection_confidence": top['confidence'] if top else None, "portuguese_detection_metadata": top['metadata_language'] if top else None, "portuguese_detection_language": top['detected_language'] if top else None, "portuguese_detection_no_confidence": any(bool(detections[path].get('no_confidence')) for path in paths if path in detections),
+            "audio_detection_confidence": top_audio['confidence'] if top_audio else None, "audio_detection_metadata": top_audio['metadata_language'] if top_audio else None, "audio_detection_language": top_audio['detected_language'] if top_audio else None,
+        })
+    return result
 
 
+@app.get("/api/v19/tv/summary")
+def tv_summary_read_model() -> list[dict]:
+    return _tv_summary_payload()
 @app.get("/api/v19/tv")
-def plex_tv_with_alternatives() -> list[dict]:
+def plex_tv_with_alternatives(show_id: str | None = None) -> list[dict]:
     aliases = aliases_by_path()
     requested = change_requests_by_path()
-    shows = plex_tv()
+    shows = plex_tv(show_id)
     audio_detection = audio_detection_by_path()
     # Index activity is derived from the live queue, so the filter remains useful
     # while a long-running core/subtitle/preview index is in progress.
@@ -347,11 +429,7 @@ def plex_tv_with_alternatives() -> list[dict]:
         # Use already indexed audio/subtitle streams only. Listing must not probe
         # episode files, especially for large shows. Video metadata rows are
         # deliberately excluded; external sidecars count as subtitle streams.
-        detection = {}
-        for row in db.execute("SELECT path,metadata_language,detected_language,confidence FROM portuguese_language_detection").fetchall():
-            current = detection.get(str(row["path"]))
-            if current is None or float(row["confidence"]) > current["confidence"]:
-                detection[str(row["path"])] = {"confidence": float(row["confidence"]), "metadata_language": str(row["metadata_language"] or ""), "detected_language": str(row["detected_language"] or "")}
+        detection = subtitle_detection_by_path()
         stream_counts = {
             str(row["path"]): {
                 "audio": int(row["audio_count"] or 0),
@@ -369,11 +447,11 @@ def plex_tv_with_alternatives() -> list[dict]:
     for show in shows:
         paths = [episode["path"] for season in show["seasons"] for episode in season["episodes"]]
         show["index_busy"] = any(path in busy_paths for path in paths)
-        confidences = [detection[path] for path in paths if path in detection]
         show["portuguese_detection_confidence"] = max((detection[path]["confidence"] for path in paths if path in detection), default=None)
         top_detection = max((detection[path] for path in paths if path in detection), key=lambda item: item["confidence"], default=None)
         show["portuguese_detection_metadata"] = top_detection["metadata_language"] if top_detection else None
         show["portuguese_detection_language"] = top_detection["detected_language"] if top_detection else None
+        show["portuguese_detection_no_confidence"] = any(bool(detection[path].get("no_confidence")) for path in paths if path in detection)
         top_audio = max((audio_detection[path] for path in paths if path in audio_detection), key=lambda item: item["confidence"], default=None)
         show["audio_detection_confidence"] = top_audio["confidence"] if top_audio else None
         show["audio_detection_metadata"] = top_audio["metadata_language"] if top_audio else None
@@ -388,6 +466,7 @@ def plex_tv_with_alternatives() -> list[dict]:
                 episode["portuguese_detection_confidence"] = episode_detection.get("confidence")
                 episode["portuguese_detection_metadata"] = episode_detection.get("metadata_language")
                 episode["portuguese_detection_language"] = episode_detection.get("detected_language")
+                episode["portuguese_detection_no_confidence"] = bool(episode_detection.get("no_confidence"))
                 audio_episode = audio_detection.get(episode["path"]) or {}
                 episode["audio_detection_confidence"] = audio_episode.get("confidence")
                 episode["audio_detection_metadata"] = audio_episode.get("metadata_language")
@@ -619,13 +698,16 @@ def portuguese_language_report(kind: str) -> dict:
         raise HTTPException(400, "Kind must be tv or movies")
     with connection() as db:
         rows = db.execute(
-            "SELECT d.path,d.source,d.type_index,d.external_path,d.metadata_language,d.detected_language,d.confidence,d.metadata_region,d.evidence,d.sdh_label,d.sdh_confidence,d.sdh_evidence "
+            "SELECT d.path,d.source,d.type_index,d.external_path,d.metadata_language,d.detected_language,d.confidence,d.metadata_region,d.evidence,d.sdh_label,d.sdh_confidence,d.sdh_evidence,d.evidence_sample,d.analysis_status,d.analysis_reason,d.cue_count,d.text_chars,d.text_coverage,d.markup_count,d.damage "
             "FROM portuguese_language_detection d JOIN plex_media p ON p.path=d.path "
-            "WHERE d.confidence>=0.60 AND d.path NOT IN (SELECT path FROM index_task_queue WHERE status IN ('pending','running')) ORDER BY d.path"
+            "WHERE d.detector_version>=? AND d.confidence>=0.60 "
+            "AND ((?='movies' AND p.kind='movie') OR (?='tv' AND p.kind='episode')) "
+            "AND d.path NOT IN (SELECT path FROM index_task_queue WHERE status IN ('pending','running')) ORDER BY d.path",
+            (SUBTITLE_DETECTOR_VERSION, kind, kind),
         ).fetchall()
     by_path = {}
     for row in rows:
-        by_path.setdefault(str(row["path"]), []).append({"source": row["source"], "type_index": int(row["type_index"]), "external_path": row["external_path"], "metadata_language": row["metadata_language"], "metadata_region": row["metadata_region"], "detected_language": row["detected_language"], "confidence": round(float(row["confidence"]) * 100, 1), "evidence": row["evidence"], "sdh_label": row["sdh_label"] or "", "sdh_confidence": round(float(row["sdh_confidence"] or 0) * 100, 1), "sdh_evidence": row["sdh_evidence"] or ""})
+        by_path.setdefault(str(row["path"]), []).append({"source": row["source"], "type_index": int(row["type_index"]), "external_path": row["external_path"], "metadata_language": row["metadata_language"], "metadata_region": row["metadata_region"], "detected_language": row["detected_language"], "confidence": round(float(row["confidence"]) * 100, 1), "evidence": row["evidence"], "evidence_sample": row["evidence_sample"] or "", "analysis_status": row["analysis_status"] or "mismatch", "analysis_reason": row["analysis_reason"] or "", "cue_count": int(row["cue_count"] or 0), "text_chars": int(row["text_chars"] or 0), "text_coverage": round(float(row["text_coverage"] or 0) * 100, 1), "markup_count": int(row["markup_count"] or 0), "damage": row["damage"] or "", "sdh_label": row["sdh_label"] or "", "sdh_confidence": round(float(row["sdh_confidence"] or 0) * 100, 1), "sdh_evidence": row["sdh_evidence"] or ""})
     items = []
     if kind == "movies":
         for movie in plex_movies():
@@ -648,6 +730,58 @@ def portuguese_language_report(kind: str) -> dict:
         groups = item.get("episodes") or [{"mismatches": item.get("mismatches") or []}]
         fixable += sum(1 for group in groups for mismatch in group.get("mismatches") or [] if float(mismatch.get("confidence") or 0) >= 80 and mismatch.get("source") == "embedded")
     return {"kind": kind, "items": items, "title_count": len(items), "media_count": sum(item["media_count"] for item in items), "fixable_above_80": fixable}
+
+
+class SubtitleRevalidateRequest(BaseModel):
+    paths: list[str] = Field(min_length=1, max_length=30000)
+    subtitle_indices: list[int] | None = None
+
+
+@app.get("/api/v19/reports/subtitle-no-confidence")
+def subtitle_no_confidence_report(kind: str, status: str | None = None, reason: str | None = None) -> dict:
+    """List current low-confidence subtitle findings with optional filters."""
+    if kind not in {"tv", "movies"}:
+        raise HTTPException(400, "Kind must be tv or movies")
+    allowed_statuses = {"no_confidence", "unreadable"}
+    if status and status not in allowed_statuses:
+        raise HTTPException(400, "Unsupported subtitle analysis status")
+    clauses = ["d.detector_version>=?", "((?='movies' AND p.kind='movie') OR (?='tv' AND p.kind='episode'))", "d.path NOT IN (SELECT path FROM index_task_queue WHERE status IN ('pending','running'))"]
+    params: list[object] = [SUBTITLE_DETECTOR_VERSION, kind, kind]
+    if status:
+        clauses.append("d.analysis_status=?")
+        params.append(status)
+    else:
+        clauses.append("d.analysis_status IN ('no_confidence','unreadable')")
+    if reason:
+        clauses.append("LOWER(COALESCE(d.analysis_reason,'')) LIKE LOWER(?)")
+        params.append(f"%{reason.strip()}%")
+    with connection() as db:
+        rows = db.execute(
+            "SELECT d.path,d.source,d.type_index,d.external_path,d.metadata_language,d.metadata_region,d.analysis_status,d.analysis_reason,d.confidence,d.cue_count,d.text_chars,d.text_coverage,d.markup_count,d.damage,d.evidence_sample,p.title,p.show_title,p.kind "
+            "FROM portuguese_language_detection d JOIN plex_media p ON p.path=d.path WHERE " + " AND ".join(clauses) + " ORDER BY p.title COLLATE NOCASE,d.path,d.type_index",
+            params,
+        ).fetchall()
+    items = []
+    for row in rows:
+        items.append({"path": str(row["path"]), "title": str(row["title"] or Path(str(row["path"])).stem), "show_title": str(row["show_title"] or ""), "source": row["source"], "type_index": int(row["type_index"]), "external_path": row["external_path"] or "", "metadata_language": row["metadata_language"] or "", "metadata_region": row["metadata_region"] or "", "status": row["analysis_status"], "reason": row["analysis_reason"] or "", "confidence": round(float(row["confidence"] or 0) * 100, 1), "cue_count": int(row["cue_count"] or 0), "text_chars": int(row["text_chars"] or 0), "text_coverage": round(float(row["text_coverage"] or 0) * 100, 1), "markup_count": int(row["markup_count"] or 0), "damage": row["damage"] or "", "evidence_sample": row["evidence_sample"] or ""})
+    return {"kind": kind, "status": status, "reason": reason or "", "items": items, "media_count": len({item["path"] for item in items}), "stream_count": len(items)}
+
+
+@app.post("/api/v19/reports/subtitle-revalidate")
+def revalidate_subtitle_report(request: SubtitleRevalidateRequest) -> dict:
+    """Queue targeted subtitle inspection for selected media/streams."""
+    from app.v80 import enqueue
+    queued = 0
+    seen = set()
+    indices = request.subtitle_indices or "all"
+    for raw_path in request.paths:
+        path = str(Path(raw_path))
+        if not path or path in seen:
+            continue
+        seen.add(path)
+        scope = {"subtitle_indices": indices}
+        queued += int(enqueue("subtitles", path, "User revalidated subtitle inspection report", scope) or 0)
+    return {"requested": len(seen), "queued": queued}
 
 
 class LanguageDetectionFixRequest(BaseModel):
@@ -821,7 +955,7 @@ async def v19_title_assets(request: Request, call_next):
         html = html.replace('<script src="/app.js"></script>', '<script src="/assets/v19.js"></script>')
         return HTMLResponse(html, headers={"Cache-Control": "no-store, max-age=0"})
     if request.method == "GET" and request.url.path == "/assets/v19.css":
-        names = ("v3.css", "v4.css", "v5.css", "v7-addon.css", "v8-addon.css", "v10-progress.css", "v11-plex.css", "v12-context.css", "v14-brand.css", "v15-path.css", "v16-bulk.css", "v18-value-popup.css", "v19-titles.css", "v20-clone.css", "v22-bulk-clone.css", "v23-session-changes.css", "v25-template-history.css", "v26-stream-layout.css", "v27-fast-defaults.css", "v28-movie-import.css", "v29-change-highlights.css", "v30-destination-order.css", "v31-destination-browser.css", "v32-output-folder.css", "v33-global-busy.css", "v36-inline-combobox.css", "v37-filename.css", "v38-movie-filters.css", "v39-movie-index.css", "v40-track-suggestions.css", "v44-prompt-settings.css", "v46-navigation-pending.css", "v48-setup-tabs.css", "v49-stream-preview.css", "v50-stream-preview.css", "v51-subtitle-properties.css", "v54-split-index.css", "v58-manual-audio-name.css", "v60-preview-layout.css", "v61-preview-overflow.css", "v63-index-controls.css", "v65-task-queue.css", "v67-index-schedules.css", "v68-plex-sync.css", "v69-stream-preview.css", "v77-bulk-track-name.css", "v78-change-requested.css", "v79-season-filters.css", "v82-movie-streams.css", "v83-media-review.css", "v84-activity.css", "v85-remove-cycle.css", "v86-tasks-layout.css", "v87-language-region.css", "v88-reports.css")
+        names = ("v3.css", "v4.css", "v5.css", "v7-addon.css", "v8-addon.css", "v10-progress.css", "v11-plex.css", "v12-context.css", "v14-brand.css", "v15-path.css", "v16-bulk.css", "v18-value-popup.css", "v19-titles.css", "v20-clone.css", "v22-bulk-clone.css", "v23-session-changes.css", "v25-template-history.css", "v26-stream-layout.css", "v27-fast-defaults.css", "v28-movie-import.css", "v29-change-highlights.css", "v30-destination-order.css", "v31-destination-browser.css", "v32-output-folder.css", "v33-global-busy.css", "v36-inline-combobox.css", "v37-filename.css", "v38-movie-filters.css", "v39-movie-index.css", "v40-track-suggestions.css", "v44-prompt-settings.css", "v46-navigation-pending.css", "v48-setup-tabs.css", "v49-stream-preview.css", "v50-stream-preview.css", "v51-subtitle-properties.css", "v54-split-index.css", "v58-manual-audio-name.css", "v60-preview-layout.css", "v61-preview-overflow.css", "v63-index-controls.css", "v65-task-queue.css", "v67-index-schedules.css", "v68-plex-sync.css", "v69-stream-preview.css", "v77-bulk-track-name.css", "v78-change-requested.css", "v79-season-filters.css", "v82-movie-streams.css", "v83-media-review.css", "v84-activity.css", "v85-remove-cycle.css", "v86-tasks-layout.css", "v87-language-region.css", "v88-reports.css", "v89-design-tokens.css", "v90-stream-properties.css", "v91-listings.css", "v92-dashboard-setup.css", "v93-movie-import.css", "v94-preview.css", "v95-global-busy.css", "v96-dialogs.css", "v97-accessibility.css")
         return asset("\n".join((STATIC_DIR / name).read_text() for name in names), "text/css")
     if request.method == "GET" and request.url.path == "/assets/v19.js":
         javascript = (STATIC_DIR / "v33-global-busy.js").read_text() + "\n" + (STATIC_DIR / "v5.js").read_text().replace("'/api/movies'", "'/api/v19/movies'").replace("'/api/tv'", "'/api/v19/tv'")

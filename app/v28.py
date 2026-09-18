@@ -13,7 +13,7 @@ import app.v7 as v7_module
 import app.v13 as v13_module
 import app.v5 as v5_module
 from app.v5 import external_subtitles
-from app.v7 import OrderItem, ReorderEditRequest, reorder_edit
+from app.v7 import ReorderEditRequest, reorder_edit
 from app.v11 import connection, plex_authorized_file
 from app.v25 import app
 

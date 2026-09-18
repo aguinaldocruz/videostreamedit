@@ -147,8 +147,7 @@ def persist_remux_language_tags(
         raise HTTPException(422, (getattr(exc, "stderr", None) or "Matroska language metadata edit failed")[-2000:]) from exc
 
 
-@app.post("/api/v7/media/edit")
-def reorder_edit(request: ReorderEditRequest) -> dict:
+def _reorder_edit_impl(request: ReorderEditRequest) -> dict:
     source = authorized_file(request.path)
     original = source.stat()
     data = probe(source)
@@ -281,3 +280,23 @@ def reorder_edit(request: ReorderEditRequest) -> dict:
         logger.info("change=stream_removed file=%s stream=%s", media, identifier.replace("\n", "\\n"))
     logger.info("change=media_file_replaced file=%s", media)
     return {"edited": str(source), "warnings": warnings}
+
+
+@app.post("/api/v7/media/edit")
+def reorder_edit(request: ReorderEditRequest) -> dict:
+    """Compatibility edit route with the same scoped follow-up planner as v43."""
+    result = _reorder_edit_impl(request)
+    try:
+        from app.v80 import detection_scope_for_edit, media_indexes_for_edit, request_media_indexes
+        payload = request.model_dump()
+        remuxed = True  # this legacy path always rewrites the container
+        request_media_indexes(
+            str(result.get("edited") or request.path),
+            media_indexes_for_edit(payload, remuxed=remuxed),
+            "Compatibility media edit completed",
+            defer_detection=request.defer_language_detection,
+            detection_scope=detection_scope_for_edit(payload, remuxed=remuxed),
+        )
+    except Exception as exc:
+        logger.warning("subtitle_detection event=compatibility_post_edit_reindex_failed file=%s error=%s", str(request.path).replace(chr(10), " ")[-300:], str(exc).replace(chr(10), " ")[-300:])
+    return result

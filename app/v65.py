@@ -5,7 +5,6 @@ import json
 import logging
 import os
 import subprocess
-import sqlite3
 import tempfile
 import threading
 import time
@@ -27,7 +26,7 @@ from app.v11 import connection, column_exists
 from app.v37 import MediaRenameRequest, rename_media
 from app.v43 import optimized_media_edit
 from app.v64 import app
-from app.postgres_store import register_task_stage, begin_task_stage, finish_task_stage, fail_task_stage, task_stage_exists, reset_task_stage_for_retry, prepare_task_artifact, commit_task_artifacts, cleanup_succeeded_workflow_group_artifacts, cleanup_succeeded_workflow_artifacts as cleanup_succeeded_workflow_artifacts_startup, workflow_details
+from app.postgres_store import register_task_stage, begin_task_stage, finish_task_stage, fail_task_stage, task_stage_exists, reset_task_stage_for_retry, prepare_task_artifact, commit_task_artifacts, cleanup_succeeded_workflow_group_artifacts, cleanup_succeeded_workflow_artifacts as cleanup_succeeded_workflow_artifacts_startup, workflow_details, create_luw, transition_luw, acquire_luw_lock, release_luw_lock, append_luw_journal, commit_luw, mark_read_models_fresh
 from app.v5 import external_subtitles
 
 
@@ -35,7 +34,16 @@ logger = logging.getLogger("uvicorn.error")
 queue_condition = threading.Condition()
 queue_thread: threading.Thread | None = None
 queue_light_thread: threading.Thread | None = None
+queue_shutdown = threading.Event()
 LIGHT_TASK_TYPES = ("index_check_prepare", "index_rebuild_prepare")
+# These jobs are protected maintenance work. User ordering still controls
+# user-requested operations, while old maintenance work receives an aging
+# allowance so it cannot be starved indefinitely.
+SYSTEM_TASK_TYPES = frozenset({
+    "plex_sync", "audio_language_detection", "media_reindex",
+    "index_check_prepare", "index_rebuild_prepare",
+})
+SYSTEM_AGING_SECONDS = 600
 
 
 class QueueRequest(BaseModel):
@@ -63,6 +71,10 @@ class QueueExpediteMatchingRequest(BaseModel):
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def scheduler_system_cutoff() -> str:
+    return datetime.fromtimestamp(time.time() - SYSTEM_AGING_SECONDS, tz=timezone.utc).isoformat(timespec="seconds")
 
 
 def queue_paused() -> bool:
@@ -189,6 +201,48 @@ def validate_media_signature(task_type: str, payload: dict) -> None:
     if current.get("digest") != expected.get("digest") or bool(current.get("missing")) != bool(expected.get("missing")):
         raise RuntimeError("Media changed between queueing and execution; job refused for safety")
 
+def _create_media_luw(task_id: int, task_type: str, payload: dict, path: str) -> str | None:
+    destructive_types = {"media_edit", "filtered_stream_edit", "filtered_stream_edit_now", "tv_filtered_stream_edit", "tv_filtered_stream_edit_now", "movie_import", "subtitle_html_cleanup", "image_subtitle_convert", "ocr_rollback", "plex_import_refresh"}
+    if os.getenv("DATABASE_BACKEND", "sqlite").lower() != "postgres" or task_type not in destructive_types or not path:
+        return None
+    existing = payload.get("_luw_id")
+    if existing:
+        return str(existing)
+    mode = "immediate" if str(task_type).endswith("_now") or payload.get("mode") == "now" else "queued"
+    resource_key = path
+    if task_type == "movie_import":
+        resource_key = f"{path} -> {payload.get('destination') or ''}/{payload.get('filename') or ''}".rstrip("/")
+    edit = payload.get("edit") or payload
+    if task_type == "movie_import":
+        rollback_strategy = "atomic-copy-target-and-retain-source"
+    elif task_type in {"image_subtitle_convert", "ocr_rollback", "subtitle_html_cleanup"}:
+        rollback_strategy = "staged-original-until-review-or-commit"
+    elif edit.get("remove") or edit.get("order") or edit.get("external_subtitles"):
+        rollback_strategy = "full-original-until-verified"
+    else:
+        rollback_strategy = "metadata-journal-plus-original-until-verified"
+    payload["_luw_strategy"] = rollback_strategy
+    luw_id = create_luw(
+        resource_key=resource_key,
+        operation_type=task_type,
+        mode=mode,
+        payload={"task_id": task_id, "source": payload.get("source"), "destination": payload.get("destination"), "filename": payload.get("filename"), "edit": payload.get("edit") or {}, "rollback_strategy": rollback_strategy, "queue_group": payload.get("_queue_group")},
+        input_signature=payload.get("_media_signature") or {},
+        group_id=payload.get("_queue_group"),
+        idempotency_key=f"task:{task_id}",
+        priority_class="user",
+    )
+    if luw_id:
+        payload["_luw_id"] = luw_id
+        append_luw_journal(
+            luw_id,
+            "operation_plan",
+            path,
+            {"media_signature": payload.get("_media_signature") or {}, "rollback_strategy": rollback_strategy},
+            {"edit": payload.get("edit") or {}, "destination": payload.get("destination"), "filename": payload.get("filename"), "rollback_strategy": rollback_strategy},
+        )
+    return luw_id
+
 def advance_media_signature(payload: dict) -> None:
     group_id = payload.get("_queue_group")
     if not group_id:
@@ -246,12 +300,9 @@ def enqueue(task_type: str, payload: dict, label: str = "", *, deduplicate: bool
     except Exception as exc:
         logger.exception("workflow event=stage_registration_failed task=%s error=%s", task_type, str(exc))
         raise
-    if affected:
-        try:
-            from app.v80 import invalidate_language_detection
-            invalidate_language_detection(affected)
-        except Exception as exc:
-            logger.warning("subtitle_detection event=invalidation_failed task=%d error=%s", task_id, str(exc).replace("\n", " ")[-300:])
+    # Detection invalidation is performed by the executing operation with a
+    # stream-aware scope. Queue insertion itself must not erase valid results
+    # for unrelated streams while a task waits behind other work.
     logger.info("task_queue event=added id=%d type=%s label=%s", task_id, task_type, (label or "").replace("\n", "\\n"))
     wake_queue()
     return task_row(task_id)
@@ -284,6 +335,9 @@ def process_media_reindex(task_id: int, payload: dict) -> dict:
     for number, name in enumerate(names, 1):
         update_progress(task_id, number - 1, len(names), f"Updating {name} index")
         indexes.processors[name](item)
+        family = {"core": "common", "subtitles": "subtitles", "previews": None}.get(name)
+        if family:
+            mark_read_models_fresh(requested, family, {"modified": int(stat.st_mtime), "size": stat.st_size})
         logger.info("task_queue event=item_progress id=%d type=media_reindex step=%d total=%d index=%s file=%s", task_id, number, len(names), name, requested.replace("\n", "\\n"))
     update_progress(task_id, len(names), len(names), "All media indexes updated")
     return {"path": requested, "indexes": list(names)}
@@ -301,16 +355,20 @@ def process_media_edit(task_id: int, payload: dict) -> dict:
         final_path = rename_media(MediaRenameRequest(path=final_path, filename=filename))["path"]
         renamed = True
     update_progress(task_id, 2, 2, "Media changes applied")
-    # Reinspect subtitle damage after every media edit.  The damaged report
-    # hides this path while the subtitle index task is pending, then exposes it
-    # again only if the refreshed analysis still reports damage.
-    # Always enqueue a fresh subtitle inspection, including after a rename.
-    # The damaged report excludes paths while this task is pending and will
-    # reappear only when the refreshed analysis still finds damage.
-    from app.v80 import media_indexes_for_edit, request_media_indexes
-    names = payload.get("reindex_indexes") or media_indexes_for_edit(edit_payload, payload.get("html_cleanups"), result.get("operation") == "single_remux")
-    names = list(dict.fromkeys([*names, "subtitles"]))
-    request_media_indexes(final_path, names, "Queued media edit completed")
+    # optimized_media_edit already schedules the exact detector/index families
+    # for the edit. Only follow up for operations performed outside that editor:
+    # HTML cleanup is applied by the wrapper before editing, and a rename changes
+    # the catalog identity without changing stream content.
+    from app.v80 import detection_scope_for_operation, request_media_indexes
+    if payload.get("html_cleanups"):
+        request_media_indexes(
+            final_path,
+            ["subtitles"],
+            "Queued HTML cleanup completed",
+            detection_scope=detection_scope_for_operation("subtitle_content"),
+        )
+    elif renamed:
+        request_media_indexes(final_path, ["core"], "Queued media rename completed")
     return {**result, "path": final_path}
 
 
@@ -374,7 +432,13 @@ def process_audio_language_detection(task_id: int, payload: dict) -> dict:
     if not path or not Path(path).is_file():
         raise RuntimeError(f'Media file is not accessible: {path}')
     probe = json.loads(subprocess.check_output(['ffprobe', '-v', 'error', '-show_entries', 'format=duration:stream=codec_type:stream_tags=language', '-of', 'json', path, '-select_streams', 'a'], text=True))
-    streams = [stream for stream in probe.get('streams', []) if stream.get('codec_type') == 'audio']
+    all_audio_streams = [stream for stream in probe.get('streams', []) if stream.get('codec_type') == 'audio']
+    requested_indices = payload.get('stream_indices')
+    if requested_indices and requested_indices != 'all':
+        wanted = {int(item) for item in requested_indices}
+        streams = [(index, stream) for index, stream in enumerate(all_audio_streams) if index in wanted]
+    else:
+        streams = list(enumerate(all_audio_streams))
     duration = float((probe.get('format') or {}).get('duration') or 0)
     service_url = os.environ.get('LANGUAGE_ID_URL', 'http://language-id:9000')
     sample_seconds = 30
@@ -392,7 +456,7 @@ def process_audio_language_detection(task_id: int, payload: dict) -> dict:
         return {'path': path, 'streams': 0, 'mismatches': 0}
     results = []
     with tempfile.TemporaryDirectory(prefix='vse-audio-language-') as work:
-        for index, stream in enumerate(streams):
+        for index, stream in streams:
             metadata = str((stream.get('tags') or {}).get('language') or '').strip()
             samples = []
             for number, fraction in enumerate(sample_positions, 1):
@@ -413,10 +477,16 @@ def process_audio_language_detection(task_id: int, payload: dict) -> dict:
             mismatch = bool(detected_code and (not metadata or metadata_code in {'', 'und', 'unknown'} or detected_code != metadata_code))
             results.append((path, index, metadata, '', detected_code, confidence, json.dumps(samples, ensure_ascii=False), 1 if mismatch else 0))
     with connection() as db:
-        db.execute('DELETE FROM audio_language_detection WHERE path=?', (path,))
+        if requested_indices and requested_indices != 'all':
+            wanted = {int(item) for item in requested_indices}
+            marks = ','.join('?' for _ in wanted)
+            db.execute(f'DELETE FROM audio_language_detection WHERE path=? AND type_index IN ({marks})', [path, *wanted])
+        else:
+            db.execute('DELETE FROM audio_language_detection WHERE path=?', (path,))
         db.executemany("""INSERT INTO audio_language_detection(path,type_index,metadata_language,metadata_region,detected_language,confidence,samples_json,mismatch,checked_at)
             VALUES(?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)""", results)
     update_progress(task_id, len(streams) * len(sample_positions), len(streams) * len(sample_positions), 'Audio language detection completed')
+    mark_read_models_fresh(path, "voice", {"modified": int(Path(path).stat().st_mtime), "size": Path(path).stat().st_size})
     mismatches = sum(row[-1] for row in results)
     logger.info('audio_language_detection event=completed path=%s streams=%d mismatches=%d', path.replace('\n', '\\n'), len(results), mismatches)
     return {'path': path, 'streams': len(results), 'mismatches': mismatches, 'results': [{'type_index': row[1], 'metadata_language': row[2], 'detected_language': row[4], 'confidence': row[5], 'mismatch': bool(row[7])} for row in results]}
@@ -447,6 +517,16 @@ def get_queue_priorities() -> dict:
     return {"priorities": task_priority_order()}
 
 
+@app.get("/api/v65/queue/policy")
+def get_queue_policy() -> dict:
+    return {
+        "user_priority": [item for item in task_priority_order() if item not in SYSTEM_TASK_TYPES],
+        "protected_system_tasks": sorted(SYSTEM_TASK_TYPES),
+        "system_aging_seconds": SYSTEM_AGING_SECONDS,
+        "run_sooner": {"inherited_by_group": True, "max_minutes": 1440, "fairness": "aging prevents maintenance starvation"},
+    }
+
+
 class QueuePrioritiesRequest(BaseModel):
     priorities: list[str] = Field(min_length=1, max_length=100)
 
@@ -467,12 +547,13 @@ def save_queue_priorities(request: QueuePrioritiesRequest) -> dict:
 def run_queue(lane: str = "main") -> None:
     light_lane = lane == "light"
     logger.info("task_queue event=worker_started lane=%s", lane)
-    while True:
+    while not queue_shutdown.is_set():
         if queue_paused():
             with queue_condition:
                 queue_condition.wait(timeout=5)
             continue
         priorities = task_priority_order()
+        system_marks = ",".join("?" for _ in SYSTEM_TASK_TYPES)
         priority_case = "CASE task_type " + " ".join(f"WHEN ? THEN {index}" for index, _ in enumerate(priorities)) + " ELSE 999 END"
         # A grouped task can be pending only because an earlier stage owns the
         # workflow boundary. Keep those rows eligible, but always let runnable
@@ -499,10 +580,10 @@ def run_queue(lane: str = "main") -> None:
             else:
                 row = db.execute(f"""SELECT * FROM task_queue
                     WHERE status='pending' AND task_type NOT IN ('media_reindex','index_check_prepare','index_rebuild_prepare')
-                    ORDER BY CASE WHEN task_type IN ('tv_filtered_stream_edit_now','filtered_stream_edit_now') THEN 0 WHEN task_type='audio_language_detection' THEN 2 ELSE ({workflow_stage_case}) END, CASE WHEN EXISTS (SELECT 1 FROM task_queue_expedite boost WHERE boost.task_id=task_queue.id AND boost.expires_at > ?) THEN 0 ELSE 1 END, {workflow_wait_case}, {priority_case}, CASE WHEN task_type IN ('tv_filtered_stream_edit_now','filtered_stream_edit_now') THEN 0
+                    ORDER BY CASE WHEN task_type IN ('tv_filtered_stream_edit_now','filtered_stream_edit_now') THEN 0 WHEN task_type='audio_language_detection' THEN 2 ELSE ({workflow_stage_case}) END, CASE WHEN EXISTS (SELECT 1 FROM task_queue_expedite boost WHERE boost.task_id=task_queue.id AND boost.expires_at > ?) THEN 0 ELSE 1 END, CASE WHEN task_type IN ({system_marks}) AND created_at < ? THEN 0 ELSE 1 END, {workflow_wait_case}, {priority_case}, CASE WHEN task_type IN ('tv_filtered_stream_edit_now','filtered_stream_edit_now') THEN 0
                                   WHEN task_type IN ('tv_filtered_stream_edit','filtered_stream_edit') THEN 1 ELSE 2 END,
                              CASE WHEN task_type IN ('tv_filtered_stream_edit_now','filtered_stream_edit_now','tv_filtered_stream_edit','filtered_stream_edit') THEN id END DESC,
-                             id LIMIT 1""", [utc_now(), *priorities]).fetchone()
+                             id LIMIT 1""", [utc_now(), *SYSTEM_TASK_TYPES, scheduler_system_cutoff(), *priorities]).fetchone()
             if row:
                 claimed = db.execute(
                     "UPDATE task_queue SET status='running',started_at=?,updated_at=?,attempts=attempts+1,progress_message='Starting' WHERE id=? AND status='pending'",
@@ -519,15 +600,30 @@ def run_queue(lane: str = "main") -> None:
         started = time.monotonic()
         stage_started = False
         task_payload = {}
+        luw_id = None
+        luw_path = ""
         try:
             task_payload = json.loads(row["payload_json"])
             validate_media_signature(task_type, task_payload)
             stage_path = affected_media_path(task_type, task_payload)
+            luw_path = stage_path
             if not task_stage_exists(task_payload.get("_queue_group"), task_type, task_id):
                 register_task_stage(task_payload.get("_queue_group"), task_type, stage_path, task_payload, task_id)
+            luw_id = _create_media_luw(task_id, task_type, task_payload, stage_path)
+            if luw_id:
+                transition_luw(luw_id, "preflighted", "preflight", "Media signature accepted")
+                if not acquire_luw_lock(luw_id, stage_path):
+                    transition_luw(luw_id, "waiting", "lock", "Waiting for media LUW lock")
+                    with connection() as db:
+                        db.execute("UPDATE task_queue SET status='pending',progress_message='Waiting for media LUW lock',started_at=NULL,updated_at=? WHERE id=?", (utc_now(), task_id))
+                    continue
+                transition_luw(luw_id, "applying", "apply", "Applying media edit")
             if not begin_task_stage(task_payload.get("_queue_group"), task_type, stage_path, task_id):
                 with connection() as db:
                     db.execute("UPDATE task_queue SET status='pending',progress_message='Waiting for workflow resource',started_at=NULL,updated_at=? WHERE id=?", (utc_now(), task_id))
+                if luw_id:
+                    release_luw_lock(luw_id, luw_path)
+                    transition_luw(luw_id, "waiting", "workflow", "Waiting for workflow stage")
                 logger.info("workflow event=stage_waiting id=%d type=%s resource=%s", task_id, task_type, stage_path)
                 continue
             stage_started = True
@@ -536,6 +632,8 @@ def run_queue(lane: str = "main") -> None:
             handler_payload = {key: value for key, value in task_payload.items() if not str(key).startswith("_")}
             prepare_task_artifact(task_payload.get("_queue_group"), task_id, task_type, stage_path, task_payload)
             result = TASK_HANDLERS[task_type](task_id, handler_payload)
+            if luw_id:
+                transition_luw(luw_id, "verifying", "verify", "Media edit completed; verifying result")
             with connection() as db:
                 db.execute(
                     "UPDATE task_queue SET status='succeeded',result_json=?,progress_message='Completed',finished_at=?,updated_at=? WHERE id=?",
@@ -543,6 +641,9 @@ def run_queue(lane: str = "main") -> None:
                 )
                 db.execute("DELETE FROM media_change_request WHERE task_id=?", (task_id,))
             advance_media_signature(task_payload)
+            if luw_id:
+                committed_path = str(result.get("target") or luw_path)
+                commit_luw(luw_id, media_configuration_signature(committed_path))
             commit_task_artifacts(task_payload.get("_queue_group"), task_id)
             finish_task_stage(task_payload.get("_queue_group"), task_type, affected_media_path(task_type, task_payload), result, task_id)
             removed_snapshots = cleanup_succeeded_workflow_group_artifacts(task_payload.get("_queue_group"))
@@ -551,6 +652,12 @@ def run_queue(lane: str = "main") -> None:
             logger.info("task_queue event=task_completed lane=%s id=%d type=%s seconds=%.2f", lane, task_id, task_type, time.monotonic() - started)
         except Exception as exc:
             message = str(getattr(exc, "detail", exc))
+            if luw_id:
+                try:
+                    release_luw_lock(luw_id, luw_path)
+                    transition_luw(luw_id, "failed", "error", message)
+                except Exception:
+                    logger.exception("luw event=failure_persist_failed task=%d", task_id)
             # Detection is advisory background work. If the media changed
             # since it was queued, discard this obsolete sample instead of
             # creating a visible failure or blocking user operations.
@@ -610,9 +717,16 @@ def initialize_task_queue() -> None:
             UPDATE task_queue SET status='pending',progress_message='Recovered after restart',started_at=NULL WHERE status='running';
         """)
         if not column_exists(db, "task_queue", "group_id"):
-            db.execute("ALTER TABLE task_queue ADD COLUMN group_id TEXT")
+            db.execute("ALTER TABLE task_queue ADD COLUMN IF NOT EXISTS group_id TEXT") if os.getenv("DATABASE_BACKEND", "sqlite").lower() == "postgres" else db.execute("ALTER TABLE task_queue ADD COLUMN group_id TEXT")
         if not column_exists(db, "task_queue_expedite", "group_id"):
-            db.execute("ALTER TABLE task_queue_expedite ADD COLUMN group_id TEXT")
+            db.execute("ALTER TABLE task_queue_expedite ADD COLUMN IF NOT EXISTS group_id TEXT") if os.getenv("DATABASE_BACKEND", "sqlite").lower() == "postgres" else db.execute("ALTER TABLE task_queue_expedite ADD COLUMN group_id TEXT")
+        if os.getenv("DATABASE_BACKEND", "sqlite").lower() == "postgres":
+            # Older deployments stored expedite timestamps as TEXT. Convert
+            # once so all priority comparisons are type-safe in PostgreSQL.
+            column_type = db.execute("SELECT data_type FROM information_schema.columns WHERE table_name='task_queue_expedite' AND column_name='expires_at'").fetchone()
+            if column_type and str(column_type[0]).lower() in {"text", "character varying"}:
+                db.execute("ALTER TABLE task_queue_expedite ALTER COLUMN expires_at TYPE TIMESTAMPTZ USING NULLIF(expires_at,'')::timestamptz")
+                db.execute("ALTER TABLE task_queue_expedite ALTER COLUMN requested_at TYPE TIMESTAMPTZ USING NULLIF(requested_at,'')::timestamptz")
         if os.getenv("DATABASE_BACKEND", "sqlite").lower() == "postgres":
             db.execute("""UPDATE workflow_stages stage SET status='pending', started_at=NULL, updated_at=now()
                           WHERE stage.status='running' AND stage.payload->>'task_id' IN
@@ -642,6 +756,7 @@ def initialize_task_queue() -> None:
 
 def start_task_queue_worker() -> None:
     global queue_thread, queue_light_thread
+    queue_shutdown.clear()
     if not queue_thread or not queue_thread.is_alive():
         queue_thread = threading.Thread(target=run_queue, args=("main",), name="vse-task-queue", daemon=True)
         queue_thread.start()
@@ -652,6 +767,17 @@ def start_task_queue_worker() -> None:
 
 
 @app.post("/api/v65/queue")
+@app.on_event("shutdown")
+def shutdown_task_queue() -> None:
+    queue_shutdown.set()
+    with queue_condition:
+        queue_condition.notify_all()
+    workers = [thread for thread in (queue_thread, queue_light_thread) if thread]
+    for thread in workers:
+        thread.join(timeout=30)
+    logger.info("task_queue event=worker_shutdown workers=%d alive=%d", len(workers), sum(thread.is_alive() for thread in workers))
+
+
 def add_queue_item(request: QueueRequest) -> dict:
     if request.task_type == "media_edit" and not (request.payload.get("edit") or request.payload).get("path"):
         raise HTTPException(400, "An edit media path is required")
@@ -807,7 +933,7 @@ def queue_status(request: QueueStatusRequest) -> dict:
         for start in range(0, len(request.task_ids), 800):
             group = request.task_ids[start:start + 800]
             rows = db.execute(
-                f"SELECT id,label,status,progress_current,progress_total,progress_message,error FROM task_queue WHERE id IN ({','.join('?' for _ in group)})",
+                f"SELECT id,label,status,progress_current,progress_total,progress_message,error,result_json FROM task_queue WHERE id IN ({','.join('?' for _ in group)})",
                 group,
             ).fetchall()
             items.extend(dict(row) for row in rows)

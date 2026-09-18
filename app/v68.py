@@ -4,7 +4,6 @@ import json
 import logging
 import os
 import re
-import sqlite3
 import subprocess
 import shutil
 import tempfile
@@ -12,7 +11,7 @@ import hashlib
 import threading
 import time
 import urllib.parse
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Literal
 
@@ -312,7 +311,10 @@ def process_plex_sync(task_id: int, payload: dict) -> dict:
             if changed_records:
                 from app.v80 import request_media_indexes
                 for record in changed_records:
-                    request_media_indexes(str(record[0]), ["core"], "Plex catalog media added or changed")
+                    changed_path = str(record[0])
+                    from app.v80 import detection_scope_for_operation
+                    request_media_indexes(changed_path, ["core", "subtitles"], "Plex catalog media added or changed", detection_scope=detection_scope_for_operation("media_added_or_changed"))
+                    mark_read_models_fresh(changed_path, "plex", {"modified": int(record[10] or 0), "size": int(record[9] or 0)})
             changed += len(changed_records)
             catalog_records += len(records)
             logger.info("plex_sync event=library_processed mode=%s library=%s items=%d catalog_items=%d media=%d file_changes=%d step=%d total=%d", "rebuild" if rebuild else "incremental", library["title"].replace("\n", "\\n"), len(items), len(all_items), len(records), len(changed_records), number, len(libraries))
@@ -364,7 +366,8 @@ def process_subtitle_html(task_id: int, payload: dict) -> dict:
     result = apply_subtitle_cleanup(SubtitleCleanup.model_validate(payload), operation_id=f"task-{task_id}")
     tasks.update_progress(task_id, 1, 2, "Queueing subtitle indexes")
     from app.v80 import request_media_indexes
-    request_media_indexes(result["path"], ["subtitles", "previews"], "Subtitle HTML removed")
+    from app.v80 import detection_scope_for_operation
+    request_media_indexes(result["path"], ["subtitles", "previews"], "Subtitle HTML removed", detection_scope=detection_scope_for_operation("subtitle_content"))
     tasks.update_progress(task_id, 2, 2, "Subtitle cleanup completed")
     return result
 
@@ -504,7 +507,7 @@ def _bdsup2sub_normalized(media: Path, type_index: int, codec: str) -> Path | No
         # more reliably than asking FFmpeg to write a standalone bitmap file.
         probe = subprocess.run(["ffprobe", "-v", "error", "-select_streams", f"s:{type_index}", "-show_entries", "stream=index", "-of", "csv=p=0", str(media)], capture_output=True, text=True, timeout=60, check=True)
         global_index = probe.stdout.strip().splitlines()[0]
-        extracted = subprocess.run(["mkvextract", "tracks", str(media), f"{global_index}:{source}"], capture_output=True, text=True, timeout=300, check=True)
+        subprocess.run(["mkvextract", "tracks", str(media), f"{global_index}:{source}"], capture_output=True, text=True, timeout=300, check=True)
         subprocess.run(["java", "-Djava.awt.headless=true", "-jar", str(jar), "-r", "keep", "-f", "lanczos3", "-S", "2,2", "-o", str(target), str(source)], capture_output=True, text=True, timeout=600, check=True)
         logger.info("ocr event=bdsup2sub_normalized file=%s stream=%d codec=%s", str(media).replace("\n", "\\n"), type_index, codec)
         return target
@@ -708,7 +711,8 @@ def process_image_subtitle_convert(task_id: int, payload: dict) -> dict:
             shutil.rmtree(subtitle.parent, ignore_errors=True)
     tasks.update_progress(task_id, 3, 4, "Queueing subtitle indexes")
     from app.v80 import request_media_indexes
-    request_media_indexes(str(media), ["subtitles", "core"], "Image subtitle converted to SRT")
+    from app.v80 import detection_scope_for_operation
+    request_media_indexes(str(media), ["subtitles", "core"], "Image subtitle converted to SRT", detection_scope=detection_scope_for_operation("subtitle_conversion"))
     tasks.update_progress(task_id, 4, 4, "Image subtitle conversion completed")
     return {"path": str(media), "type_index": int(payload.get("type_index", -1)), "language": language, "language_confidence": language_confidence, "language_source": language_source}
 
@@ -789,7 +793,8 @@ def finalize_ocr_converted(stage_id: int) -> dict:
     with plex.connection() as db:
         db.execute("UPDATE ocr_staged_backups SET status='converted',converted_path=?,size_bytes=? WHERE id=?", (str(original), staged.stat().st_size, stage_id))
     from app.v80 import request_media_indexes
-    request_media_indexes(str(original), ["subtitles", "core", "previews"], "OCR converted candidate moved to final media path")
+    from app.v80 import detection_scope_for_operation
+    request_media_indexes(str(original), ["subtitles", "core", "previews"], "OCR converted candidate moved to final media path", detection_scope=detection_scope_for_operation("subtitle_conversion"))
     logger.info("ocr_staging event=converted_finalized id=%d original=%s", stage_id, original)
     return {"id": stage_id, "status": "converted", "path": str(original)}
 
@@ -823,7 +828,8 @@ def perform_ocr_rollback(stage_id: int, task_id: int | None = None) -> dict:
     with plex.connection() as db:
         db.execute("UPDATE ocr_staged_backups SET converted_path=? WHERE id=?", (str(converted_snapshot), stage_id))
     from app.v80 import request_media_indexes
-    request_media_indexes(str(original), ["subtitles", "core", "previews"], "OCR original restored")
+    from app.v80 import detection_scope_for_operation
+    request_media_indexes(str(original), ["subtitles", "core", "previews"], "OCR original restored", detection_scope=detection_scope_for_operation("ocr_restore"))
     logger.info("ocr_staging event=rollback id=%d original=%s", stage_id, original)
     return {"id": stage_id, "status": "restored", "path": str(original)}
 

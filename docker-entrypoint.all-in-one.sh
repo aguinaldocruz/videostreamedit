@@ -30,4 +30,4 @@ su -s /bin/sh postgres -c "createdb -h 127.0.0.1 -O videostreamedit videostreame
 export DATABASE_BACKEND=postgres
 export DATABASE_URL="${DATABASE_URL:-postgresql://videostreamedit:change-this-local-password@127.0.0.1:5432/videostreamedit}"
 find /config -mindepth 1 -maxdepth 1 ! -name data -exec chown -R videostreamedit:videostreamedit {} + || true
-exec gosu videostreamedit uvicorn app.v86:app --host 0.0.0.0 --port 8080
+exec gosu videostreamedit uvicorn app.v86:app --host 0.0.0.0 --port 8080 --timeout-graceful-shutdown 90

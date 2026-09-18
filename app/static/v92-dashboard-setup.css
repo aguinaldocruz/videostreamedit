@@ -1,0 +1,37 @@
+
+/* Phase 5 Dashboard/Setup visual layer. Configuration and maintenance behavior stays unchanged. */
+#dashboard .page-title,#setup .page-title{border-bottom:1px solid var(--vse-border,#303947);padding-bottom:.8rem}
+#dashboard .dashboard-tools,#setup .page-tools{gap:.5rem}
+#dashboard .dashboard-tools select{border-color:var(--vse-border,#303947);background:var(--vse-surface-subtle,#12171d);color:var(--vse-text,#e7edf5);border-radius:var(--vse-radius-sm,8px)}
+#dashboard .dashboard-content{gap:1rem}
+#dashboard .dashboard-cards article,#dashboard .dashboard-chart,#dashboard .dashboard-libraries{background:var(--vse-surface,#151b22);border-color:var(--vse-border,#303947);border-radius:var(--vse-radius-lg,12px);box-shadow:0 8px 24px rgba(0,0,0,.12)}
+#dashboard .dashboard-cards strong{color:var(--vse-text,#e7edf5)}
+#dashboard .dashboard-bar-row>div{background:var(--vse-surface-subtle,#12171d);border:1px solid var(--vse-border,#303947)}
+#dashboard .dashboard-library-list span{background:var(--vse-surface-raised,#202833);border-color:var(--vse-border,#303947);border-radius:var(--vse-radius-sm,8px)}
+#dashboard .dashboard-loading,#dashboard .dashboard-error,#dashboard .dashboard-muted{border:1px dashed var(--vse-border,#303947);border-radius:var(--vse-radius-sm,8px);background:var(--vse-surface-subtle,#12171d)}
+#setup .setup-tabs{border-color:var(--vse-border,#303947);background:var(--vse-surface-raised,#202833);border-radius:var(--vse-radius-lg,12px);padding:.35rem}
+#setup .setup-tabs button{border-radius:var(--vse-radius-sm,8px);color:var(--vse-muted,#9aa6b2)}
+#setup .setup-tabs button:hover{background:var(--vse-surface-hover,#273343);color:var(--vse-text,#e7edf5)}
+#setup .setup-tabs button.active{background:var(--vse-accent,#62b0ff);color:#091018}
+#setup .setup-tab-panels>section>article,#setup .setup-grid>article,#setup .plex-setup>article,#setup .import-setup-grid>article{background:var(--vse-surface,#151b22);border-color:var(--vse-border,#303947);border-radius:var(--vse-radius-lg,12px);box-shadow:0 8px 24px rgba(0,0,0,.12)}
+#setup .setup-tab-panels h3,#setup .setup-grid h3{color:var(--vse-text,#e7edf5)}
+#setup .setup-tab-panels label,#setup .setup-grid label{color:var(--vse-muted,#9aa6b2)}
+#setup .setup-tab-panels input,#setup .setup-tab-panels select,#setup .setup-grid input,#setup .setup-grid select{border-color:var(--vse-border,#303947);background:var(--vse-surface-subtle,#12171d);color:var(--vse-text,#e7edf5);border-radius:var(--vse-radius-sm,8px)}
+#setup .setup-tab-panels input:focus,#setup .setup-tab-panels select:focus,#setup .setup-grid input:focus,#setup .setup-grid select:focus{border-color:var(--vse-accent,#62b0ff);box-shadow:0 0 0 2px color-mix(in srgb,var(--vse-accent,#62b0ff) 22%,transparent);outline:0}
+#setup .plex-library,#setup .learned-suggestion-item,#setup .ocr-staged-row,#setup .queue-priority-row{background:var(--vse-surface-raised,#202833);border-color:var(--vse-border,#303947);border-radius:var(--vse-radius-sm,8px)}
+#setup .root{border-color:var(--vse-border,#303947)}
+#setup .index-maintenance,#setup .split-index-shell,#setup .tasks-shell{border-color:var(--vse-border,#303947);border-radius:var(--vse-radius-lg,12px)}
+#setup button:not(.icon-close){border-radius:var(--vse-radius-sm,8px)}
+#setup button:not(.icon-close):hover{border-color:var(--vse-accent,#62b0ff)}
+#setup .primary{background:var(--vse-accent,#62b0ff);border-color:var(--vse-accent,#62b0ff);color:#091018}
+#setup .language-detection-settings{display:grid;gap:14px}
+#setup .detector-section{border:1px solid var(--vse-border,#303947);border-radius:var(--vse-radius-md,10px);padding:16px;background:var(--vse-surface-subtle,#12171d);display:grid;gap:10px}
+#setup .detector-section-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:16px}
+#setup .detector-section-heading h3,#setup .detector-section-heading p{margin:0}
+#setup .detector-section-heading p{margin-top:4px;color:var(--vse-muted,#9aa6b2);max-width:70ch}
+#setup .detector-section h4{margin:0;color:var(--vse-text,#e7edf5)}
+#setup .detector-badge{white-space:nowrap;border:1px solid var(--vse-border,#303947);border-radius:999px;padding:4px 9px;font-size:.72rem;color:var(--vse-muted,#9aa6b2)}
+#setup .detector-health{margin-top:2px}
+#setup .secondary-detector-section{background:transparent}
+#setup .language-detection-queue-actions{display:flex;flex-wrap:wrap;gap:8px}
+@media(max-width:650px){#setup .detector-section-heading{display:grid;gap:8px}#setup .detector-badge{justify-self:start}}

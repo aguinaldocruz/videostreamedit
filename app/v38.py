@@ -23,7 +23,6 @@ class MovieStreamIndexInvalidate(BaseModel):
     path: str
 
 
-@app.on_event("startup")
 def initialize_movie_stream_filter_index() -> None:
     with connection() as db:
         db.executescript("""
@@ -135,9 +134,9 @@ def _value_groups(rows, field: str) -> dict[str, list[str]]:
 def movie_stream_filter_values() -> dict:
     _start_index_if_needed()
     with connection() as db:
-        language_rows = db.execute("SELECT DISTINCT stream_type,language FROM movie_stream_index_value WHERE language != ''").fetchall()
-        name_rows = db.execute("SELECT DISTINCT stream_type,track_name FROM movie_stream_index_value WHERE track_name != ''").fetchall()
-        indexed = db.execute("SELECT count(*) FROM movie_stream_index").fetchone()[0]
+        language_rows = db.execute("SELECT DISTINCT CASE WHEN stream_type='external' THEN 'subtitle' ELSE stream_type END AS stream_type,language FROM media_stream_index WHERE language != ''").fetchall()
+        name_rows = db.execute("SELECT DISTINCT CASE WHEN stream_type='external' THEN 'subtitle' ELSE stream_type END AS stream_type,track_name FROM media_stream_index WHERE track_name != ''").fetchall()
+        indexed = db.execute("SELECT count(DISTINCT path) FROM media_stream_index").fetchone()[0]
         movies = db.execute("SELECT count(*) FROM plex_media WHERE kind='movie'").fetchone()[0]
     with _index_lock:
         status = dict(_index_state)
@@ -157,8 +156,11 @@ def movie_stream_filter_matches(
     clauses = ["media.kind='movie'"]
     values: list[str] = []
     if stream_type != "all":
-        clauses.append("value.stream_type=?")
-        values.append(stream_type)
+        if stream_type == "subtitle":
+            clauses.append("(value.stream_type='subtitle' OR value.stream_type='external')")
+        else:
+            clauses.append("value.stream_type=?")
+            values.append(stream_type)
     if language:
         clauses.append("value.language=?")
         values.append(language)
@@ -167,7 +169,7 @@ def movie_stream_filter_matches(
         values.append(track_name)
     with connection() as db:
         rows = db.execute(
-            "SELECT DISTINCT media.path FROM plex_media media JOIN movie_stream_index_value value ON value.path=media.path WHERE " + " AND ".join(clauses),
+            "SELECT DISTINCT media.path FROM plex_media media JOIN media_stream_index value ON value.path=media.path WHERE " + " AND ".join(clauses),
             values,
         ).fetchall()
     return {"paths": [row["path"] for row in rows]}
