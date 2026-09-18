@@ -1,8 +1,13 @@
 let globalBusyRequests = 0, globalBusyReleaseTimer = null, globalBusyRevealTimer = null, globalBusyContext = '', globalBusyProgress = null;
 const originalFetch = window.fetch.bind(window);
 
-function isApplicationRequest(resource) {
+function isApplicationRequest(resource, options = {}) {
   const value = typeof resource === 'string' ? resource : resource?.url || '';
+  // Read-only GETs (page loads, filters, queue/status polling) must not
+  // trigger the global processing overlay. Only mutating/explicit operations
+  // should lock the interface.
+  const method = String(options?.method || 'GET').toUpperCase();
+  if (method === 'GET' || method === 'HEAD') return false;
   try {
     const path = new URL(value, window.location.href).pathname;
     // These endpoints only load/filter cached values. Their screens already
@@ -22,7 +27,7 @@ function busyContext(resource, options) {
     mediaPath = payload?.path || payload?.edit?.path || payload?.request?.path || payload?.paths?.[0] || payload?.request?.paths?.[0] || '';
   } catch (_) { /* Non-JSON request bodies have no media context. */ }
   const operation = endpoint.includes('language-detection/stream') ? 'Detecting stream language'
-    : endpoint.includes('evaluate-forced') ? 'Evaluating forced subtitles'
+    : endpoint.includes('evaluate-forced') ? 'Evaluating subtitles'
     : endpoint.includes('/media/edit') ? 'Applying stream changes'
     : endpoint.includes('/stream-preview/') ? 'Preparing stream preview'
     : endpoint.includes('/index/request') ? 'Updating media indexes'
@@ -145,7 +150,7 @@ window.waitForGlobalTasks = async function (taskIds) {
 };
 
 window.fetch = async function (resource, options) {
-  const tracked = isApplicationRequest(resource);
+  const tracked = isApplicationRequest(resource, options);
   if (tracked) beginGlobalBusy(busyContext(resource, options));
   try { return await originalFetch(resource, options); }
   finally { if (tracked) endGlobalBusy(); }

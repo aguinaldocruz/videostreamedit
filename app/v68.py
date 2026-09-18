@@ -228,7 +228,7 @@ def persist_library(library: dict, records: list[tuple], aliases: list[tuple], w
                 db.executemany("DELETE FROM plex_media WHERE path=?", [(path,) for path in removed])
                 db.executemany("DELETE FROM plex_title_aliases WHERE path=?", [(path,) for path in removed])
                 logger.info("plex_sync event=removed_media_reconciled library=%s removed=%d", library["title"].replace("\n", " "), len(removed))
-        db.execute("INSERT INTO plex_sync_state(library_key,watermark,last_check,last_rebuild) VALUES(?,?,CURRENT_TIMESTAMP,CASE WHEN ? THEN CURRENT_TIMESTAMP ELSE NULL END) ON CONFLICT(library_key) DO UPDATE SET watermark=excluded.watermark,last_check=CURRENT_TIMESTAMP,last_rebuild=CASE WHEN ? THEN CURRENT_TIMESTAMP ELSE plex_sync_state.last_rebuild END", (library["library_key"], watermark, int(rebuild), int(rebuild)))
+        db.execute("INSERT INTO plex_sync_state(library_key,watermark,last_check,last_rebuild) VALUES(?,?,CAST(CURRENT_TIMESTAMP AS TEXT),CASE WHEN ? THEN CAST(CURRENT_TIMESTAMP AS TEXT) ELSE NULL END) ON CONFLICT(library_key) DO UPDATE SET watermark=excluded.watermark,last_check=CAST(CURRENT_TIMESTAMP AS TEXT),last_rebuild=CASE WHEN ? THEN CAST(CURRENT_TIMESTAMP AS TEXT) ELSE plex_sync_state.last_rebuild END", (library["library_key"], watermark, bool(rebuild), bool(rebuild)))
     if moved_paths:
         from app.v80 import migrate_index_paths
         migrated = migrate_index_paths(moved_paths)
@@ -361,7 +361,7 @@ def process_subtitle_html_preflight(task_id: int, payload: dict) -> dict:
 
 def process_subtitle_html(task_id: int, payload: dict) -> dict:
     tasks.update_progress(task_id, 0, 2, "Removing subtitle HTML tags")
-    result = apply_subtitle_cleanup(SubtitleCleanup.model_validate(payload))
+    result = apply_subtitle_cleanup(SubtitleCleanup.model_validate(payload), operation_id=f"task-{task_id}")
     tasks.update_progress(task_id, 1, 2, "Queueing subtitle indexes")
     from app.v80 import request_media_indexes
     request_media_indexes(result["path"], ["subtitles", "previews"], "Subtitle HTML removed")
@@ -385,17 +385,11 @@ def _ensure_ocr_stage_table() -> None:
             size_bytes INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             converted_at TEXT, restored_at TEXT, approved_at TEXT
         )""")
-        try:
+        if not plex.column_exists(db, "ocr_staged_backups", "media_kind"):
             db.execute("ALTER TABLE ocr_staged_backups ADD COLUMN media_kind TEXT NOT NULL DEFAULT 'unknown'")
-        except sqlite3.OperationalError as exc:
-            if "duplicate column" not in str(exc).lower():
-                raise
         db.execute("CREATE INDEX IF NOT EXISTS ocr_staged_status ON ocr_staged_backups(status, id)")
-        try:
+        if not plex.column_exists(db, "ocr_staged_backups", "converted_path"):
             db.execute("ALTER TABLE ocr_staged_backups ADD COLUMN converted_path TEXT")
-        except sqlite3.OperationalError as exc:
-            if "duplicate column" not in str(exc).lower():
-                raise
 
 def stage_ocr_original(path: Path, task_id: int) -> int:
     _ensure_ocr_stage_table()
@@ -652,20 +646,39 @@ def _ocr_graphical_subtitle(media: Path, type_index: int, language: str) -> Path
     output.write_text("\n".join(entries), encoding="utf-8")
     return output
 
+def _resolve_ocr_language(payload: dict) -> tuple[str, float, str]:
+    """Resolve a Tesseract language from Plex metadata or a trusted preflight result.
+
+    Plex-normalized metadata is treated as authoritative for the first OCR pass.
+    A future detector may provide detected_language/language_confidence; those
+    values are accepted only when confidence is at least 0.80.
+    """
+    metadata = str(payload.get("language") or "").strip()
+    detected = str(payload.get("detected_language") or "").strip()
+    try:
+        confidence = float(payload.get("language_confidence") or 0)
+    except (TypeError, ValueError):
+        confidence = 0.0
+    invalid = {"", "und", "unknown", "zxx", "mis"}
+    if metadata.casefold() not in invalid:
+        return metadata, 1.0, "Plex stream language metadata"
+    if detected.casefold() not in invalid and confidence >= 0.80:
+        return detected, confidence, "OCR language preflight"
+    raise RuntimeError("Image subtitle language could not be determined with at least 80% confidence; conversion was not started")
+
+
 def process_image_subtitle_convert(task_id: int, payload: dict) -> dict:
     media = Path(str(payload.get("path") or "")).resolve()
     if not media.is_file():
         raise RuntimeError(f"Media is not accessible: {media}")
-    language = str(payload.get("language") or "").strip()
-    if not language or language.casefold() in {"und", "unknown", "zxx"}:
-        raise RuntimeError("Image subtitle language is not set or is und")
-    # Preserve the complete original container before any OCR/remux operation.
-    # A full copy is intentional: it restores all tracks, attachments, timing,
-    # and metadata exactly, rather than attempting a lossy subtitle-only rebuild.
-    stage_id = stage_ocr_original(media, task_id)
-    tasks.update_progress(task_id, 0, 3, "Reading graphical subtitle events (original staged)")
+    language, language_confidence, language_source = _resolve_ocr_language(payload)
+    tasks.update_progress(task_id, 0, 4, "Validating subtitle language before OCR")
     subtitle = _ocr_graphical_subtitle(media, int(payload.get("type_index", -1)), language)
-    tasks.update_progress(task_id, 1, 3, "Replacing graphical subtitle with OCR text")
+    # Preserve the complete original container immediately before remuxing. A
+    # full copy restores every track, attachment, chapter, timing, and tag.
+    stage_id = stage_ocr_original(media, task_id)
+    tasks.update_progress(task_id, 1, 4, "Graphical subtitle recognized; original staged")
+    tasks.update_progress(task_id, 2, 4, "Replacing graphical subtitle with OCR text")
     streams = indexes.probe(media).get("streams", []) if hasattr(indexes, "probe") else []
     if not streams:
         from app.v2 import probe
@@ -674,7 +687,7 @@ def process_image_subtitle_convert(task_id: int, payload: dict) -> dict:
     selected = subtitle_globals[int(payload.get("type_index", -1))] if 0 <= int(payload.get("type_index", -1)) < len(subtitle_globals) else -1
     if selected < 0:
         subtitle.unlink(missing_ok=True); raise RuntimeError("Subtitle stream was not found")
-    temporary = media.with_name(f".{media.stem}.vse-ocr{media.suffix}")
+    temporary = media.with_name(f".{media.stem}.vse-ocr-{task_id}{media.suffix}")
     command = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-i", str(media), "-i", str(subtitle)]
     subtitle_output = 0
     for global_index, stream in enumerate(streams):
@@ -693,11 +706,11 @@ def process_image_subtitle_convert(task_id: int, payload: dict) -> dict:
         subtitle.unlink(missing_ok=True); temporary.unlink(missing_ok=True)
         if subtitle.parent.name.startswith("vse-ccx-"):
             shutil.rmtree(subtitle.parent, ignore_errors=True)
-    tasks.update_progress(task_id, 2, 3, "Queueing subtitle indexes")
+    tasks.update_progress(task_id, 3, 4, "Queueing subtitle indexes")
     from app.v80 import request_media_indexes
     request_media_indexes(str(media), ["subtitles", "core"], "Image subtitle converted to SRT")
-    tasks.update_progress(task_id, 3, 3, "Image subtitle conversion completed")
-    return {"path": str(media), "type_index": int(payload.get("type_index", -1)), "language": language}
+    tasks.update_progress(task_id, 4, 4, "Image subtitle conversion completed")
+    return {"path": str(media), "type_index": int(payload.get("type_index", -1)), "language": language, "language_confidence": language_confidence, "language_source": language_source}
 
 tasks.TASK_HANDLERS["image_subtitle_convert"] = process_image_subtitle_convert
 
@@ -705,6 +718,7 @@ tasks.TASK_HANDLERS["image_subtitle_convert"] = process_image_subtitle_convert
 @app.get("/api/v68/ocr/staged")
 def list_ocr_staged() -> dict:
     _ensure_ocr_stage_table()
+    reconcile_startup_artifacts()
     with plex.connection() as db:
         rows = db.execute("SELECT * FROM ocr_staged_backups WHERE status IN ('staged','converted','restored') ORDER BY id DESC").fetchall()
     return {"stage_root": str(OCR_STAGE_ROOT), "items": [dict(row) for row in rows]}
@@ -779,33 +793,32 @@ def finalize_ocr_converted(stage_id: int) -> dict:
     logger.info("ocr_staging event=converted_finalized id=%d original=%s", stage_id, original)
     return {"id": stage_id, "status": "converted", "path": str(original)}
 
-@app.post("/api/v68/ocr/staged/{stage_id}/rollback")
-def rollback_ocr_staged(stage_id: int) -> dict:
+def perform_ocr_rollback(stage_id: int, task_id: int | None = None) -> dict:
     _ensure_ocr_stage_table()
     with plex.connection() as db:
         row = db.execute("SELECT * FROM ocr_staged_backups WHERE id=? AND status IN ('staged','converted','restored')", (stage_id,)).fetchone()
     if not row:
-        raise HTTPException(404, "OCR staging record not found")
+        raise RuntimeError("OCR staging record not found")
     staged = Path(row["staged_path"]).resolve(); original = Path(row["original_path"]).resolve()
     if staged.parent != OCR_STAGE_ROOT.resolve() or not staged.is_file():
-        raise HTTPException(404, "Staged original file is missing")
+        raise RuntimeError("Staged original file is missing")
     if not original.parent.is_dir():
-        raise HTTPException(409, "Original media folder is unavailable")
+        raise RuntimeError("Original media folder is unavailable")
     if str(row["status"]) == "restored" and original.is_file():
         return {"id": stage_id, "status": "restored", "path": str(original), "already_restored": True}
-    # Preserve the currently converted file before restoring the original.
-    # This gives the user a reviewable artifact and keeps rollback reversible.
     converted_snapshot = Path(str(row["converted_path"] or "")) if row["converted_path"] else OCR_STAGE_ROOT / f"{stage_id}-converted-{original.name}"
-    if original.is_file() and converted_snapshot != original and converted_snapshot.parent == OCR_STAGE_ROOT.resolve() and not converted_snapshot.exists():
-        shutil.copy2(original, converted_snapshot)
     if converted_snapshot.parent != OCR_STAGE_ROOT.resolve():
         converted_snapshot = OCR_STAGE_ROOT / f"{stage_id}-converted-{original.name}"
-        if original.is_file() and not converted_snapshot.exists():
-            shutil.copy2(original, converted_snapshot)
-    temporary = original.with_name(f".{original.name}.vse-rollback")
-    shutil.copyfile(staged, temporary)
-    os.chmod(temporary, original.stat().st_mode if original.exists() else staged.stat().st_mode)
-    os.replace(temporary, original)
+    if original.is_file() and converted_snapshot != original and not converted_snapshot.exists():
+        shutil.copy2(original, converted_snapshot)
+    token = str(task_id or uuid.uuid4().hex)
+    temporary = original.with_name(f".{original.name}.vse-rollback-{token}")
+    try:
+        shutil.copyfile(staged, temporary)
+        os.chmod(temporary, original.stat().st_mode if original.exists() else staged.stat().st_mode)
+        os.replace(temporary, original)
+    finally:
+        temporary.unlink(missing_ok=True)
     _ocr_stage_update(stage_id, "restored")
     with plex.connection() as db:
         db.execute("UPDATE ocr_staged_backups SET converted_path=? WHERE id=?", (str(converted_snapshot), stage_id))
@@ -813,6 +826,23 @@ def rollback_ocr_staged(stage_id: int) -> dict:
     request_media_indexes(str(original), ["subtitles", "core", "previews"], "OCR original restored")
     logger.info("ocr_staging event=rollback id=%d original=%s", stage_id, original)
     return {"id": stage_id, "status": "restored", "path": str(original)}
+
+
+def process_ocr_rollback(task_id: int, payload: dict) -> dict:
+    tasks.update_progress(task_id, 0, 2, "Restoring staged original media")
+    result = perform_ocr_rollback(int(payload.get("stage_id", 0)), task_id=task_id)
+    tasks.update_progress(task_id, 1, 2, "Refreshing media indexes")
+    tasks.update_progress(task_id, 2, 2, "Rollback completed")
+    return result
+
+
+tasks.TASK_HANDLERS["ocr_rollback"] = process_ocr_rollback
+
+@app.post("/api/v68/ocr/staged/{stage_id}/rollback")
+def rollback_ocr_staged(stage_id: int) -> dict:
+    task = tasks.enqueue("ocr_rollback", {"stage_id": stage_id}, f"Rollback OCR staging #{stage_id}", deduplicate=True)
+    logger.info("ocr_staging event=rollback_queued id=%d task=%d", stage_id, task["id"])
+    return {"queued": True, "task_id": task["id"], "stage_id": stage_id, "status": "pending"}
 
 
 def plex_schedule_data() -> dict:
@@ -860,17 +890,59 @@ def run_plex_scheduler() -> None:
         threading.Event().wait(30)
 
 
+def reconcile_startup_artifacts() -> None:
+    """Report unresolved staging and remove only stale app-owned remux artifacts."""
+    _ensure_ocr_stage_table()
+    with plex.connection() as db:
+        stages = db.execute("SELECT status,count(*) AS n FROM ocr_staged_backups WHERE status IN ('staged','converted','restored') GROUP BY status").fetchall()
+        rows = db.execute("SELECT payload_json FROM task_queue WHERE status IN ('pending','running','failed')").fetchall()
+    parent_dirs = set()
+    for row in rows:
+        try:
+            payload = json.loads(row["payload_json"])
+        except (TypeError, json.JSONDecodeError):
+            continue
+        for key in ("path", "source"):
+            value = str(payload.get(key) or (payload.get("edit") or {}).get(key) or "")
+            if value:
+                parent_dirs.add(str(Path(value).resolve().parent))
+    patterns = (".*.subtitle-clean.vse-*.mkv", ".*.subtitle-clean.vse-*.mp4", ".*.subtitle-clean.vse.mkv", ".*.subtitle-clean.vse.mp4", ".*.vse-ocr-*.mkv", ".*.vse-ocr-*.mp4", ".*.vse-ocr.mkv", ".*.vse-ocr.mp4", ".*.vse-rollback-*", ".*.vse-rollback", ".*.vse-finalize", ".*.vse-*.tmp")
+    active_payload = " ".join(str(row["payload_json"] or "") for row in rows)
+    removed = 0
+    cutoff = time.time() - 600
+    for directory in parent_dirs:
+        folder = Path(directory)
+        if not folder.is_dir():
+            continue
+        for pattern in patterns:
+            for artifact in folder.glob(pattern):
+                try:
+                    if artifact.is_file() and artifact.stat().st_mtime < cutoff and str(artifact) not in active_payload:
+                        artifact.unlink(); removed += 1
+                except OSError as exc:
+                    logger.warning("startup_recovery event=temporary_cleanup_failed path=%s error=%s", artifact, str(exc).replace("\\n", " ")[-300:])
+    unresolved = ",".join(f"{row['status']}={row['n']}" for row in stages) or "none"
+    logger.info("startup_recovery event=checked unresolved_ocr_staging=%s stale_temp_removed=%d", unresolved, removed)
+
+
 @app.on_event("startup")
 def initialize_incremental_plex_sync() -> None:
     global plex_schedule_thread
     _ensure_ocr_stage_table()
+    reconcile_startup_artifacts()
     with plex.connection() as db:
-        for statement in ("ALTER TABLE plex_media ADD COLUMN plex_added_at INTEGER NOT NULL DEFAULT 0", "ALTER TABLE plex_media ADD COLUMN plex_updated_at INTEGER NOT NULL DEFAULT 0"):
-            try:
+        for column, statement in (("plex_added_at", "ALTER TABLE plex_media ADD COLUMN plex_added_at INTEGER NOT NULL DEFAULT 0"), ("plex_updated_at", "ALTER TABLE plex_media ADD COLUMN plex_updated_at INTEGER NOT NULL DEFAULT 0")):
+            if not plex.column_exists(db, "plex_media", column):
                 db.execute(statement)
-            except sqlite3.OperationalError as exc:
-                if "duplicate column" not in str(exc).lower():
-                    raise
+        # PostgreSQL INTEGER is 32-bit; media byte sizes and Plex timestamps
+        # can exceed that range. Widen catalog fingerprint columns before the
+        # next incremental sync. SQLite keeps its existing compatibility path.
+        if os.getenv("DATABASE_BACKEND", "sqlite").lower() == "postgres":
+            for column in ("size", "modified", "plex_added_at", "plex_updated_at"):
+                try:
+                    db.execute(f"ALTER TABLE plex_media ALTER COLUMN {column} TYPE BIGINT")
+                except Exception as exc:
+                    logger.warning("plex_sync event=column_width_migration_failed column=%s error=%s", column, str(exc).replace("\n", " ")[-300:])
         db.executescript("""
             CREATE TABLE IF NOT EXISTS plex_sync_state (
                 library_key TEXT PRIMARY KEY, watermark INTEGER NOT NULL DEFAULT 0,

@@ -3,13 +3,14 @@
   if(!maintenance)return;
   maintenance.querySelectorAll('[data-index-job]').forEach(card=>{
     const job=card.dataset.indexJob,actions=card.querySelector('.index-maintenance-actions');
-    actions.insertAdjacentHTML('beforeend','<button type="button" data-index-retry disabled>Retry failed</button><button type="button" data-index-pause disabled>Pause</button><button type="button" class="danger" data-index-stop disabled>Stop</button>');
-    const retry=card.querySelector('[data-index-retry]'),pause=card.querySelector('[data-index-pause]'),stop=card.querySelector('[data-index-stop]');
-    const synchronizeControls=()=>{const status=card.querySelector('[data-index-status]').textContent,active=!status.startsWith('0 running · 0 queued');pause.disabled=!active;stop.disabled=!active;if(!active)pause.textContent='Pause'};
+    actions.insertAdjacentHTML('beforeend','<button type="button" data-index-retry disabled>Retry failed</button><button type="button" data-index-delete-failed disabled>Delete failed</button><button type="button" data-index-pause disabled>Pause</button><button type="button" class="danger" data-index-stop disabled>Stop</button>');
+    const retry=card.querySelector('[data-index-retry]'),deleteFailed=card.querySelector('[data-index-delete-failed]'),pause=card.querySelector('[data-index-pause]'),stop=card.querySelector('[data-index-stop]');
+    const synchronizeControls=()=>{const status=card.querySelector('[data-index-status]').textContent,active=!status.startsWith('0 running · 0 queued');pause.disabled=!active;stop.disabled=!active;const failed=/· (\d+) failed/.exec(status);const hasFailed=Boolean(failed&&Number(failed[1]));retry.disabled=!hasFailed;deleteFailed.disabled=!hasFailed;if(!active)pause.textContent='Pause'};
     new MutationObserver(synchronizeControls).observe(card.querySelector('[data-index-status]'),{childList:true,characterData:true,subtree:true});
     pause.onclick=async()=>{const action=pause.textContent==='Resume'?'resume':'pause';try{const status=await api(`/api/v80/setup/index/${job}/${action}`,{method:'POST',body:'{}'});pause.textContent=status.paused?'Resume':'Pause';toast(status.paused?'Index queue paused.':'Index queue resumed.')}catch(error){toast(error.message,true)}};
     stop.onclick=async()=>{try{await api(`/api/v80/setup/index/${job}/stop`,{method:'POST',body:'{}'});card.querySelector('[data-index-status]').textContent='Stopping after the current item and cancelling pending index requests…';stop.disabled=true}catch(error){toast(error.message,true)}};
     retry.onclick=async()=>{try{await api(`/api/v80/setup/index/${job}/retry`,{method:'POST',body:'{}'});toast(`Failed ${job} index items queued again`)}catch(error){toast(error.message,true)}};
+    deleteFailed.onclick=async()=>{if(!confirm(`Delete all failed ${job} index items? Their cached data will be kept.`))return;try{const value=await api(`/api/v80/setup/index/${job}/delete-failed`,{method:'POST',body:'{}'});toast(`Failed ${job} index items deleted`);deleteFailed.disabled=true}catch(error){toast(error.message,true)}};
   });
   const controlsApi=api;
   api=async function(resource,options){const result=await controlsApi(resource,options);const match=resource.match(/\/api\/v80\/setup\/index\/(core|subtitles|previews)\/status/);if(match)setTimeout(()=>{const card=maintenance.querySelector('[data-index-job="'+match[1]+'"]'),pause=card?.querySelector("[data-index-pause]");if(pause)pause.textContent=result.paused?"Resume":"Pause"},0);return result};

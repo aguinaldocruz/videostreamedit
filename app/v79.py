@@ -12,7 +12,7 @@ from pydantic import BaseModel, Field
 
 import app.v54 as indexes
 import app.v65 as tasks
-from app.v11 import connection
+from app.v11 import connection, column_exists
 from app.v13 import media_details_with_ietf
 from app.v51 import decode_external, extracted_text
 from app.v43 import optimized_media_edit
@@ -123,18 +123,13 @@ def ensure_tv_stream_index() -> None:
         db.execute("INSERT OR IGNORE INTO language_detection_settings(key,value) VALUES('voice_detection_url','http://language-id:9000')")
         db.execute("INSERT OR IGNORE INTO language_detection_settings(key,value) VALUES('voice_detection_sample_seconds','30')")
         db.execute("INSERT OR IGNORE INTO language_detection_settings(key,value) VALUES('voice_detection_positions','[0.1,0.5,0.9]')")
+        db.execute("INSERT OR IGNORE INTO language_detection_settings(key,value) VALUES('voice_detection_sample_count','3')")
         db.execute("INSERT OR IGNORE INTO language_detection_settings(key,value) VALUES('incremental_detection_enabled','1')")
         for column, definition in (("sdh_label", "TEXT NOT NULL DEFAULT ''"), ("sdh_confidence", "REAL NOT NULL DEFAULT 0"), ("sdh_evidence", "TEXT NOT NULL DEFAULT ''")):
-            try:
+            if not column_exists(db, "portuguese_language_detection", column):
                 db.execute(f"ALTER TABLE portuguese_language_detection ADD COLUMN {column} {definition}")
-            except Exception as exc:
-                if "duplicate column" not in str(exc).lower():
-                    raise
-        try:
+        if not column_exists(db, "portuguese_detection_state", "detector_version"):
             db.execute("ALTER TABLE portuguese_detection_state ADD COLUMN detector_version INTEGER NOT NULL DEFAULT 1")
-        except Exception as exc:
-            if "duplicate column" not in str(exc).lower():
-                raise
 
 
 @app.get("/api/v79/language-detection/settings")
@@ -208,17 +203,20 @@ class VoiceDetectionSettings(BaseModel):
     enabled: bool = True
     service_url: str = Field(default="http://language-id:9000", max_length=500)
     sample_seconds: int = Field(default=30, ge=10, le=120)
-    sample_positions: list[float] = Field(default_factory=lambda: [0.1, 0.5, 0.9], min_length=1, max_length=5)
+    sample_positions: list[float] = Field(default_factory=lambda: [0.1, 0.5, 0.9], min_length=1, max_length=9)
+    sample_count: int = Field(default=3, ge=1, le=9)
 
 
 def voice_detection_settings() -> dict:
-    defaults = {"enabled": True, "service_url": "http://language-id:9000", "sample_seconds": 30, "sample_positions": [0.1, 0.5, 0.9]}
+    defaults = {"enabled": True, "service_url": "http://language-id:9000", "sample_seconds": 30, "sample_positions": [0.1, 0.5, 0.9], "sample_count": 3}
     with connection() as db:
         rows = db.execute("SELECT key,value FROM language_detection_settings WHERE key LIKE 'voice_detection_%'").fetchall()
     values = {str(row["key"]): str(row["value"]) for row in rows}
     try: positions = [max(0.0, min(1.0, float(x))) for x in json.loads(values.get("voice_detection_positions", "[0.1,0.5,0.9]"))]
     except (TypeError, ValueError, json.JSONDecodeError): positions = defaults["sample_positions"]
-    return {"enabled": values.get("voice_detection_enabled", "1") == "1", "service_url": values.get("voice_detection_url", defaults["service_url"]), "sample_seconds": max(10, min(120, int(values.get("voice_detection_sample_seconds", "30")))), "sample_positions": positions or defaults["sample_positions"]}
+    try: count = max(1, min(9, int(values.get("voice_detection_sample_count", str(len(positions) or 3)))))
+    except (TypeError, ValueError): count = defaults["sample_count"]
+    return {"enabled": values.get("voice_detection_enabled", "1") == "1", "service_url": values.get("voice_detection_url", defaults["service_url"]), "sample_seconds": max(10, min(120, int(values.get("voice_detection_sample_seconds", "30")))), "sample_positions": positions or defaults["sample_positions"], "sample_count": count}
 
 
 @app.get("/api/v79/audio-language-detection/settings")
@@ -263,9 +261,13 @@ def queue_language_detection(request: DetectionQueueRequest) -> dict:
 @app.put("/api/v79/audio-language-detection/settings")
 def save_voice_detection_settings(request: VoiceDetectionSettings) -> dict:
     url = request.service_url.strip().rstrip("/") or "http://language-id:9000"
-    positions = [max(0.0, min(1.0, float(value))) for value in request.sample_positions]
+    count = max(1, min(9, int(request.sample_count)))
+    # Keep positions deterministic and evenly distributed; this makes the
+    # sample count setting authoritative while retaining the positions field
+    # for older clients.
+    positions = [round(index / (count + 1), 4) for index in range(1, count + 1)]
     with connection() as db:
-        for key, value in (("voice_detection_enabled", "1" if request.enabled else "0"), ("voice_detection_url", url), ("voice_detection_sample_seconds", str(request.sample_seconds)), ("voice_detection_positions", json.dumps(positions))):
+        for key, value in (("voice_detection_enabled", "1" if request.enabled else "0"), ("voice_detection_url", url), ("voice_detection_sample_seconds", str(request.sample_seconds)), ("voice_detection_positions", json.dumps(positions)), ("voice_detection_sample_count", str(count))):
             db.execute("INSERT OR REPLACE INTO language_detection_settings(key,value) VALUES(?,?)", (key, value))
     logger.info("change=voice_detection_settings enabled=%s seconds=%d positions=%s", request.enabled, request.sample_seconds, positions)
     return voice_detection_settings()
@@ -337,6 +339,10 @@ def audio_language_report() -> dict:
         item=dict(row)
         try: item["samples"]=json.loads(item.pop("samples_json") or "[]")
         except (TypeError,ValueError,json.JSONDecodeError): item["samples"]=[]
+        detected_code = _audio_language_code(str(item.get("detected_language") or ""))
+        agreeing = sum(1 for sample in item["samples"] if _audio_language_code(str(sample.get("language") or "")) == detected_code) if detected_code else 0
+        item["sample_agree"] = agreeing
+        item["sample_total"] = len(item["samples"])
         item["confidence"]=round(float(item["confidence"])*100,1)
         items.append(item)
     return {"items":items,"media_count":len({item["path"] for item in items}),"stream_count":len(items)}
@@ -718,10 +724,10 @@ def tv_show_status(request: TvShowStatusRequest) -> dict:
     index_paths: set[str] = set()
     with connection() as db:
         change_paths = {row["path"] for row in db.execute(
-            f"SELECT marker.path FROM media_change_request marker JOIN task_queue task ON task.id=marker.task_id WHERE marker.path IN ({placeholders}) AND task.status IN ('pending','running')", paths
+            f"SELECT marker.path FROM media_change_request marker JOIN task_queue task ON task.id=marker.task_id WHERE marker.path IN ({placeholders}) AND task.status IN ('pending','running') AND task.task_type NOT IN ('audio_language_detection')", paths
         ).fetchall()}
         index_paths = {row["path"] for row in db.execute(
-            f"SELECT DISTINCT path FROM index_task_queue WHERE path IN ({placeholders}) AND status IN ('pending','running','failed')", paths
+            f"SELECT DISTINCT path FROM index_task_queue WHERE path IN ({placeholders}) AND status IN ('pending','running','failed') AND job <> 'subtitles'", paths
         ).fetchall()}
         indexed = {row["path"]: (row["modified_ns"], row["size"]) for row in db.execute(
             f"SELECT path,modified_ns,size FROM media_stream_index_state WHERE path IN ({placeholders})", paths

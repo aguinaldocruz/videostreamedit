@@ -61,7 +61,9 @@ function chooseSavedComboboxValue(input, value) {
 
 showSavedValueMenu = function (input, filter = false) {
   closeSavedValueMenu();
-  const values = savedComboboxValues(input, filter);
+  const allValues = savedComboboxValues(input, filter);
+  const limited = input.dataset.savedExpanded !== 'true' && !filter && allValues.length > 4;
+  const values = limited ? allValues.slice(0, 4) : allValues;
   const menu = document.createElement('div');
   menu.className = 'saved-value-menu saved-combobox-menu';
   menu.setAttribute('role', 'listbox');
@@ -84,6 +86,14 @@ showSavedValueMenu = function (input, filter = false) {
     option.onclick = () => chooseSavedComboboxValue(input, value);
     menu.append(option);
   });
+  if (limited) {
+    const more = document.createElement('button');
+    more.type = 'button';
+    more.className = 'saved-value-option saved-value-load-more';
+    more.textContent = `Load more… (${allValues.length - values.length})`;
+    more.onclick = event => { event.preventDefault(); input.dataset.savedExpanded = 'true'; showSavedValueMenu(input, false); };
+    menu.append(more);
+  }
   (input.closest('dialog') || document.body).append(menu);
   openSavedValueMenu = menu;
   savedComboboxInput = input;
@@ -105,6 +115,7 @@ installSavedValuePopups = function (root = document) {
       if (savedComboboxInput === input) closeSavedValueMenu();
     }, 120);
     input.addEventListener('input', () => {
+      input.dataset.savedExpanded = 'false';
       if (!suppressSavedComboboxInput) showSavedValueMenu(input, true);
     });
     input.addEventListener('keydown', event => {

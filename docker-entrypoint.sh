@@ -13,7 +13,9 @@ if [ "$(id -u)" = "0" ]; then
     if [ "$current_uid" != "$runtime_uid" ]; then
         usermod --non-unique --uid "$runtime_uid" videostreamedit
     fi
-    chown -R videostreamedit:videostreamedit /config
+    # /config/data contains PostgreSQL files owned by the database container.
+    # Never recursively chown that subtree from the application container.
+    find /config -mindepth 1 -maxdepth 1 ! -name data -exec chown -R videostreamedit:videostreamedit {} + || true
     exec gosu videostreamedit "$@"
 fi
 

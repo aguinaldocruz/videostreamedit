@@ -1,0 +1,23 @@
+# Optional single-container deployment. The default compose deployment keeps
+# PostgreSQL separate; use the `single-container` profile only on small hosts.
+FROM python:3.13-slim-bookworm
+
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 CONFIG_DIR=/config
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ffmpeg gosu mkvtoolnix postgresql postgresql-client \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
+COPY app ./app
+COPY scripts ./scripts
+COPY db ./db
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+COPY docker-entrypoint.all-in-one.sh /usr/local/bin/docker-entrypoint.all-in-one.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.all-in-one.sh \
+    && mkdir -p /config /data /run/postgresql \
+    && useradd --create-home --uid 1000 --shell /usr/sbin/nologin videostreamedit \
+    && chown -R postgres:postgres /run/postgresql
+EXPOSE 8080
+VOLUME ["/config", "/data"]
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.all-in-one.sh"]

@@ -45,6 +45,6 @@ def refresh_movie_indexes(payload: RefreshMovieIndex) -> dict:
         db.execute("DELETE FROM movie_stream_index_value WHERE path=?", (str(path),))
         db.execute("DELETE FROM subtitle_extended_index WHERE path=?", (str(path),))
         db.executemany("INSERT INTO movie_stream_index_value(path,stream_type,language,track_name) VALUES(?,?,?,?)", [(str(path), *value) for value in base_values])
-        db.executemany("INSERT INTO subtitle_extended_index(path,source,type_index,external_path,codec,encoding,markup) VALUES(?,?,?,?,?,?,?)", extended_values)
+        db.executemany("INSERT INTO subtitle_extended_index(path,source,type_index,external_path,codec,encoding,markup,damage) VALUES(?,?,?,?,?,?,?,?)", extended_values)
         db.execute("INSERT OR REPLACE INTO movie_stream_index(path,modified,size,indexed_at) VALUES(?,?,?,datetime('now'))", (str(path), item["modified"], item["size"]))
     return {"indexed": True}

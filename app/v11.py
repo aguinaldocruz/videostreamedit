@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -63,10 +64,19 @@ def initialize_plex() -> None:
             CREATE INDEX IF NOT EXISTS plex_media_kind ON plex_media(kind);
             CREATE INDEX IF NOT EXISTS plex_media_show ON plex_media(show_title, season_number, episode_number);
         """)
-        try:
+        if not column_exists(db, "plex_config", "auth_method"):
             db.execute("ALTER TABLE plex_config ADD COLUMN auth_method TEXT NOT NULL DEFAULT 'manual'")
-        except Exception:
-            pass
+
+
+def column_exists(db, table: str, column: str) -> bool:
+    """Check schema metadata without issuing a duplicate ALTER statement."""
+    if os.getenv("DATABASE_BACKEND", "sqlite").lower() == "postgres":
+        return bool(db.execute(
+            "SELECT 1 FROM information_schema.columns WHERE table_schema=current_schema() AND table_name=? AND column_name=?",
+            (table, column),
+        ).fetchone())
+    safe_table = "".join(ch for ch in table if ch.isalnum() or ch == "_")
+    return any(str(row[1]) == column for row in db.execute(f"PRAGMA table_info({safe_table})").fetchall())
 
 
 PLEX_CLIENT_ID = "videostreamedit"

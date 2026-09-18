@@ -51,7 +51,7 @@ const sessionOpenEditor=openEditor;
 openEditor=async function(path,label){await sessionOpenEditor(path,label);if(document.querySelector('#stream-content .stream-row'))captureEditorBaseline()};
 
 $('#stream-form').onsubmit=async function(e){
-  e.preventDefault();const queued=queuedChangeCount();if(!queued){toast('No changes queued');return}let applySucceeded=false,applyError='';applyProgressBusy=true;setApplyProgress(1,4,'Preparing changes',queuedChangeSummary())
+  e.preventDefault();const queued=queuedChangeCount();if(!queued){toast('No changes queued');return}let applySucceeded=false,applyError='';applyProgressBusy=true;if(typeof beginGlobalBusy==='function')beginGlobalBusy('Applying stream changes');setApplyProgress(1,4,'Preparing changes',queuedChangeSummary())
   const rows=[...document.querySelectorAll('.stream-row')],tracks=[],external=[],order=[],remove=[],usedValues=[];
   rows.forEach(r=>{
     if(r.querySelector('[name=remove]').checked)remove.push(r.dataset.key);
@@ -73,5 +73,5 @@ $('#stream-form').onsubmit=async function(e){
     if(renameQueued){setApplyProgress(3,4,"Renaming media",filename);const renamed=await api("/api/v37/media/rename",{method:"POST",body:JSON.stringify({path,filename})});finalPath=renamed.path;adoptRenamedMediaPath(path,finalPath)}
     if(usedValues.length){setApplyProgress(3,4,"Saving reusable values","Recording successfully used metadata values");await offerSavedValues(usedValues)}
     setApplyProgress(4,4,"Refreshing properties","Reading updated streams from the media file");toast(result.warnings.length?result.warnings.join(" "):queued+" change"+(queued===1?"":"s")+" applied",result.warnings.length>0);const indexes=result.operation==='single_remux'?['core','subtitles','previews']:result.subtitle_html_cleaned?['core','subtitles','previews']:['core'];await openEditor(finalPath,label);document.dispatchEvent(new CustomEvent("media-properties-applied",{detail:{path:finalPath,indexes}}));applySucceeded=true;
-  }catch(error){applyError=error.message;toast(error.message,true)}finally{if(document.querySelector("#stream-content .stream-row"))updateQueuedChangeLabels();else{button.disabled=false;button.textContent="Apply changes";$("#stream-form .dialog-actions [data-close-stream]").textContent="Close"}applyProgressBusy=false;setApplyProgress(4,4,applySucceeded?"Complete":"Could not complete",applySucceeded?queued+" change"+(queued===1?"":"s")+" applied":applyError)}
+  }catch(error){applyError=error.message;toast(error.message,true)}finally{if(document.querySelector("#stream-content .stream-row"))updateQueuedChangeLabels();else{button.disabled=false;button.textContent="Apply changes";$("#stream-form .dialog-actions [data-close-stream]").textContent="Close"}applyProgressBusy=false;if(typeof endGlobalBusy==='function')endGlobalBusy();setApplyProgress(4,4,applySucceeded?"Complete":"Could not complete",applySucceeded?queued+" change"+(queued===1?"":"s")+" applied":applyError)}
 };

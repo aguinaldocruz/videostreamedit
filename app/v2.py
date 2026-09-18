@@ -13,6 +13,8 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
+from app.pg_compat import connect as postgres_connect
+
 CONFIG_DIR = Path(os.getenv("CONFIG_DIR", "/config"))
 DB_PATH = CONFIG_DIR / "videostreamedit.db"
 STATIC_DIR = Path(__file__).parent / "static"
@@ -48,6 +50,8 @@ class EditRequest(BaseModel):
 
 
 def connection() -> sqlite3.Connection:
+    if os.getenv('DATABASE_BACKEND', 'sqlite').lower() == 'postgres':
+        return postgres_connect()  # type: ignore[return-value]
     db = sqlite3.connect(DB_PATH, timeout=30)
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA busy_timeout=30000")

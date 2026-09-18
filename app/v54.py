@@ -12,7 +12,7 @@ from fastapi import HTTPException
 
 import app.v38 as legacy_index
 from app.v2 import CONFIG_DIR, probe
-from app.v11 import connection
+from app.v11 import connection, column_exists
 from app.v51 import inspect_extended
 from app.v53 import app
 
@@ -41,11 +41,8 @@ def initialize_split_indexes() -> None:
                 indexed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
         """)
-        try:
+        if not column_exists(db, "subtitle_extended_media", "markup_version"):
             db.execute("ALTER TABLE subtitle_extended_media ADD COLUMN markup_version INTEGER NOT NULL DEFAULT 1")
-        except Exception as exc:
-            if "duplicate column" not in str(exc).lower():
-                raise
 
 
 def media_rows() -> list[dict]:
@@ -92,7 +89,7 @@ def index_subtitles(item: dict) -> None:
     values = inspect_extended(path)
     with connection() as db:
         db.execute("DELETE FROM subtitle_extended_index WHERE path=?", (str(path),))
-        db.executemany("INSERT INTO subtitle_extended_index(path,source,type_index,external_path,codec,encoding,markup) VALUES(?,?,?,?,?,?,?)", values)
+        db.executemany("INSERT INTO subtitle_extended_index(path,source,type_index,external_path,codec,encoding,markup,damage) VALUES(?,?,?,?,?,?,?,?)", values)
         db.execute("INSERT OR REPLACE INTO subtitle_extended_media(path,modified,size,markup_version,indexed_at) VALUES(?,?,?,2,datetime('now'))", (str(path), item["modified"], item["size"]))
 
 

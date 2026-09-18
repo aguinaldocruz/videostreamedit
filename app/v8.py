@@ -80,8 +80,27 @@ def saved_values() -> dict:
         usage_rows = db.execute(
             "SELECT value, use_count FROM language_region_selection_usage"
         ).fetchall() if usage_table else []
+    saved_values = {field: [] for field in result if field != "language_region_usage"}
     for row in rows:
-        result[row["field"]].append(row["value"])
+        if row["field"] in saved_values:
+            saved_values[row["field"]].append(row["value"])
+    # Learned corrections are reusable track-name choices, ranked by use.
+    learned = []
+    try:
+        with connection() as learned_db:
+            learned = learned_db.execute(
+                "SELECT stream_type,new_value,use_count FROM track_name_correction_history WHERE enabled=1 AND TRIM(new_value) <> '' ORDER BY use_count DESC,last_used DESC"
+            ).fetchall()
+    except Exception as exc:
+        logger.warning("saved_values event=learned_track_names_unavailable error=%s", str(exc).replace("\n", " ")[-300:])
+    learned_values = {"title_audio": [], "title_subtitle": []}
+    for row in learned:
+        field = "title_audio" if str(row["stream_type"]) == "audio" else "title_subtitle"
+        value = str(row["new_value"]).strip()
+        if value and value not in learned_values[field]:
+            learned_values[field].append(value)
+    for field in ("language", "region", "title_audio", "title_subtitle"):
+        result[field] = learned_values.get(field, []) + [value for value in saved_values[field] if value not in learned_values.get(field, [])]
     result["language_region_usage"] = {row["value"]: row["use_count"] for row in usage_rows}
     return result
 

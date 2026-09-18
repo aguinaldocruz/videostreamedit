@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import subprocess
+import sqlite3
 import tempfile
 import threading
 import time
@@ -22,10 +23,11 @@ from pydantic import BaseModel, Field
 import app.v54 as indexes
 import app.v7 as media_editor
 from app.v7 import ReorderEditRequest
-from app.v11 import connection
+from app.v11 import connection, column_exists
 from app.v37 import MediaRenameRequest, rename_media
 from app.v43 import optimized_media_edit
 from app.v64 import app
+from app.postgres_store import register_task_stage, begin_task_stage, finish_task_stage, fail_task_stage, task_stage_exists, reset_task_stage_for_retry, prepare_task_artifact, commit_task_artifacts, cleanup_succeeded_workflow_group_artifacts, cleanup_succeeded_workflow_artifacts as cleanup_succeeded_workflow_artifacts_startup, workflow_details
 from app.v5 import external_subtitles
 
 
@@ -48,6 +50,15 @@ class QueueAction(BaseModel):
 
 class QueueStatusRequest(BaseModel):
     task_ids: list[int] = Field(min_length=1, max_length=30000)
+
+
+class QueueExpediteRequest(BaseModel):
+    minutes: int = Field(default=60, ge=5, le=1440)
+
+
+class QueueExpediteMatchingRequest(BaseModel):
+    query: str = Field(min_length=2, max_length=500)
+    minutes: int = Field(default=60, ge=5, le=1440)
 
 
 def utc_now() -> str:
@@ -75,15 +86,41 @@ def wake_queue() -> None:
         queue_condition.notify_all()
 
 
+def clear_expired_expedites(db) -> None:
+    """Remove temporary boosts so an occasional priority decision cannot become permanent."""
+    db.execute("DELETE FROM task_queue_expedite WHERE expires_at <= ?", (utc_now(),))
+
+
+def _active_expedite_expiry(db, group_id: str | None = None, path: str | None = None) -> str | None:
+    """Return the latest active expedite inherited by a group or media path."""
+    clear_expired_expedites(db)
+    candidates = db.execute("SELECT group_id,expires_at,task_id FROM task_queue_expedite WHERE expires_at > ?", (utc_now(),)).fetchall()
+    best = None
+    for row in candidates:
+        if group_id and row["group_id"] and str(row["group_id"]) == str(group_id):
+            best = max(best or str(row["expires_at"]), str(row["expires_at"]))
+            continue
+        if path:
+            task = db.execute("SELECT task_type,payload_json FROM task_queue WHERE id=?", (row["task_id"],)).fetchone()
+            try:
+                if task and affected_media_path(str(task["task_type"]), json.loads(task["payload_json"])) == path:
+                    best = max(best or str(row["expires_at"]), str(row["expires_at"]))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+    return best
+
+
 def affected_media_path(task_type: str, payload: dict) -> str:
     if task_type == "media_edit":
         return str((payload.get("edit") or payload).get("path") or "")
-    if task_type == "subtitle_html_cleanup":
+    if task_type in {"subtitle_html_cleanup", "subtitle_html_preflight"}:
         return str(payload.get("path") or "")
     if task_type in {"tv_filtered_stream_edit", "tv_filtered_stream_edit_now", "filtered_stream_edit", "filtered_stream_edit_now", "plex_import_refresh"}:
         return str(payload.get("path") or "")
     if task_type == "movie_import":
         return str(payload.get("source") or "")
+    if task_type == "media_reindex":
+        return str(payload.get("path") or "")
     if task_type == "audio_language_detection":
         return str(payload.get("path") or "")
     return ""
@@ -120,18 +157,31 @@ def media_configuration_signature(path: str) -> dict:
     except (OSError, ValueError, TypeError, subprocess.SubprocessError) as exc:
         raise RuntimeError(f"Could not capture media signature: {exc}") from exc
 
-def attach_media_signature(task_type: str, payload: dict) -> dict:
+def attach_media_signature(task_type: str, payload: dict, group_id: str | None = None) -> dict:
     if task_type in SIGNATURE_EXCLUDED_TASKS or payload.get("_media_signature"):
         return payload
     path = affected_media_path(task_type, payload)
     if not path:
         return payload
     signed = dict(payload)
-    signed["_media_signature"] = media_configuration_signature(path)
+    signed["_queue_group"] = group_id or str(payload.get("_queue_group") or uuid.uuid4().hex)
+    expected = None
+    if signed["_queue_group"]:
+        with connection() as db:
+            row = db.execute("SELECT signature_json FROM task_queue_group WHERE group_id=?", (signed["_queue_group"],)).fetchone()
+        if row and row["signature_json"]:
+            expected = json.loads(row["signature_json"])
+    signed["_media_signature"] = expected or media_configuration_signature(path)
     return signed
 
 def validate_media_signature(task_type: str, payload: dict) -> None:
     expected = payload.get("_media_signature")
+    group_id = payload.get("_queue_group")
+    if group_id:
+        with connection() as db:
+            row = db.execute("SELECT signature_json FROM task_queue_group WHERE group_id=?", (group_id,)).fetchone()
+        if row and row["signature_json"]:
+            expected = json.loads(row["signature_json"])
     if not expected or task_type in SIGNATURE_EXCLUDED_TASKS:
         return
     path = str(expected.get("path") or affected_media_path(task_type, payload) or "")
@@ -139,8 +189,33 @@ def validate_media_signature(task_type: str, payload: dict) -> None:
     if current.get("digest") != expected.get("digest") or bool(current.get("missing")) != bool(expected.get("missing")):
         raise RuntimeError("Media changed between queueing and execution; job refused for safety")
 
+def advance_media_signature(payload: dict) -> None:
+    group_id = payload.get("_queue_group")
+    if not group_id:
+        return
+    with connection() as db:
+        row = db.execute("SELECT path FROM task_queue_group WHERE group_id=?", (group_id,)).fetchone()
+    path = str(row["path"] if row and row["path"] else "")
+    if not path:
+        path = affected_media_path("media_edit", payload) or affected_media_path("subtitle_html_cleanup", payload) or str((payload.get("_media_signature") or {}).get("path") or "")
+    if not path:
+        return
+    signature = media_configuration_signature(path)
+    with connection() as db:
+        db.execute("UPDATE task_queue_group SET signature_json=?,updated_at=? WHERE group_id=?", (json.dumps(signature, ensure_ascii=False), utc_now(), group_id))
+
 def enqueue(task_type: str, payload: dict, label: str = "", *, deduplicate: bool = False) -> dict:
-    payload = attach_media_signature(task_type, payload)
+    affected = affected_media_path(task_type, payload)
+    group_id = str(payload.get("_queue_group") or "")
+    if affected and not group_id and task_type not in SIGNATURE_EXCLUDED_TASKS:
+        with connection() as lookup:
+            row = lookup.execute("SELECT task_queue.group_id FROM media_change_request JOIN task_queue ON task_queue.id=media_change_request.task_id WHERE media_change_request.path=? AND task_queue.group_id IS NOT NULL AND task_queue.status IN ('pending','running') ORDER BY task_queue.id LIMIT 1", (affected,)).fetchone()
+        group_id = str(row[0]) if row else uuid.uuid4().hex
+    if not group_id:
+        group_id = uuid.uuid4().hex
+    payload = dict(payload)
+    payload["_queue_group"] = group_id
+    payload = attach_media_signature(task_type, payload, group_id)
     encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     with connection() as db:
         if deduplicate:
@@ -151,13 +226,26 @@ def enqueue(task_type: str, payload: dict, label: str = "", *, deduplicate: bool
             if row:
                 return task_row(row[0])
         cursor = db.execute(
-            "INSERT INTO task_queue(task_type,label,payload_json,status,progress_message,created_at,updated_at) VALUES(?,?,?,'pending','Waiting',?,?)",
-            (task_type, label.strip() or task_type.replace("_", " ").title(), encoded, utc_now(), utc_now()),
+            "INSERT INTO task_queue(task_type,label,payload_json,group_id,status,progress_message,created_at,updated_at) VALUES(?,?,?,?, 'pending','Waiting',?,?)",
+            (task_type, label.strip() or task_type.replace("_", " ").title(), encoded, payload.get("_queue_group"), utc_now(), utc_now()),
         )
         task_id = cursor.lastrowid
+        if payload.get("_queue_group") and affected:
+            db.execute("INSERT OR IGNORE INTO task_queue_group(group_id,path,signature_json,updated_at) VALUES(?,?,?,?)", (payload["_queue_group"], affected, json.dumps(payload.get("_media_signature") or {}, ensure_ascii=False), utc_now()))
         affected = affected_media_path(task_type, payload)
         if affected:
             db.execute("INSERT OR REPLACE INTO media_change_request(task_id,path,requested_at) VALUES(?,?,?)", (task_id, affected, utc_now()))
+        # An expedited parent/workflow carries its temporary boost to any child
+        # task created later for the same group or media.
+        inherited = _active_expedite_expiry(db, group_id, affected)
+        if inherited:
+            db.execute("INSERT OR REPLACE INTO task_queue_expedite(task_id,group_id,requested_at,expires_at) VALUES(?,?,?,?)", (task_id, group_id, utc_now(), inherited))
+            logger.info("task_queue event=expedite_inherited id=%d group=%s file=%s expires=%s", task_id, group_id, affected or "", inherited)
+    try:
+        register_task_stage(payload.get("_queue_group"), task_type, affected, payload, task_id)
+    except Exception as exc:
+        logger.exception("workflow event=stage_registration_failed task=%s error=%s", task_type, str(exc))
+        raise
     if affected:
         try:
             from app.v80 import invalidate_language_detection
@@ -213,10 +301,16 @@ def process_media_edit(task_id: int, payload: dict) -> dict:
         final_path = rename_media(MediaRenameRequest(path=final_path, filename=filename))["path"]
         renamed = True
     update_progress(task_id, 2, 2, "Media changes applied")
-    if not renamed:
-        from app.v80 import media_indexes_for_edit, request_media_indexes
-        names = payload.get("reindex_indexes") or media_indexes_for_edit(edit_payload, payload.get("html_cleanups"), result.get("operation") == "single_remux")
-        request_media_indexes(final_path, names, "Queued media edit completed")
+    # Reinspect subtitle damage after every media edit.  The damaged report
+    # hides this path while the subtitle index task is pending, then exposes it
+    # again only if the refreshed analysis still reports damage.
+    # Always enqueue a fresh subtitle inspection, including after a rename.
+    # The damaged report excludes paths while this task is pending and will
+    # reappear only when the refreshed analysis still finds damage.
+    from app.v80 import media_indexes_for_edit, request_media_indexes
+    names = payload.get("reindex_indexes") or media_indexes_for_edit(edit_payload, payload.get("html_cleanups"), result.get("operation") == "single_remux")
+    names = list(dict.fromkeys([*names, "subtitles"]))
+    request_media_indexes(final_path, names, "Queued media edit completed")
     return {**result, "path": final_path}
 
 
@@ -254,6 +348,27 @@ def _language_service_request(wav: str, service_url: str | None = None) -> dict:
     return {"language_code": "", "confidence": 0.0, "error": "language-id unavailable"}
 
 
+def extract_audio_sample(path: str, stream_index: int, start: float, seconds: int, wav: str) -> None:
+    """Extract a sample with one fast seek and one accurate-seek retry."""
+    base = ['ffmpeg', '-nostdin', '-hide_banner', '-loglevel', 'error']
+    commands = [
+        base + ['-ss', f'{start:.3f}', '-i', path, '-map', f'0:a:{stream_index}', '-t', str(seconds), '-ac', '1', '-ar', '16000', '-c:a', 'pcm_s16le', '-f', 'wav', wav],
+        base + ['-i', path, '-ss', f'{start:.3f}', '-map', f'0:a:{stream_index}', '-t', str(seconds), '-ac', '1', '-ar', '16000', '-c:a', 'pcm_s16le', '-f', 'wav', wav],
+    ]
+    errors = []
+    for command in commands:
+        Path(wav).unlink(missing_ok=True)
+        try:
+            result = subprocess.run(command, capture_output=True, text=True, timeout=180)
+        except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+            errors.append(str(exc)); continue
+        if result.returncode == 0 and Path(wav).is_file() and Path(wav).stat().st_size > 44:
+            return
+        detail = (result.stderr or result.stdout or f'exit status {result.returncode}').strip().replace('\n', ' ')
+        errors.append(detail[-500:])
+    raise RuntimeError(f'FFmpeg audio sample extraction failed for audio {stream_index + 1} at {start:.1f}s: {errors[-1] if errors else "unknown error"}')
+
+
 def process_audio_language_detection(task_id: int, payload: dict) -> dict:
     path = str(payload.get('path') or '')
     if not path or not Path(path).is_file():
@@ -283,7 +398,7 @@ def process_audio_language_detection(task_id: int, payload: dict) -> dict:
             for number, fraction in enumerate(sample_positions, 1):
                 start = max(0.0, min(max(0.0, duration - float(sample_seconds)), duration * fraction))
                 wav = str(Path(work) / f'audio-{index}-{number}.wav')
-                subprocess.run(['ffmpeg', '-nostdin', '-hide_banner', '-loglevel', 'error', '-ss', f'{start:.3f}', '-i', path, '-map', f'0:a:{index}', '-t', str(sample_seconds), '-ac', '1', '-ar', '16000', '-c:a', 'pcm_s16le', '-f', 'wav', wav], check=True, timeout=180)
+                extract_audio_sample(path, index, start, sample_seconds, wav)
                 detected = _language_service_request(wav, service_url)
                 samples.append({'language': str(detected.get('language_code') or '').strip().lower(), 'confidence': float(detected.get('confidence') or 0), 'position': round(start, 2)})
                 update_progress(task_id, (index * 3) + number, len(streams) * len(sample_positions), f'Detecting audio {index + 1}/{len(streams)} sample {number}/{len(sample_positions)}')
@@ -359,7 +474,20 @@ def run_queue(lane: str = "main") -> None:
             continue
         priorities = task_priority_order()
         priority_case = "CASE task_type " + " ".join(f"WHEN ? THEN {index}" for index, _ in enumerate(priorities)) + " ELSE 999 END"
+        # A grouped task can be pending only because an earlier stage owns the
+        # workflow boundary. Keep those rows eligible, but always let runnable
+        # tasks (including the predecessor stage) go first. Without this guard,
+        # a high-priority blocked task can be claimed repeatedly and starve its
+        # own predecessor indefinitely.
+        workflow_wait_case = "CASE WHEN progress_message='Waiting for workflow resource' THEN 1 ELSE 0 END"
+        if os.getenv('DATABASE_BACKEND', 'sqlite').lower() == 'postgres':
+            # Prefer the earliest runnable stage of an active group. This lets
+            # a low-priority predecessor unblock its higher-priority siblings.
+            workflow_stage_case = "CASE WHEN EXISTS (SELECT 1 FROM workflow_stages current_stage WHERE current_stage.group_id=task_queue.group_id::uuid AND current_stage.status='pending' AND current_stage.payload->>'task_id'=task_queue.id::text AND NOT EXISTS (SELECT 1 FROM workflow_stages earlier_stage WHERE earlier_stage.group_id=current_stage.group_id AND earlier_stage.stage_number<current_stage.stage_number AND earlier_stage.status NOT IN ('succeeded','cancelled'))) THEN 0 ELSE 1 END"
+        else:
+            workflow_stage_case = '1'
         with connection() as db:
+            clear_expired_expedites(db)
             # Immediate bulk edits are submitted as individual tasks so the
             # UI can report per-media progress. Run them ahead of unrelated
             # backlog items; otherwise an immediate operation could remain at
@@ -371,10 +499,10 @@ def run_queue(lane: str = "main") -> None:
             else:
                 row = db.execute(f"""SELECT * FROM task_queue
                     WHERE status='pending' AND task_type NOT IN ('media_reindex','index_check_prepare','index_rebuild_prepare')
-                    ORDER BY {priority_case}, CASE WHEN task_type IN ('tv_filtered_stream_edit_now','filtered_stream_edit_now') THEN 0
+                    ORDER BY CASE WHEN task_type IN ('tv_filtered_stream_edit_now','filtered_stream_edit_now') THEN 0 WHEN task_type='audio_language_detection' THEN 2 ELSE ({workflow_stage_case}) END, CASE WHEN EXISTS (SELECT 1 FROM task_queue_expedite boost WHERE boost.task_id=task_queue.id AND boost.expires_at > ?) THEN 0 ELSE 1 END, {workflow_wait_case}, {priority_case}, CASE WHEN task_type IN ('tv_filtered_stream_edit_now','filtered_stream_edit_now') THEN 0
                                   WHEN task_type IN ('tv_filtered_stream_edit','filtered_stream_edit') THEN 1 ELSE 2 END,
                              CASE WHEN task_type IN ('tv_filtered_stream_edit_now','filtered_stream_edit_now','tv_filtered_stream_edit','filtered_stream_edit') THEN id END DESC,
-                             id LIMIT 1""", priorities).fetchone()
+                             id LIMIT 1""", [utc_now(), *priorities]).fetchone()
             if row:
                 claimed = db.execute(
                     "UPDATE task_queue SET status='running',started_at=?,updated_at=?,attempts=attempts+1,progress_message='Starting' WHERE id=? AND status='pending'",
@@ -389,12 +517,24 @@ def run_queue(lane: str = "main") -> None:
         task_id, task_type = row["id"], row["task_type"]
         logger.info("task_queue event=task_started lane=%s id=%d type=%s attempt=%d", lane, task_id, task_type, row["attempts"] + 1)
         started = time.monotonic()
+        stage_started = False
+        task_payload = {}
         try:
             task_payload = json.loads(row["payload_json"])
             validate_media_signature(task_type, task_payload)
+            stage_path = affected_media_path(task_type, task_payload)
+            if not task_stage_exists(task_payload.get("_queue_group"), task_type, task_id):
+                register_task_stage(task_payload.get("_queue_group"), task_type, stage_path, task_payload, task_id)
+            if not begin_task_stage(task_payload.get("_queue_group"), task_type, stage_path, task_id):
+                with connection() as db:
+                    db.execute("UPDATE task_queue SET status='pending',progress_message='Waiting for workflow resource',started_at=NULL,updated_at=? WHERE id=?", (utc_now(), task_id))
+                logger.info("workflow event=stage_waiting id=%d type=%s resource=%s", task_id, task_type, stage_path)
+                continue
+            stage_started = True
             # Private queue metadata is persisted for validation but must not
             # be passed to strict Pydantic task request models.
             handler_payload = {key: value for key, value in task_payload.items() if not str(key).startswith("_")}
+            prepare_task_artifact(task_payload.get("_queue_group"), task_id, task_type, stage_path, task_payload)
             result = TASK_HANDLERS[task_type](task_id, handler_payload)
             with connection() as db:
                 db.execute(
@@ -402,9 +542,28 @@ def run_queue(lane: str = "main") -> None:
                     (json.dumps(result, ensure_ascii=False), utc_now(), utc_now(), task_id),
                 )
                 db.execute("DELETE FROM media_change_request WHERE task_id=?", (task_id,))
+            advance_media_signature(task_payload)
+            commit_task_artifacts(task_payload.get("_queue_group"), task_id)
+            finish_task_stage(task_payload.get("_queue_group"), task_type, affected_media_path(task_type, task_payload), result, task_id)
+            removed_snapshots = cleanup_succeeded_workflow_group_artifacts(task_payload.get("_queue_group"))
+            if removed_snapshots:
+                logger.info("workflow event=staging_cleaned group=%s files=%d", task_payload.get("_queue_group"), removed_snapshots)
             logger.info("task_queue event=task_completed lane=%s id=%d type=%s seconds=%.2f", lane, task_id, task_type, time.monotonic() - started)
         except Exception as exc:
             message = str(getattr(exc, "detail", exc))
+            # Detection is advisory background work. If the media changed
+            # since it was queued, discard this obsolete sample instead of
+            # creating a visible failure or blocking user operations.
+            if task_type == "audio_language_detection" and "Media changed between queueing and execution" in message:
+                with connection() as db:
+                    db.execute("UPDATE task_queue SET status='cancelled',error=?,progress_message='Discarded: media changed',finished_at=?,updated_at=? WHERE id=?", (message, utc_now(), utc_now(), task_id))
+                logger.info("audio_language_detection event=discarded_obsolete task=%d", task_id)
+                continue
+            if stage_started:
+                try:
+                    fail_task_stage(task_payload.get("_queue_group"), task_type, affected_media_path(task_type, task_payload), message, task_id)
+                except Exception as workflow_exc:
+                    logger.exception("workflow event=stage_failure_persist_failed id=%d error=%s", task_id, workflow_exc)
             with connection() as db:
                 db.execute(
                     "UPDATE task_queue SET status='failed',error=?,progress_message='Failed',finished_at=?,updated_at=? WHERE id=?",
@@ -432,7 +591,13 @@ def initialize_task_queue() -> None:
                 attempts INTEGER NOT NULL DEFAULT 0,
                 progress_current INTEGER NOT NULL DEFAULT 0, progress_total INTEGER NOT NULL DEFAULT 0,
                 progress_message TEXT NOT NULL DEFAULT '', result_json TEXT, error TEXT,
-                created_at TEXT NOT NULL, started_at TEXT, finished_at TEXT, updated_at TEXT NOT NULL
+                group_id TEXT, created_at TEXT NOT NULL, started_at TEXT, finished_at TEXT, updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS task_queue_group (
+                group_id TEXT PRIMARY KEY, path TEXT NOT NULL, signature_json TEXT NOT NULL, updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS task_queue_expedite (
+                task_id INTEGER PRIMARY KEY, group_id TEXT, requested_at TEXT NOT NULL, expires_at TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS task_queue_status_id ON task_queue(status,id);
             CREATE TABLE IF NOT EXISTS media_change_request (
@@ -444,7 +609,21 @@ def initialize_task_queue() -> None:
             INSERT OR IGNORE INTO task_queue_settings(key,value) VALUES('priority_order','[]');
             UPDATE task_queue SET status='pending',progress_message='Recovered after restart',started_at=NULL WHERE status='running';
         """)
+        if not column_exists(db, "task_queue", "group_id"):
+            db.execute("ALTER TABLE task_queue ADD COLUMN group_id TEXT")
+        if not column_exists(db, "task_queue_expedite", "group_id"):
+            db.execute("ALTER TABLE task_queue_expedite ADD COLUMN group_id TEXT")
+        if os.getenv("DATABASE_BACKEND", "sqlite").lower() == "postgres":
+            db.execute("""UPDATE workflow_stages stage SET status='pending', started_at=NULL, updated_at=now()
+                          WHERE stage.status='running' AND stage.payload->>'task_id' IN
+                            (SELECT id::text FROM task_queue WHERE status <> 'running')""")
+            db.execute("""UPDATE workflow_groups group_row SET status='pending', updated_at=now()
+                          WHERE group_row.status='running' AND NOT EXISTS
+                            (SELECT 1 FROM workflow_stages stage WHERE stage.group_id=group_row.group_id AND stage.status='running')""")
         db.execute("DELETE FROM media_change_request WHERE task_id NOT IN (SELECT id FROM task_queue WHERE status IN ('pending','running','failed'))")
+        # Keep active boosts attached to completed parents until expiry so
+        # follow-up child/index work created after a restart can inherit them.
+        db.execute("DELETE FROM task_queue_expedite WHERE task_id NOT IN (SELECT id FROM task_queue) OR expires_at <= ?", (utc_now(),))
         active = db.execute("SELECT id,task_type,payload_json,created_at FROM task_queue WHERE status IN ('pending','running','failed')").fetchall()
         for row in active:
             try:
@@ -453,6 +632,14 @@ def initialize_task_queue() -> None:
                 affected = ""
             if affected:
                 db.execute("INSERT OR IGNORE INTO media_change_request(task_id,path,requested_at) VALUES(?,?,?)", (row["id"], affected, row["created_at"]))
+    try:
+        removed_snapshots = cleanup_succeeded_workflow_artifacts_startup()
+        if removed_snapshots:
+            logger.info("workflow event=startup_staging_cleaned files=%d", removed_snapshots)
+    except Exception as exc:
+        logger.warning("workflow event=startup_staging_cleanup_failed error=%s", str(exc).replace("\n", " ")[-300:])
+
+
 def start_task_queue_worker() -> None:
     global queue_thread, queue_light_thread
     if not queue_thread or not queue_thread.is_alive():
@@ -474,12 +661,13 @@ def add_queue_item(request: QueueRequest) -> dict:
 
 
 @app.get("/api/v65/queue")
-def list_queue(limit: int = 200, status: str | None = None, task_type: str | None = None) -> dict:
+def list_queue(limit: int = 200, status: str | None = None, task_type: str | None = None, grouped: bool = False, q: str | None = None) -> dict:
     limit = max(1, min(limit, 500))
     if status not in {None, "running", "pending", "failed", "succeeded", "cancelled"}:
         raise HTTPException(400, "Unsupported queue status")
     if task_type and not task_type.strip():
         task_type = None
+    q = q.strip() if q else None
     clauses = []
     params: list[Any] = []
     if status:
@@ -488,10 +676,14 @@ def list_queue(limit: int = 200, status: str | None = None, task_type: str | Non
     if task_type:
         clauses.append("task_type=?")
         params.append(task_type)
+    if q:
+        clauses.append("(label LIKE ? OR payload_json LIKE ?)")
+        params.extend([f"%{q}%", f"%{q}%"])
     where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
     params.append(limit)
+    groups = []
     with connection() as db:
-        rows = db.execute(f"SELECT * FROM task_queue{where} ORDER BY CASE status WHEN 'running' THEN 0 WHEN 'pending' THEN 1 WHEN 'failed' THEN 2 ELSE 3 END,id DESC LIMIT ?", params).fetchall()
+        rows = db.execute(f"SELECT task_queue.*, CASE WHEN task_queue_expedite.task_id IS NOT NULL AND task_queue_expedite.expires_at > ? THEN 1 ELSE 0 END AS expedited, task_queue_expedite.expires_at AS expedite_expires_at FROM task_queue LEFT JOIN task_queue_expedite ON task_queue_expedite.task_id=task_queue.id{where} ORDER BY CASE status WHEN 'running' THEN 0 WHEN 'pending' THEN 1 WHEN 'failed' THEN 2 ELSE 3 END,id DESC LIMIT ?", [utc_now(), *params]).fetchall()
         counts = {row["status"]: row["amount"] for row in db.execute("SELECT status,count(*) amount FROM task_queue GROUP BY status")}
         type_status = status if status in {"pending", "failed", "succeeded", "cancelled"} else None
         pending_rows = db.execute("SELECT task_type,count(*) amount FROM task_queue WHERE status=? GROUP BY task_type", (type_status,)).fetchall() if type_status else []
@@ -501,9 +693,111 @@ def list_queue(limit: int = 200, status: str | None = None, task_type: str | Non
     for row in rows:
         item = dict(row)
         item["payload"] = json.loads(item.pop("payload_json"))
-        item.pop("result_json", None)
+        raw_result = item.pop("result_json", None)
+        item["result"] = json.loads(raw_result) if raw_result else None
         items.append(item)
-    return {"paused": queue_paused(), "counts": counts, "type_status": type_status, "pending_types": pending_types, "items": items}
+    if grouped:
+        with connection() as db:
+            group_clauses = list(clauses) + ["group_id IS NOT NULL"]
+            group_where = " WHERE " + " AND ".join(group_clauses)
+            group_params = list(params[:-1]) if params else []
+            group_rows = db.execute(
+                f"SELECT group_id,status,created_at,updated_at FROM task_queue{group_where} ORDER BY updated_at DESC LIMIT ?",
+                [*group_params, min(limit, 50)],
+            ).fetchall()
+            grouped_rows = {}
+            for item in group_rows:
+                gid = str(item["group_id"])
+                group = grouped_rows.setdefault(gid, {"group_id": gid, "task_count": 0, "created_at": item["created_at"], "updated_at": item["updated_at"], "running": 0, "pending": 0, "failed": 0, "succeeded": 0, "cancelled": 0})
+                group["task_count"] += 1
+                group["created_at"] = min(group["created_at"], item["created_at"])
+                group["updated_at"] = max(group["updated_at"], item["updated_at"])
+                group[str(item["status"])] = group.get(str(item["status"]), 0) + 1
+            group_rows = list(grouped_rows.values())[:limit]
+            for row in group_rows:
+                group = dict(row)
+                gid = str(group["group_id"])
+                group["tasks"] = [dict(item) for item in db.execute(
+                    "SELECT id,label,task_type,status,progress_current,progress_total,progress_message,error,created_at,updated_at "
+                    "FROM task_queue WHERE group_id=? ORDER BY id", (gid,)
+                ).fetchall()]
+                try:
+                    group["workflow"] = workflow_details(gid) or None
+                except Exception:
+                    group["workflow"] = None
+                groups.append(group)
+    return {"paused": queue_paused(), "counts": counts, "type_status": type_status, "pending_types": pending_types, "items": items, "grouped": bool(grouped), "groups": groups}
+
+
+@app.post("/api/v65/queue/expedite-matching")
+def expedite_matching_queue(request: QueueExpediteMatchingRequest) -> dict:
+    """Boost pending tasks whose label or payload identifies a requested movie/show."""
+    query = request.query.strip()
+    now = utc_now()
+    expires = datetime.fromtimestamp(time.time() + request.minutes * 60, timezone.utc).isoformat(timespec="seconds")
+    with connection() as db:
+        clear_expired_expedites(db)
+        rows = db.execute("SELECT id,group_id FROM task_queue WHERE status='pending' AND (label LIKE ? OR payload_json LIKE ?)", (f"%{query}%", f"%{query}%")).fetchall()
+        if not rows:
+            raise HTTPException(404, "No pending tasks matched that movie or show")
+        for row in rows:
+            db.execute("INSERT OR REPLACE INTO task_queue_expedite(task_id,group_id,requested_at,expires_at) VALUES(?,?,?,?)", (row["id"], row["group_id"], now, expires))
+    logger.info("task_queue event=matching_expedited query=%s tasks=%d expires=%s", query.replace("\n", " ")[:120], len(rows), expires)
+    wake_queue()
+    return {"query": query, "tasks": len(rows), "expedited": True, "expires_at": expires}
+
+
+@app.post("/api/v65/queue/{task_id}/expedite")
+def expedite_queue_item(task_id: int, request: QueueExpediteRequest) -> dict:
+    """Temporarily prioritize one pending media task without bypassing workflow stages."""
+    now = utc_now()
+    expires = datetime.fromtimestamp(time.time() + request.minutes * 60, timezone.utc).isoformat(timespec="seconds")
+    with connection() as db:
+        row = db.execute("SELECT id,status,group_id FROM task_queue WHERE id=?", (task_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "Queue item not found")
+        if row["status"] != "pending":
+            raise HTTPException(409, "Only pending work can be expedited; running work is never interrupted")
+        clear_expired_expedites(db)
+        db.execute("INSERT OR REPLACE INTO task_queue_expedite(task_id,group_id,requested_at,expires_at) VALUES(?,?,?,?)", (task_id, row["group_id"], now, expires))
+    logger.info("task_queue event=expedited id=%d expires=%s", task_id, expires)
+    wake_queue()
+    return {"task_id": task_id, "expedited": True, "expires_at": expires}
+
+
+@app.delete("/api/v65/queue/{task_id}/expedite")
+def cancel_expedite_queue_item(task_id: int) -> dict:
+    with connection() as db:
+        db.execute("DELETE FROM task_queue_expedite WHERE task_id=?", (task_id,))
+    logger.info("task_queue event=expedite_cancelled id=%d", task_id)
+    wake_queue()
+    return {"task_id": task_id, "expedited": False}
+
+
+@app.post("/api/v65/queue/group/{group_id}/expedite")
+def expedite_queue_group(group_id: str, request: QueueExpediteRequest) -> dict:
+    """Temporarily prioritize pending stages in one workflow group."""
+    now = utc_now()
+    expires = datetime.fromtimestamp(time.time() + request.minutes * 60, timezone.utc).isoformat(timespec="seconds")
+    with connection() as db:
+        rows = db.execute("SELECT id FROM task_queue WHERE group_id=? AND status='pending'", (group_id,)).fetchall()
+        if not rows:
+            raise HTTPException(409, "This workflow has no pending stage to expedite")
+        clear_expired_expedites(db)
+        for row in rows:
+            db.execute("INSERT OR REPLACE INTO task_queue_expedite(task_id,group_id,requested_at,expires_at) VALUES(?,?,?,?)", (row["id"], group_id, now, expires))
+    logger.info("task_queue event=workflow_expedited group=%s tasks=%d expires=%s", group_id, len(rows), expires)
+    wake_queue()
+    return {"group_id": group_id, "tasks": len(rows), "expedited": True, "expires_at": expires}
+
+
+@app.delete("/api/v65/queue/group/{group_id}/expedite")
+def cancel_expedite_queue_group(group_id: str) -> dict:
+    with connection() as db:
+        changed = db.execute("DELETE FROM task_queue_expedite WHERE group_id=?", (group_id,)).rowcount
+    logger.info("task_queue event=workflow_expedite_cancelled group=%s tasks=%d", group_id, changed)
+    wake_queue()
+    return {"group_id": group_id, "expedited": False, "tasks": changed}
 
 
 @app.post("/api/v65/queue/status")
@@ -530,6 +824,17 @@ def control_queue(request: QueueAction) -> dict:
     return {"paused": paused}
 
 
+def _group_has_unfinished_tasks(db, group_id: str | None) -> bool:
+    """Completed tasks remain until every sibling task in their group is done."""
+    if not group_id:
+        return False
+    row = db.execute(
+        "SELECT 1 FROM task_queue WHERE group_id=? AND status IN ('pending','running') LIMIT 1",
+        (group_id,),
+    ).fetchone()
+    return bool(row)
+
+
 @app.post("/api/v65/queue/bulk")
 def bulk_queue_action(request: dict) -> dict:
     action = str(request.get("action") or "").strip().lower()
@@ -549,14 +854,23 @@ def bulk_queue_action(request: dict) -> dict:
         if action == "retry":
             changed = db.execute(f"UPDATE task_queue SET status='pending',error=NULL,finished_at=NULL,progress_current=0,progress_total=0,progress_message='Waiting',updated_at=? WHERE {where}", [utc_now(), *params]).rowcount
         else:
-            ids = [int(row["id"]) for row in db.execute(f"SELECT id FROM task_queue WHERE {where}", params).fetchall()]
-            changed = db.execute(f"DELETE FROM task_queue WHERE {where}", params).rowcount
+            candidates = db.execute(f"SELECT id,group_id FROM task_queue WHERE {where}", params).fetchall()
+            ids, skipped = [], 0
+            for candidate in candidates:
+                if _group_has_unfinished_tasks(db, candidate["group_id"]):
+                    skipped += 1
+                else:
+                    ids.append(int(candidate["id"]))
             if ids:
+                placeholders=','.join('?' for _ in ids)
+                changed = db.execute(f"DELETE FROM task_queue WHERE id IN ({placeholders})", ids).rowcount
                 db.executemany("DELETE FROM media_change_request WHERE task_id=?", [(task_id,) for task_id in ids])
-    logger.info("task_queue event=bulk_%s status=%s task_type=%s count=%d", action, status, task_type or "all", changed)
+            else:
+                changed = 0
+    logger.info("task_queue event=bulk_%s status=%s task_type=%s count=%d skipped_group_partial=%d", action, status, task_type or "all", changed, skipped if action == 'delete' else 0)
     if action == "retry":
         wake_queue()
-    return {"action": action, "status": status, "task_type": task_type, "count": changed}
+    return {"action": action, "status": status, "task_type": task_type, "count": changed, "skipped": skipped if action == 'delete' else 0}
 
 @app.post("/api/v65/queue/{task_id}/retry")
 def retry_queue_item(task_id: int) -> dict:
@@ -564,6 +878,12 @@ def retry_queue_item(task_id: int) -> dict:
         changed = db.execute("UPDATE task_queue SET status='pending',error=NULL,finished_at=NULL,progress_current=0,progress_total=0,progress_message='Waiting',updated_at=? WHERE id=? AND status='failed'", (utc_now(), task_id)).rowcount
     if not changed:
         raise HTTPException(409, "Only failed queue items can be retried")
+    try:
+        row = task_row(task_id)
+        reset_task_stage_for_retry(row.get("group_id"), task_id)
+    except Exception as exc:
+        logger.warning("workflow event=retry_reset_failed id=%d error=%s", task_id, str(exc).replace("\n", " ")[-300:])
+        raise HTTPException(500, "Queue item reset succeeded but staged workflow could not be reopened") from exc
     logger.info("task_queue event=retry_requested id=%d", task_id)
     wake_queue()
     return task_row(task_id)
@@ -584,10 +904,14 @@ def cancel_queue_item(task_id: int) -> dict:
 @app.delete("/api/v65/queue/{task_id}")
 def delete_queue_item(task_id: int) -> dict:
     with connection() as db:
-        changed = db.execute("DELETE FROM task_queue WHERE id=? AND status IN ('succeeded','failed','cancelled')", (task_id,)).rowcount
-    if not changed:
-        raise HTTPException(409, "Only finished queue items can be deleted")
-    with connection() as db:
+        row = db.execute("SELECT status,group_id FROM task_queue WHERE id=?", (task_id,)).fetchone()
+        if not row or row["status"] not in {'succeeded','failed','cancelled'}:
+            raise HTTPException(409, "Only finished queue items can be deleted")
+        if _group_has_unfinished_tasks(db, row["group_id"]):
+            raise HTTPException(409, "This task belongs to a workflow group that is still in progress; delete it after the whole group completes")
+        changed = db.execute("DELETE FROM task_queue WHERE id=?", (task_id,)).rowcount
         db.execute("DELETE FROM media_change_request WHERE task_id=?", (task_id,))
+    if not changed:
+        raise HTTPException(409, "Task was already removed")
     logger.info("task_queue event=task_deleted id=%d", task_id)
     return {"deleted": True, "id": task_id}

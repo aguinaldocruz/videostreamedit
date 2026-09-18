@@ -200,10 +200,10 @@ def initialize_unified_stream_index() -> None:
             db.execute("INSERT INTO index_task_queue(job,path,reason,status,created_at,updated_at) SELECT 'core',path,'Canonical index design v3 migration','pending',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP FROM plex_media")
             logger.info("core_index event=canonical_migration_queued version=3")
 
-        language_migration = db.execute("SELECT 1 FROM feature_migrations WHERE name=\"plex_language_semantics_v4\"").fetchone()
+        language_migration = db.execute("SELECT 1 FROM feature_migrations WHERE name='plex_language_semantics_v4'").fetchone()
         if not language_migration:
-            db.execute("INSERT INTO index_task_queue(job,path,reason,status,created_at,updated_at) SELECT \"core\",path,\"Plex language semantics v4 migration\",\"pending\",CURRENT_TIMESTAMP,CURRENT_TIMESTAMP FROM (SELECT DISTINCT path FROM media_stream_index WHERE lower(language)=\"und\") media WHERE NOT EXISTS (SELECT 1 FROM index_task_queue q WHERE q.job=\"core\" AND q.path=media.path AND q.status IN (\"pending\",\"running\"))")
-            db.execute("INSERT INTO feature_migrations(name) VALUES(\"plex_language_semantics_v4\")")
+            db.execute("INSERT INTO index_task_queue(job,path,reason,status,created_at,updated_at) SELECT 'core',path,'Plex language semantics v4 migration','pending',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP FROM (SELECT DISTINCT path FROM media_stream_index WHERE lower(language)='und') media WHERE NOT EXISTS (SELECT 1 FROM index_task_queue q WHERE q.job='core' AND q.path=media.path AND q.status IN ('pending','running'))")
+            db.execute("INSERT INTO feature_migrations(name) VALUES('plex_language_semantics_v4')")
             logger.info("core_index event=plex_language_semantics_migration_queued version=4")
 
 

@@ -36,3 +36,6 @@ htmlcov/
 models/
 audio-language-audit-*.log
 audio-language-findings-*.txt
+
+data/*
+!data/.gitkeep

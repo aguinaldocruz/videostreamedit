@@ -1,15 +1,25 @@
 from pydantic import BaseModel, Field
 from typing import Literal
 import logging
+from fastapi import HTTPException
 
-from app.v11 import connection
+from app.v11 import connection, column_exists
 from app.v85 import app
+from app.postgres_store import (
+    initialize_schema as initialize_postgres_workflow_schema,
+    workflow_details, rollback_workflow,
+)
 
 logger = logging.getLogger("videostreamedit")
 
 
 class LanguageRegionUse(BaseModel):
     value: str = Field(min_length=1, max_length=32)
+
+
+class WorkflowRollbackRequest(BaseModel):
+    # Explicit confirmation prevents an accidental media restore from a stale UI.
+    confirm: Literal["ROLLBACK"]
 
 
 class MediaNoteRequest(BaseModel):
@@ -39,14 +49,43 @@ def initialize_language_region_usage() -> None:
                 PRIMARY KEY(entity_type, entity_key)
             )
         """)
-        try:
+        if not column_exists(db, "media_notes", "reviewed"):
             db.execute("ALTER TABLE media_notes ADD COLUMN reviewed INTEGER NOT NULL DEFAULT 0")
-        except Exception:
-            pass
-        try:
+        if not column_exists(db, "media_notes", "plex_sync_change"):
             db.execute("ALTER TABLE media_notes ADD COLUMN plex_sync_change INTEGER NOT NULL DEFAULT 0")
-        except Exception:
-            pass
+
+
+@app.get("/api/v86/workflows/{group_id}")
+def get_workflow(group_id: str) -> dict:
+    """Read staged group, stage, artifact, and lock state for task review."""
+    details = workflow_details(group_id)
+    if not details:
+        raise HTTPException(404, "Workflow group not found")
+    return details
+
+
+@app.post("/api/v86/workflows/{group_id}/rollback")
+def rollback_workflow_group(group_id: str, request: WorkflowRollbackRequest) -> dict:
+    """Restore staged originals for an explicitly confirmed failed workflow.
+
+    Running/pending/succeeded groups are never restored through this endpoint;
+    the user must first let the workflow finish or cancel it.
+    """
+    if request.confirm != "ROLLBACK":
+        raise HTTPException(400, "Type ROLLBACK to confirm")
+    details = workflow_details(group_id)
+    if not details:
+        raise HTTPException(404, "Workflow group not found")
+    group = details["group"]
+    if group.get("status") not in {"failed", "cancelled"}:
+        raise HTTPException(409, "Only failed or cancelled workflows can be rolled back")
+    if details.get("locks"):
+        raise HTTPException(409, "Workflow still owns an active resource lock")
+    if not details.get("artifacts"):
+        raise HTTPException(409, "Workflow has no staged original to restore")
+    result = rollback_workflow(group_id)
+    logger.warning("workflow event=rollback_requested group=%s restored=%s", group_id, result.get("restored", 0))
+    return {"ok": True, **result, "workflow": workflow_details(group_id)}
 
 
 @app.post("/api/v86/language-region-use")
@@ -133,3 +172,21 @@ def save_media_note(request: MediaNoteRequest) -> dict:
             db.execute("DELETE FROM media_notes WHERE entity_type=? AND entity_key=?", (request.entity_type, request.entity_key))
     logger.info("change=media_note_saved type=%s key=%s present=%s reviewed=%s plex_sync_change=%s", request.entity_type, request.entity_key.replace("\n", " ")[:200], bool(note), reviewed, plex_sync_change)
     return {"entity_type": request.entity_type, "entity_key": request.entity_key, "note": note, "reviewed": reviewed, "plex_sync_change": plex_sync_change}
+
+@app.on_event("startup")
+def initialize_postgres_workflow() -> None:
+    """Create the durable staged-workflow tables when PostgreSQL is active."""
+    import os
+    if os.getenv("DATABASE_BACKEND", "sqlite").lower() != "postgres":
+        return
+    # Startup hooks also launch queue workers; retry schema creation briefly
+    # if a worker has already taken a PostgreSQL relation lock.
+    import time
+    for attempt in range(5):
+        try:
+            initialize_postgres_workflow_schema()
+            break
+        except Exception as exc:
+            if "deadlock detected" not in str(exc).lower() or attempt == 4:
+                raise
+            time.sleep(0.5 * (attempt + 1))

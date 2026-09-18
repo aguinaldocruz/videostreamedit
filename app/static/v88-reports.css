@@ -4,3 +4,11 @@
 .report-language-fix{margin-top:.35rem;font-size:.78rem}
 
 .stream-language-detect-dot{width:.56rem;height:.56rem;min-width:.56rem;margin:0 .08rem;padding:0;border:0;border-radius:50%;background:#7d8995;display:inline-block;vertical-align:middle;cursor:pointer;box-shadow:0 0 0 1px rgba(0,0,0,.25)}.stream-language-detect-dot:hover{background:#aeb8c1}.stream-language-detect-dot.checking{animation:stream-language-detect-pulse .8s ease-in-out infinite}.stream-language-detect-dot.detected{background:var(--detection-color,#d1a84b)}.stream-language-detect-dot.queued{background:#55a7ff}@keyframes stream-language-detect-pulse{50%{opacity:.35;transform:scale(.78)}}
+.subtitle-stage-columns{display:grid;grid-template-columns:1fr 1fr;gap:.75rem;max-height:60vh;overflow:auto}.subtitle-stage-columns pre{white-space:pre-wrap;background:var(--panel,#151b22);padding:.6rem;font-size:.75rem;max-height:55vh;overflow:auto}.subtitle-stage-review{max-width:min(1100px,95vw);width:1100px}
+.subtitle-stage-review .dialog-actions{display:flex;gap:.4rem;flex-wrap:wrap}.subtitle-stage-review .dialog-actions [data-prev],.subtitle-stage-review .dialog-actions [data-next]{min-width:5.5rem}
+
+/* Duplicate-language reports stay compact: one readable row per finding. */
+.report-item[data-dup-row]{grid-template-columns:minmax(0,1fr) auto auto auto;gap:.35rem;padding:.35rem .2rem}
+.report-item[data-dup-row] .report-item-action,.report-item[data-dup-row] [data-dup-ignore]{width:auto;min-width:0;padding:.2rem .45rem;font-size:.72rem;line-height:1.15;white-space:nowrap}
+.report-item[data-dup-row]>span:nth-child(2){font-size:.76rem;white-space:nowrap}
+@media(max-width:700px){.report-item[data-dup-row]{grid-template-columns:minmax(0,1fr) auto}.report-item[data-dup-row]>span:nth-child(2){grid-column:2;grid-row:1}.report-item[data-dup-row] .report-item-action,.report-item[data-dup-row] [data-dup-ignore]{grid-row:2}}

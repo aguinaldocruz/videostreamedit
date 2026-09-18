@@ -21,13 +21,14 @@
     if(job==='previews')summary+=` · ${status.audio_files||0} audio segments · ${bytes(status.cache_bytes||0)}`;
     stableText(text,summary);
     let details=card.querySelector('[data-index-queue-items]');
-    if(!details){text.insertAdjacentHTML('afterend','<details data-index-queue-items><summary>Queued work and errors</summary><div></div></details>');details=card.querySelector('[data-index-queue-items]')}
+    if(!details){text.insertAdjacentHTML('afterend','<div data-index-queue-items class="index-status-groups"></div>');details=card.querySelector('[data-index-queue-items]')}
     const items=status.items||[],signature=JSON.stringify(items.map(item=>[item.id,item.status,item.attempts,item.error]));
     if(details.dataset.signature!==signature){
-      const wasOpen=details.open;
-      details.querySelector('div').innerHTML=items.length?items.map(item=>`<p><strong>#${item.id} · ${esc(item.status)}</strong> · ${esc(item.path.split('/').pop())}${item.error?`<br><span class="error">${esc(item.error)}</span>`:''}</p>`).join(''):'<p class="muted">No active or failed items.</p>';
+      const expanded={};details.querySelectorAll('details[data-status]').forEach(group=>{expanded[group.dataset.status]=group.open});
+      const groups=[['running','running'],['pending','queued'],['failed','failed'],['succeeded','completed']];
+      details.innerHTML=groups.map(([state,label])=>{const rows=items.filter(item=>item.status===state);const count=state==='running'?(status.running?1:0):state==='pending'?(status.queued||0):state==='failed'?(status.failed||0):(status.completed||0);return `<details class="index-status-group status-${state}" data-status="${state}"${expanded[state]?' open':''}><summary>&gt; ${count} jobs ${label}</summary><div>${rows.length?rows.map(item=>`<p><strong>#${item.id}</strong> · ${esc((item.path||'').split('/').pop())}${item.error?`<br><span class="error">${esc(item.error)}</span>`:''}</p>`).join(''):'<p class="muted">None</p>'}</div></details>`}).join('');
+      details.querySelectorAll('details[data-status]').forEach(group=>group.addEventListener('toggle',()=>{if(group.open)group.scrollIntoView({block:'nearest'})}));
       details.dataset.signature=signature;
-      details.open=wasOpen;
     }
     const retry=card.querySelector('[data-index-retry]');if(retry)retry.disabled=!(status.failed>0);
     clearTimeout(timers[job]);

@@ -4,6 +4,7 @@ import json
 import logging
 import re
 import subprocess
+import hashlib
 from pathlib import Path
 from typing import Literal
 
@@ -13,7 +14,7 @@ from pydantic import BaseModel, Field
 
 from app.v11 import connection, paged_metadata, plex_authorized_file, plex_movies, plex_tv, sync_plex
 from app.v2 import probe
-from app.v5 import external_subtitles
+from app.v5 import external_subtitles, canonical_language
 from app.v16 import STATIC_DIR, app, asset
 
 
@@ -24,6 +25,7 @@ logger = logging.getLogger("videostreamedit")
 def initialize_plex_title_aliases() -> None:
     with connection() as db:
         db.execute("CREATE TABLE IF NOT EXISTS plex_title_aliases (path TEXT PRIMARY KEY, alternatives TEXT NOT NULL DEFAULT '[]')")
+        db.execute("CREATE TABLE IF NOT EXISTS duplicate_language_report_suppressions (path TEXT NOT NULL, stream_type TEXT NOT NULL, language TEXT NOT NULL, fingerprint TEXT NOT NULL, PRIMARY KEY(path,stream_type,language))")
 
 
 def title_values(item: dict) -> list[str]:
@@ -339,7 +341,7 @@ def plex_tv_with_alternatives() -> list[dict]:
         busy_paths = {
             str(row["path"])
             for row in db.execute(
-                "SELECT DISTINCT path FROM index_task_queue WHERE status IN ('pending','running')"
+                "SELECT DISTINCT path FROM index_task_queue WHERE status IN ('pending','running','failed')"
             ).fetchall()
         }
         # Use already indexed audio/subtitle streams only. Listing must not probe
@@ -467,8 +469,10 @@ def html_subtitle_report(kind: str) -> dict:
         rows = db.execute(
             "SELECT path,source,type_index,external_path,codec FROM subtitle_extended_index "
             "WHERE markup LIKE ? AND lower(codec) IN (" + placeholders + ") "
-            "AND path NOT IN (SELECT json_extract(payload_json, '$.path') FROM task_queue "
+            "AND path NOT IN (SELECT CAST(payload_json AS JSONB)->>'path' FROM task_queue "
             "WHERE task_type IN ('subtitle_html_preflight','subtitle_html_cleanup') "
+            "AND status IN ('pending','running')) "
+            "AND path NOT IN (SELECT path FROM index_task_queue WHERE job='subtitles' "
             "AND status IN ('pending','running')) "
             "ORDER BY path,type_index,external_path",
             ("%HTML tags%", *text_codecs),
@@ -490,6 +494,55 @@ def html_subtitle_report(kind: str) -> dict:
             subtitle_count = sum(by_path.get(str(episode["path"]), 0) for season in show["seasons"] for episode in season["episodes"])
             if media_count:
                 items.append({"title": str(show["name"]), "root_name": str(show.get("root_name") or ""), "media_count": media_count, "html_subtitle_count": subtitle_count, "paths": [episode["path"] for season in show["seasons"] for episode in season["episodes"] if refs_by_path.get(str(episode["path"]))], "streams": [ref for season in show["seasons"] for episode in season["episodes"] for ref in refs_by_path.get(str(episode["path"]), [])]})
+    items.sort(key=lambda item: item["title"].casefold())
+    return {"kind": kind, "items": items, "title_count": len(items), "media_count": sum(item["media_count"] for item in items)}
+
+
+@app.get("/api/v19/reports/damaged-subtitles")
+def damaged_subtitle_report(kind: str) -> dict:
+    if kind not in {"tv", "movies"}:
+        raise HTTPException(400, "Kind must be tv or movies")
+    text_codecs = ("subrip", "srt", "ass", "ssa", "webvtt", "mov_text", "text")
+    placeholders = ",".join("?" for _ in text_codecs)
+    with connection() as db:
+        rows = db.execute(
+            "SELECT path,source,type_index,external_path,codec,damage FROM subtitle_extended_index "
+            "WHERE damage IS NOT NULL AND damage!='' AND damage!='None' "
+            "AND lower(codec) IN (" + placeholders + ") "
+            "AND path NOT IN (SELECT path FROM index_task_queue WHERE job='subtitles' AND status IN ('pending','running')) "
+            "ORDER BY path,type_index,external_path",
+            text_codecs,
+        ).fetchall()
+    refs_by_path = {}
+    for row in rows:
+        refs_by_path.setdefault(str(row["path"]), []).append({
+            "path": str(row["path"]), "source": row["source"],
+            "type_index": int(row["type_index"]), "external_path": row["external_path"] or "",
+            "codec": row["codec"] or "", "damage": row["damage"] or "",
+        })
+    if kind == "movies":
+        items = []
+        for movie in plex_movies():
+            path = str(movie["path"])
+            refs = refs_by_path.get(path, [])
+            if refs:
+                items.append({"title": Path(str(movie.get("name") or path)).stem,
+                              "root_name": movie.get("root_name") or "", "media_count": 1,
+                              "damaged_subtitle_count": len(refs), "paths": [path], "streams": refs})
+    else:
+        items = []
+        for show in plex_tv():
+            episodes = []
+            for season in show["seasons"]:
+                for episode in season["episodes"]:
+                    refs = refs_by_path.get(str(episode["path"]), [])
+                    if refs:
+                        episodes.append({"path": str(episode["path"]), "episode": episode.get("episode") or episode.get("name") or Path(str(episode["path"])).stem, "streams": refs})
+            if episodes:
+                items.append({"title": str(show["name"]), "root_name": str(show.get("root_name") or ""),
+                              "media_count": len(episodes), "damaged_subtitle_count": sum(len(ep["streams"]) for ep in episodes),
+                              "paths": [ep["path"] for ep in episodes], "episodes": episodes,
+                              "streams": [stream for ep in episodes for stream in ep["streams"]]})
     items.sort(key=lambda item: item["title"].casefold())
     return {"kind": kind, "items": items, "title_count": len(items), "media_count": sum(item["media_count"] for item in items)}
 
@@ -568,7 +621,7 @@ def portuguese_language_report(kind: str) -> dict:
         rows = db.execute(
             "SELECT d.path,d.source,d.type_index,d.external_path,d.metadata_language,d.detected_language,d.confidence,d.metadata_region,d.evidence,d.sdh_label,d.sdh_confidence,d.sdh_evidence "
             "FROM portuguese_language_detection d JOIN plex_media p ON p.path=d.path "
-            "WHERE d.confidence>=0.60 ORDER BY d.path"
+            "WHERE d.confidence>=0.60 AND d.path NOT IN (SELECT path FROM index_task_queue WHERE status IN ('pending','running')) ORDER BY d.path"
         ).fetchall()
     by_path = {}
     for row in rows:
@@ -637,6 +690,91 @@ def fix_portuguese_language_report(request: LanguageDetectionFixRequest) -> dict
     return {"queued_media": len(task_ids), "queued_streams": queued, "skipped": skipped, "task_ids": task_ids}
 
 
+
+
+class DuplicateLanguageSettings(BaseModel):
+    audio: list[str] = Field(default_factory=list, max_length=100)
+    subtitle: list[str] = Field(default_factory=list, max_length=100)
+
+def _duplicate_language_values(stream_type: str) -> list[str]:
+    key = "duplicate_report_audio_languages" if stream_type == "audio" else "duplicate_report_subtitle_languages"
+    with connection() as db:
+        row = db.execute("SELECT value FROM language_detection_settings WHERE key=?", (key,)).fetchone()
+        fallback = db.execute("SELECT value FROM language_detection_settings WHERE key='common_languages'").fetchone()
+    try: values = json.loads(row["value"]) if row and row["value"] else json.loads(fallback["value"] if fallback else "[]")
+    except (TypeError, ValueError, json.JSONDecodeError): values = []
+    return sorted({canonical_language(str(value)) for value in values if canonical_language(str(value)) and canonical_language(str(value)) not in {"und", "unknown"}})
+
+@app.get("/api/v19/settings/duplicate-languages")
+def get_duplicate_language_settings() -> dict:
+    return {"audio": _duplicate_language_values("audio"), "subtitle": _duplicate_language_values("subtitle")}
+
+@app.put("/api/v19/settings/duplicate-languages")
+def save_duplicate_language_settings(request: DuplicateLanguageSettings) -> dict:
+    def clean(values): return sorted({canonical_language(str(value)) for value in values if canonical_language(str(value)) and canonical_language(str(value)) not in {"und", "unknown"}})
+    audio, subtitle = clean(request.audio), clean(request.subtitle)
+    with connection() as db:
+        db.execute("INSERT OR REPLACE INTO language_detection_settings(key,value) VALUES('duplicate_report_audio_languages',?)", (json.dumps(audio, ensure_ascii=False),))
+        db.execute("INSERT OR REPLACE INTO language_detection_settings(key,value) VALUES('duplicate_report_subtitle_languages',?)", (json.dumps(subtitle, ensure_ascii=False),))
+    return {"audio": audio, "subtitle": subtitle}
+
+def _duplicate_group_fingerprint(streams: list[dict]) -> str:
+    fields = [{"source": str(row.get("source") or ""), "type_index": int(row.get("type_index") or 0), "external_path": str(row.get("external_path") or ""), "language": canonical_language(str(row.get("language") or "")), "region": str(row.get("region") or "").upper(), "track_name": str(row.get("track_name") or ""), "codec": str(row.get("codec") or "")} for row in streams]
+    return hashlib.sha256(json.dumps(sorted(fields, key=lambda value: (value["source"], value["type_index"], value["external_path"])), ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+
+class DuplicateLanguageSuppressRequest(BaseModel):
+    path: str = Field(min_length=1, max_length=4096)
+    stream_type: Literal["audio", "subtitle"]
+    language: str = Field(min_length=1, max_length=32)
+
+@app.post("/api/v19/reports/duplicate-languages/suppress")
+def suppress_duplicate_language_report(request: DuplicateLanguageSuppressRequest) -> dict:
+    path = str(Path(request.path).resolve()); language = canonical_language(request.language)
+    with connection() as db:
+        rows = db.execute("SELECT source,type_index,external_path,codec,language,region,track_name FROM media_stream_index WHERE path=? AND stream_type=?", (path, request.stream_type)).fetchall()
+    streams = [dict(row) for row in rows if canonical_language(str(row["language"] or "")) == language]
+    if len(streams) < 2: return {"suppressed": False, "reason": "The duplicate no longer exists"}
+    fingerprint = _duplicate_group_fingerprint(streams)
+    with connection() as db:
+        db.execute("INSERT OR REPLACE INTO duplicate_language_report_suppressions(path,stream_type,language,fingerprint) VALUES(?,?,?,?)", (path, request.stream_type, language, fingerprint))
+    logger.info("report=duplicate_language_suppressed path=%s type=%s language=%s", path.replace("\n", "\\n"), request.stream_type, language)
+    return {"suppressed": True, "path": path, "stream_type": request.stream_type, "language": language}
+
+@app.get("/api/v19/reports/duplicate-languages")
+def duplicate_language_report(kind: str, stream_type: str) -> dict:
+    if kind not in {"tv", "movies"} or stream_type not in {"audio", "subtitle"}: raise HTTPException(400, "Invalid report selection")
+    allowed = set(_duplicate_language_values(stream_type))
+    with connection() as db:
+        rows = db.execute("SELECT path,source,type_index,external_path,codec,language,region,track_name FROM media_stream_index WHERE stream_type=? AND path NOT IN (SELECT path FROM index_task_queue WHERE status IN ('pending','running')) ORDER BY path,type_index", (stream_type,)).fetchall()
+        suppressed = {(str(row["path"]), canonical_language(str(row["language"])), str(row["fingerprint"])) for row in db.execute("SELECT path,language,fingerprint FROM duplicate_language_report_suppressions WHERE stream_type=?", (stream_type,)).fetchall()}
+    by_path = {}
+    for row in rows:
+        language = canonical_language(str(row["language"] or ""))
+        if not language or (allowed and language not in allowed): continue
+        by_path.setdefault(str(row["path"]), {}).setdefault(language, []).append(dict(row))
+    duplicates = {}
+    for path, groups in by_path.items():
+        visible = {}
+        for language, streams in groups.items():
+            if len(streams) > 1 and (path, language, _duplicate_group_fingerprint(streams)) not in suppressed: visible[language] = streams
+        if visible: duplicates[path] = visible
+    def detail(path, groups): return [{"language": language, "count": len(streams), "streams": streams} for language, streams in sorted(groups.items()) if len(streams)>1]
+    items=[]
+    if kind == "movies":
+        for movie in plex_movies():
+            path=str(movie["path"]); groups=duplicates.get(path)
+            if groups: items.append({"title": Path(str(movie.get("name") or path)).stem, "path": path, "root_name": movie.get("root_name") or "", "duplicates": detail(path, groups)})
+    else:
+        for show in plex_tv():
+            episodes=[]
+            for season in show["seasons"]:
+                for episode in season["episodes"]:
+                    path=str(episode["path"]); groups=duplicates.get(path)
+                    if groups: episodes.append({"episode": episode.get("name") or Path(path).stem, "path": path, "duplicates": detail(path, groups)})
+            if episodes: items.append({"title": str(show["name"]), "root_name": str(show.get("root_name") or ""), "media_count": len(episodes), "episodes": episodes})
+    items.sort(key=lambda item: item["title"].casefold())
+    return {"kind": kind, "stream_type": stream_type, "languages": sorted(allowed), "items": items, "title_count": len(items), "media_count": sum(item.get("media_count",1) for item in items)}
+
 @app.get("/api/v19/reports/forced-streams")
 def forced_stream_report(kind: str) -> dict:
     if kind not in {"tv", "movies"}:
@@ -644,7 +782,7 @@ def forced_stream_report(kind: str) -> dict:
     with connection() as db:
         setting = db.execute("SELECT value FROM language_detection_settings WHERE key='forced_report_excluded_track_names'").fetchone()
         rows = db.execute("""SELECT path,stream_type,type_index,external_path,codec,language,region,track_name
-            FROM media_stream_index WHERE is_forced=1 ORDER BY path,type_index""").fetchall()
+            FROM media_stream_index WHERE is_forced=1 AND path NOT IN (SELECT path FROM index_task_queue WHERE status IN ('pending','running')) ORDER BY path,type_index""").fetchall()
     try:
         excluded = {str(value).strip().casefold() for value in (json.loads(setting["value"]) if setting else []) if str(value).strip()}
     except (TypeError, ValueError, json.JSONDecodeError):

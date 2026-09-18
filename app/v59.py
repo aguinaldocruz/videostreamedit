@@ -135,7 +135,7 @@ def record_language_aware_corrections(request: ReorderEditRequest, before: dict)
             db.execute("""
                 INSERT INTO track_name_correction_history(stream_type,track_language,old_value,new_value,use_count)
                 VALUES(?,?,?,?,1) ON CONFLICT(stream_type,track_language,old_value,new_value) DO UPDATE SET
-                use_count=use_count+1,last_used=CURRENT_TIMESTAMP
+                use_count=track_name_correction_history.use_count+1,last_used=CURRENT_TIMESTAMP
             """, (stream_type, language, old_value, new_value))
             logger.info("change=track_name_correction_learned stream=%s language=%s from=%s to=%s", stream_type, language, old_value.replace("\n", "\\n"), new_value.replace("\n", "\\n"))
 

@@ -1,6 +1,35 @@
 name: videostreamedit
 
 services:
+# Default: PostgreSQL runs as the separate `postgres` service below.
+#
+# Optional single-container mode (small/test hosts only):
+#   docker compose --profile single-container build videostreamedit-all-in-one
+#   docker compose --profile single-container up -d videostreamedit-all-in-one
+# Stop the default `postgres` and `videostreamedit` services first; both modes
+# must never share the same /data/postgres directory at the same time. The
+# profile uses Dockerfile.all-in-one, supervises PostgreSQL and uvicorn in one
+# container, and keeps the database under /data/postgres. The separated mode
+# remains recommended for backups, upgrades, resource limits, and recovery.
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: videostreamedit-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: videostreamedit
+      POSTGRES_USER: videostreamedit
+      POSTGRES_PASSWORD: change-this-local-password
+      TZ: "America/Sao_Paulo"
+    command: ["postgres", "-c", "timezone=America/Sao_Paulo", "-c", "log_timezone=America/Sao_Paulo"]
+    volumes:
+      - /home/docker/videostreamedit/data/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U videostreamedit -d videostreamedit"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
   videostreamedit:
     # Replace this with a published image later, for example:
     # image: ghcr.io/your-user/videostreamedit:latest
@@ -10,19 +39,25 @@ services:
     container_name: videostreamedit
     restart: unless-stopped
     init: true
+    depends_on:
+      postgres:
+        condition: service_healthy
 
     ports:
       - "8383:8080"
 
     environment:
-      TZ: "America/Sao_Paulo"
       PUID: "1000"
       PGID: "1000"
       LANGUAGE_ID_URL: "http://language-id:9000"
+      # Internal PostgreSQL is the default. For external PostgreSQL, set DATABASE_URL to its URL and disable the postgres service/depends_on.
+      DATABASE_BACKEND: "postgres"
+      DATABASE_URL: "${DATABASE_URL:-postgresql://videostreamedit:change-this-local-password@postgres:5432/videostreamedit}"
 
     volumes:
       - /media/:/media
       - /home/docker/videostreamedit:/config
+      - /home/docker/videostreamedit/data:/data
 
     security_opt:
       - no-new-privileges:true
@@ -43,7 +78,6 @@ services:
       - "9000:9000"
 
     environment:
-      TZ: "America/Sao_Paulo"
       HF_HOME: "/models/huggingface"
       TRANSFORMERS_CACHE: "/models/huggingface"
       SPEECHBRAIN_CACHE: "/models/speechbrain"
@@ -51,5 +85,34 @@ services:
     volumes:
       - /home/docker/videostreamedit/language-id-models:/models
 
+    security_opt:
+      - no-new-privileges:true
+
+  # Optional alternative to the two services above. Do not run it alongside
+  # `postgres`/`videostreamedit` using the same persistent data directory.
+  videostreamedit-all-in-one:
+    profiles: ["single-container"]
+    build:
+      context: .
+      dockerfile: Dockerfile.all-in-one
+    image: videostreamedit:all-in-one
+    container_name: videostreamedit-all-in-one
+    restart: unless-stopped
+    init: true
+    ports:
+      - "8383:8080"
+    environment:
+      PUID: "1000"
+      PGID: "1000"
+      LANGUAGE_ID_URL: "http://language-id:9000"
+      DATABASE_BACKEND: "postgres"
+      # Set DATABASE_URL to an external PostgreSQL instance if desired.
+    volumes:
+      - /media/:/media
+      - /home/docker/videostreamedit:/config
+      - /home/docker/videostreamedit/data:/data
+    depends_on:
+      language-id:
+        condition: service_started
     security_opt:
       - no-new-privileges:true

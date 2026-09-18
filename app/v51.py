@@ -5,7 +5,9 @@ import logging
 import os
 import re
 import subprocess
+import sqlite3
 import tempfile
+import uuid
 from pathlib import Path
 
 from fastapi import HTTPException, Query
@@ -14,7 +16,7 @@ from pydantic import BaseModel
 import app.v38 as movie_index
 from app.v2 import probe
 from app.v5 import checked_external, external_subtitles
-from app.v11 import connection
+from app.v11 import connection, column_exists
 from app.v28 import authorized_import_file
 from app.v50 import app
 
@@ -42,11 +44,13 @@ def initialize_extended_subtitle_index() -> None:
             CREATE TABLE IF NOT EXISTS subtitle_extended_index (
                 path TEXT NOT NULL, source TEXT NOT NULL, type_index INTEGER NOT NULL DEFAULT -1,
                 external_path TEXT NOT NULL DEFAULT '', codec TEXT NOT NULL DEFAULT '',
-                encoding TEXT NOT NULL DEFAULT '', markup TEXT NOT NULL DEFAULT '',
+                encoding TEXT NOT NULL DEFAULT '', markup TEXT NOT NULL DEFAULT '', damage TEXT NOT NULL DEFAULT '',
                 PRIMARY KEY(path,source,type_index,external_path)
             );
             CREATE INDEX IF NOT EXISTS subtitle_extended_filter ON subtitle_extended_index(encoding,markup,path);
         """)
+        if not column_exists(db, "subtitle_extended_index", "damage"):
+            db.execute("ALTER TABLE subtitle_extended_index ADD COLUMN damage TEXT NOT NULL DEFAULT ''")
 
 
 def decode_external(data: bytes) -> tuple[str, str]:
@@ -73,7 +77,12 @@ def extracted_text(path: Path, selector: str) -> str:
     try:
         result = subprocess.run(["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-i", str(path), "-map", selector, "-t", "900", "-f", "srt", "pipe:1"], capture_output=True, timeout=50, check=True)
         return result.stdout.decode("utf-8", errors="replace")
-    except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+    except subprocess.CalledProcessError as exc:
+        # FFmpeg may return a non-zero code after emitting usable subtitle
+        # packets (for example, one malformed legacy character). Preserve the
+        # text so markup detection can inspect the current stream.
+        return (exc.stdout or b"").decode("utf-8", errors="replace")
+    except (FileNotFoundError, subprocess.TimeoutExpired):
         return ""
 
 
@@ -87,8 +96,42 @@ def complete_extracted_text(path: Path, selector: str) -> str:
             check=True,
         )
         return result.stdout.decode("utf-8", errors="replace")
-    except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+    except subprocess.CalledProcessError as exc:
+        return (exc.stdout or b"").decode("utf-8", errors="replace")
+    except (FileNotFoundError, subprocess.TimeoutExpired):
         return ""
+
+
+def damage_kind(text: str) -> str:
+    """Return conservative SRT corruption markers, not ordinary accented text."""
+    issues = []
+    if "\ufffd" in text:
+        issues.append("Replacement characters")
+    controls = sum(1 for char in text if ord(char) < 32 and char not in "\r\n\t")
+    if controls:
+        issues.append("Control characters")
+    cue_numbers = len(re.findall(r"(?m)^\s*\d+\s*$", text))
+    timings = len(re.findall(r"(?m)^\s*\d{1,2}:\d{2}:\d{2}[,.]\d{1,3}\s+-->\s+\d{1,2}:\d{2}:\d{2}[,.]\d{1,3}", text))
+    if cue_numbers and not timings:
+        issues.append("Malformed SRT timing")
+    if re.search(r"(?:Ã.|Â.|â€|â€™|â€œ|â€)", text):
+        issues.append("Possible mojibake")
+    # Do not classify a subtitle merely because its language is outside the
+    # configured detector. Only flag substantial payloads with almost no
+    # Unicode letters at all, which is characteristic of broken OCR/decoding.
+    payload = re.sub(r"^\s*\d+\s*$|^\s*\d{1,2}:\d{2}:\d{2}[,.]\d{1,3}\s+-->.*$", " ", text, flags=re.M)
+    printable = "".join(char for char in payload if char.isprintable() and not char.isspace())
+    letters = sum(char.isalpha() for char in printable)
+    if len(printable) >= 40 and letters < max(4, len(printable) // 12) and not re.search(r"[♪♫]", payload):
+        issues.append("No recognizable text")
+    # A common failed bitmap-OCR signature is many isolated letters instead of
+    # words. Require a meaningful sample so short dialogue such as "I am" is
+    # not reported as damaged.
+    tokens = re.findall(r"[^\W\d_]+", payload, flags=re.UNICODE)
+    isolated = sum(1 for token in tokens if len(token) == 1)
+    if len(tokens) >= 12 and isolated >= 8 and isolated / len(tokens) >= 0.35:
+        issues.append("Likely OCR gibberish (isolated letters)")
+    return " + ".join(dict.fromkeys(issues)) or "None"
 
 
 def inspect_extended(path: Path) -> list[tuple]:
@@ -101,15 +144,16 @@ def inspect_extended(path: Path) -> list[tuple]:
         if codec in TEXT_SUBTITLE_CODECS:
             text = extracted_text(path, f"0:s:{subtitle_index}")
             encoding, markup = "UTF-8 (container)", markup_kind(text)
+            damage = damage_kind(text)
         else:
-            encoding, markup = "Bitmap", "Graphical"
-        found.append((str(path), "embedded", subtitle_index, "", codec, encoding, markup))
+            encoding, markup, damage = "Bitmap", "Graphical", "None"
+        found.append((str(path), "embedded", subtitle_index, "", codec, encoding, markup, damage))
         subtitle_index += 1
     for item in external_subtitles(path):
         subtitle = Path(item["path"])
         raw = subtitle.read_bytes()[:512_000]
         text, encoding = decode_external(raw)
-        found.append((str(path), "external", -1, str(subtitle), item.get("codec") or subtitle.suffix.lstrip("."), encoding, markup_kind(text)))
+        found.append((str(path), "external", -1, str(subtitle), item.get("codec") or subtitle.suffix.lstrip("."), encoding, markup_kind(text), damage_kind(text)))
     return found
 
 
@@ -129,7 +173,7 @@ def extended_run_index(items: list[dict]) -> None:
             values = inspect_extended(path)
             with connection() as db:
                 db.execute("DELETE FROM subtitle_extended_index WHERE path=?", (str(path),))
-                db.executemany("INSERT INTO subtitle_extended_index(path,source,type_index,external_path,codec,encoding,markup) VALUES(?,?,?,?,?,?,?)", values)
+                db.executemany("INSERT INTO subtitle_extended_index(path,source,type_index,external_path,codec,encoding,markup,damage) VALUES(?,?,?,?,?,?,?,?)", values)
         except Exception as exc:
             logger.warning("change=subtitle_extended_index_failed path=%s error=%s", str(path).replace("\n", "\\n"), exc)
         with movie_index._index_lock:
@@ -188,13 +232,14 @@ def strip_html(text: str) -> str:
     return html.unescape(HTML_TAG.sub("", text))
 
 
-def clean_external_html(subtitle: Path) -> None:
+def clean_external_html(subtitle: Path, operation_id: str | None = None) -> None:
     text, current = decode_external(subtitle.read_bytes())
     if not HTML_TAG.search(text):
         logger.info("change=subtitle_html_cleanup_skipped reason=no_tags file=%s source=external", str(subtitle).replace("\n", "\\n"))
         return
     codecs = {"UTF-8": "utf-8", "UTF-8 BOM": "utf-8-sig", "UTF-16": "utf-16", "Windows-1252": "cp1252"}
-    temporary = subtitle.with_name(f".{subtitle.name}.vse.tmp")
+    token = re.sub(r"[^A-Za-z0-9_-]", "", str(operation_id or uuid.uuid4().hex))[-48:]
+    temporary = subtitle.with_name(f".{subtitle.name}.vse-{token}.tmp")
     try:
         temporary.write_bytes(strip_html(text).encode(codecs[current], errors="replace"))
         os.chmod(temporary, subtitle.stat().st_mode)
@@ -203,7 +248,7 @@ def clean_external_html(subtitle: Path) -> None:
         temporary.unlink(missing_ok=True)
 
 
-def clean_embedded(media: Path, type_index: int) -> None:
+def clean_embedded(media: Path, type_index: int, operation_id: str | None = None) -> None:
     streams = probe(media).get("streams", [])
     subtitle_globals = [index for index, stream in enumerate(streams) if stream.get("codec_type") == "subtitle"]
     if type_index < 0 or type_index >= len(subtitle_globals):
@@ -224,7 +269,8 @@ def clean_embedded(media: Path, type_index: int) -> None:
     with tempfile.TemporaryDirectory(prefix="vse-subtitle-") as folder:
         subtitle = Path(folder) / "clean.srt"
         subtitle.write_text(clean, encoding="utf-8")
-        temporary = media.with_name(f".{media.stem}.subtitle-clean.vse{media.suffix}")
+        token = re.sub(r"[^A-Za-z0-9_-]", "", str(operation_id or uuid.uuid4().hex))[-48:]
+        temporary = media.with_name(f".{media.stem}.subtitle-clean.vse-{token}{media.suffix}")
         command = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-i", str(media), "-i", str(subtitle)]
         subtitle_output = 0
         for global_index, stream in enumerate(streams):
@@ -246,6 +292,10 @@ def clean_embedded(media: Path, type_index: int) -> None:
         disposition = selected.get("disposition") or {}
         flags = "+".join(name for name, enabled in disposition.items() if enabled) or "0"
         command += [f"-disposition:s:{type_index}", flags, str(temporary)]
+        # This path is owned by the current task. Remove an artifact left by a
+        # previous interrupted attempt, then allow FFmpeg to replace it.
+        temporary.unlink(missing_ok=True)
+        command.insert(1, "-y")
         try:
             subprocess.run(command, capture_output=True, text=True, timeout=3600, check=True)
             os.chmod(temporary, media.stat().st_mode)
@@ -256,14 +306,14 @@ def clean_embedded(media: Path, type_index: int) -> None:
 
 
 @app.post("/api/v51/subtitle-cleanup")
-def apply_subtitle_cleanup(request: SubtitleCleanup) -> dict:
+def apply_subtitle_cleanup(request: SubtitleCleanup, operation_id: str | None = None) -> dict:
     media = authorized_import_file(request.path)
     if request.external_path:
         subtitle = checked_external(media, request.external_path)
-        clean_external_html(subtitle)
+        clean_external_html(subtitle, operation_id)
         target = subtitle.name
     else:
-        clean_embedded(media, request.type_index if request.type_index is not None else -1)
+        clean_embedded(media, request.type_index if request.type_index is not None else -1, operation_id)
         target = f"subtitle:{request.type_index}"
     with connection() as db:
         db.execute("DELETE FROM movie_stream_index WHERE path=?", (str(media),))

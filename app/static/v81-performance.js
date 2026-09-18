@@ -5,7 +5,7 @@
   if(heading)heading.textContent='Core metadata and subtitle inspection can run incrementally on demand or on a schedule. Preview media remains on demand.';
   const core=maintenance.querySelector('[data-index-job="core"]');
   if(core){core.querySelector('h3').textContent='Core stream metadata index';core.querySelector('p').textContent='Language, region, track name, stream type, flags, and external subtitle tags for movie and TV filters.'}
-  document.head.insertAdjacentHTML('beforeend','<style>.index-on-demand [data-index-status],.index-on-demand [data-index-queue-items],.index-on-demand [data-index-retry],.index-on-demand [data-index-pause],.index-on-demand [data-index-stop],.index-on-demand .index-schedule{display:none!important}</style>');
+  document.head.insertAdjacentHTML('beforeend','<style>.index-on-demand [data-index-check],.index-on-demand .index-schedule{display:none!important}</style>');
   for(const [job,title,description] of [
     ['subtitles','Subtitle inspection','Incremental subtitle inspection can run now or on a schedule. Start from scratch only when necessary.'],
     ['previews','On-demand preview cache','Audio segments stream when requested and only viewed segments are retained in the 512 MB LRU cache.']
