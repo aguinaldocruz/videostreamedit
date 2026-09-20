@@ -9,7 +9,6 @@ from app.v39 import RefreshMovieIndex
 from app.v54 import cache_folder, index_core
 from app.v55 import app
 
-
 logger = logging.getLogger("uvicorn.error")
 
 

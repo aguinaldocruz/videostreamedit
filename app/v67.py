@@ -12,7 +12,6 @@ import app.v54 as index_jobs
 from app.v11 import connection
 from app.v65 import app
 
-
 logger = logging.getLogger("uvicorn.error")
 schedule_thread: threading.Thread | None = None
 FREQUENCY_DAYS = {"daily": 1, "every_other_day": 2, "weekly": 7}

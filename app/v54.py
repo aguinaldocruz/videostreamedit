@@ -12,10 +12,9 @@ from fastapi import HTTPException
 
 import app.v38 as legacy_index
 from app.v2 import CONFIG_DIR, DATA_DIR, probe
-from app.v11 import connection, column_exists
+from app.v11 import column_exists, connection
 from app.v51 import inspect_extended
 from app.v53 import app
-
 
 logger = logging.getLogger("uvicorn.error")
 CACHE_DIR = DATA_DIR / "preview-cache"

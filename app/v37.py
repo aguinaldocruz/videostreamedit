@@ -10,7 +10,6 @@ from app.v5 import external_subtitles
 from app.v11 import connection, plex_authorized_file
 from app.v35 import app
 
-
 logger = logging.getLogger("videostreamedit")
 
 
@@ -26,6 +25,8 @@ def renamed_subtitle_path(source: Path, target: Path, subtitle: Path) -> Path:
 
 @app.post("/api/v37/media/rename")
 def rename_media(request: MediaRenameRequest) -> dict:
+    from app.v86 import assert_media_editable
+    assert_media_editable(request.path)
     source = plex_authorized_file(request.path)
     with connection() as db:
         catalog = db.execute("SELECT library_key,rating_key FROM plex_media WHERE path=?", (str(source),)).fetchone()

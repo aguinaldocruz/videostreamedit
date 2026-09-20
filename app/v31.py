@@ -11,7 +11,6 @@ from app.v2 import is_blocked, resolve_existing
 from app.v11 import connection
 from app.v30 import app
 
-
 base_movie_destinations = v30_module.all_movie_destinations
 
 

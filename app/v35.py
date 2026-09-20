@@ -5,7 +5,6 @@ import logging
 from app.v2 import connection
 from app.v34 import app
 
-
 logger = logging.getLogger("videostreamedit")
 
 

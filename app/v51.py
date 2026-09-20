@@ -15,17 +15,16 @@ from pydantic import BaseModel
 import app.v38 as movie_index
 from app.v2 import probe
 from app.v5 import checked_external, external_subtitles
-from app.v11 import connection, column_exists
+from app.v11 import column_exists, connection
 from app.v28 import authorized_import_file
 from app.v50 import app
-
 
 logger = logging.getLogger("uvicorn.error")
 TEXT_SUBTITLE_CODECS = {"subrip", "srt", "ass", "ssa", "webvtt", "mov_text", "text"}
 # Broad tag matcher is retained for cleanup; reports use the stricter
 # presentation-tag matcher so angle-bracket text is not misclassified.
 HTML_TAG = re.compile(r"<\s*/?\s*[a-zA-Z][^>]*>")
-HTML_PRESENTATION_TAG = re.compile(r"<\s*/?\s*(?:i|b|u|s|em|strong|font|span|br|div|p|ruby|rt|rb|c|q|small|big|sub|sup|a|nobr)(?:\s+[^>]*)?\s*/?>", re.I)
+HTML_PRESENTATION_TAG = re.compile(r"<\s*/?\s*(?:i|b|u|s|em|strong|font|span|br|div|p|ruby|rt|rb|c|q|small|big|sub|sup|a|nobr)(?:\s+[^>]*)?\s*/?>", re.IGNORECASE)
 ASS_TAG = re.compile(r"\{\\[^}]+}")
 
 
@@ -118,7 +117,7 @@ def damage_kind(text: str) -> str:
     # Do not classify a subtitle merely because its language is outside the
     # configured detector. Only flag substantial payloads with almost no
     # Unicode letters at all, which is characteristic of broken OCR/decoding.
-    payload = re.sub(r"^\s*\d+\s*$|^\s*\d{1,2}:\d{2}:\d{2}[,.]\d{1,3}\s+-->.*$", " ", text, flags=re.M)
+    payload = re.sub(r"^\s*\d+\s*$|^\s*\d{1,2}:\d{2}:\d{2}[,.]\d{1,3}\s+-->.*$", " ", text, flags=re.MULTILINE)
     printable = "".join(char for char in payload if char.isprintable() and not char.isspace())
     letters = sum(char.isalpha() for char in printable)
     if len(printable) >= 40 and letters < max(4, len(printable) // 12) and not re.search(r"[♪♫]", payload):
@@ -316,6 +315,8 @@ def clean_embedded(media: Path, type_index: int, operation_id: str | None = None
 
 @app.post("/api/v51/subtitle-cleanup")
 def apply_subtitle_cleanup(request: SubtitleCleanup, operation_id: str | None = None) -> dict:
+    from app.v86 import assert_media_editable
+    assert_media_editable(request.path)
     media = authorized_import_file(request.path)
     if request.external_path:
         subtitle = checked_external(media, request.external_path)
@@ -324,9 +325,11 @@ def apply_subtitle_cleanup(request: SubtitleCleanup, operation_id: str | None = 
     else:
         clean_embedded(media, request.type_index if request.type_index is not None else -1, operation_id)
         target = f"subtitle:{request.type_index}"
+    # Legacy movie stream projection tables were removed in the canonical
+    # index migration.  Invalidate only the current subtitle index; the task
+    # workflow queues the dependent stages after this function returns.
     with connection() as db:
-        db.execute("DELETE FROM movie_stream_index WHERE path=?", (str(media),))
-        db.execute("DELETE FROM movie_stream_index_value WHERE path=?", (str(media),))
         db.execute("DELETE FROM subtitle_extended_index WHERE path=?", (str(media),))
+        db.execute("DELETE FROM subtitle_extended_media WHERE path=?", (str(media),))
     logger.info("change=subtitle_html_removed file=%s target=%s", str(media).replace("\n", "\\n"), target.replace("\n", "\\n"))
     return {"changed": True, "path": str(media)}

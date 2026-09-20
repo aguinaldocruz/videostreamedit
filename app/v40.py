@@ -9,7 +9,6 @@ import app.v28 as movie_import
 from app.v11 import connection
 from app.v39 import app
 
-
 logger = logging.getLogger("videostreamedit")
 
 
@@ -85,10 +84,9 @@ def record_track_name_corrections(request: media_editor.ReorderEditRequest, befo
 
 @app.post("/api/v40/media/edit")
 def edit_and_learn_track_names(request: media_editor.ReorderEditRequest) -> dict:
-    before = existing_track_names(request)
-    result = media_editor.reorder_edit(request)
-    record_track_name_corrections(request, before)
-    return result
+    """Compatibility URL backed by the canonical editor and learning hook."""
+    from app.v43 import optimized_media_edit
+    return optimized_media_edit(request)
 
 
 movie_import.reorder_edit = edit_and_learn_track_names

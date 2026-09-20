@@ -13,7 +13,6 @@ from app.v5 import canonical_language, external_subtitles, split_tag
 from app.v11 import connection
 from app.v37 import app
 
-
 logger = logging.getLogger("videostreamedit")
 _index_lock = threading.Lock()
 _index_state = {"running": False, "total": 0, "completed": 0, "errors": 0}
@@ -47,15 +46,19 @@ def initialize_movie_stream_filter_index() -> None:
 
 
 def _pending_movies() -> list[dict]:
+    """Return stale movies from the canonical stream-index state table.
+
+    Older filter endpoints still call this compatibility helper, but the old
+    movie projection tables were intentionally retired.  Keep the status path
+    read-only and canonical so it cannot recreate or query removed tables.
+    """
     with connection() as db:
-        db.execute("DELETE FROM movie_stream_index_value WHERE path NOT IN (SELECT path FROM plex_media WHERE kind='movie')")
-        db.execute("DELETE FROM movie_stream_index WHERE path NOT IN (SELECT path FROM plex_media WHERE kind='movie')")
         rows = db.execute("""
             SELECT media.path, media.modified, media.size
               FROM plex_media AS media
-              LEFT JOIN movie_stream_index AS cached ON cached.path = media.path
+              LEFT JOIN media_stream_index_state AS cached ON cached.path = media.path
              WHERE media.kind='movie'
-               AND (cached.path IS NULL OR cached.modified != media.modified OR cached.size != media.size)
+               AND (cached.path IS NULL OR cached.modified_ns != (media.modified * 1000000000) OR cached.size != media.size)
              ORDER BY media.title COLLATE NOCASE, media.path
         """).fetchall()
     return [dict(row) for row in rows]

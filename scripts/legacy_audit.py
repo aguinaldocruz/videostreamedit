@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Find static assets with no repository-wide filename reference."""
 from __future__ import annotations
+
 import argparse
 from pathlib import Path
 

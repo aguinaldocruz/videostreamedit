@@ -9,10 +9,9 @@ from pydantic import BaseModel, Field
 
 import app.v65 as tasks
 from app.v5 import canonical_language, split_tag
+from app.v7 import probe
 from app.v11 import connection
 from app.v76 import app
-from app.v7 import probe
-
 
 logger = logging.getLogger("videostreamedit")
 

@@ -112,19 +112,21 @@ function applyLastChange(saved) {
   if (!compatibleCloneState(saved.before, cloneStreamState())) { updateCloneButton(); return; }
   const currentRows = [...document.querySelectorAll('#stream-content .stream-row')];
   const rowById = new Map(cloneStreamState().rows.map((item, index) => [item.id, currentRows[index]]));
+  const beforeById = new Map(saved.before.rows.map(item => [item.id, item]));
   saved.after.rows.forEach(item => {
     const row = rowById.get(item.id);
+    const before = beforeById.get(item.id) || {};
     for (const field of ['language', 'region', 'title']) {
+      if (before[field] === item[field]) continue;
       const input = row.querySelector(`[name=${field}]`);
       input.value = item[field];
       input.dataset.dirty = 'true';
       input.dispatchEvent(new Event('input', {bubbles: true}));
     }
     const embed = row.querySelector('[name=embed]');
-    if (embed) { embed.checked = item.embed; embed.dispatchEvent(new Event('change', {bubbles: true})); }
+    if (embed && before.embed !== item.embed) { embed.checked = item.embed; embed.dispatchEvent(new Event('change', {bubbles: true})); }
     const remove = row.querySelector('[name=remove]');
-    remove.checked = item.removed;
-    remove.dispatchEvent(new Event('change', {bubbles: true}));
+    if (before.removed !== item.removed) { remove.checked = item.removed; remove.dispatchEvent(new Event('change', {bubbles: true})); }
   });
   for (const type of ['audio', 'subtitle']) {
     const desired = saved.after.order[type].map(id => rowById.get(id));
@@ -159,8 +161,11 @@ $('#stream-form').addEventListener('submit', () => {
   pendingLastChange = changes.length ? {before, after, changes, savedAt: new Date().toISOString()} : null;
 }, true);
 
-document.addEventListener('media-properties-applied', () => {
-  if (pendingLastChange) localStorage.setItem(LAST_CHANGE_KEY, JSON.stringify(pendingLastChange));
+document.addEventListener('media-properties-applied', event => {
+  if (pendingLastChange) {
+    localStorage.setItem(LAST_CHANGE_KEY, JSON.stringify(pendingLastChange));
+    if (event.detail) event.detail.template = pendingLastChange;
+  }
   pendingLastChange = null;
   updateCloneButton();
 });

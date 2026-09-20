@@ -12,7 +12,6 @@ import json
 import sqlite3
 from pathlib import Path
 
-
 TABLES = (
     "plex_config",
     "plex_libraries",

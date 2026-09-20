@@ -1,10 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
 import subprocess
-import hashlib
 from pathlib import Path
 from typing import Literal
 
@@ -12,11 +12,18 @@ from fastapi import HTTPException, Request
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
-from app.v11 import connection, paged_metadata, plex_authorized_file, plex_movies, plex_tv, sync_plex
 from app.v2 import probe
-from app.v5 import external_subtitles, canonical_language
+from app.v5 import canonical_language, external_subtitles
+from app.v11 import (
+    connection,
+    paged_metadata,
+    plex_authorized_file,
+    plex_movies,
+    plex_tv,
+    sync_plex,
+)
 from app.v16 import STATIC_DIR, app, asset
-
+from app.preflight_dispatcher import enqueue_bulk_preflight, register_approval_handler, register_handler
 
 logger = logging.getLogger("videostreamedit")
 from app.subtitle_detector_config import SUBTITLE_DETECTOR_VERSION
@@ -64,7 +71,7 @@ def _subtitle_metrics(text: str, duration: float) -> dict:
         payload = " ".join(line for line in lines if "-->" not in line and not line.isdigit())
         payload = re.sub(r"<[^>]+>", " ", payload).strip()
         characters += len(payload)
-        if re.search(r"[\[\(].{1,80}[\]\)]|♪|♫|\b(?:[A-Z][A-Z .'-]{2,}|signs?|speaks? foreign)\b", payload, re.I):
+        if re.search(r"[\[\(].{1,80}[\]\)]|♪|♫|\b(?:[A-Z][A-Z .'-]{2,}|signs?|speaks? foreign)\b", payload, re.IGNORECASE):
             marker_cues += 1
     minutes = max(duration / 60.0, 1.0)
     density = cues / minutes
@@ -93,9 +100,18 @@ def _extract_subtitle_text(media: Path, index: int, codec: str) -> str:
 @app.post("/api/v19/stream/evaluate-forced")
 def evaluate_forced_subtitles(request: ForcedEvaluationRequest) -> dict:
     from app.v51 import damage_kind
-    from app.v79 import analyze_sdh, calibrate_subtitle_confidence, common_detection_languages, detect_common_variant, normalized_evidence_sample, subtitle_quality_issue
+    from app.v79 import (
+        analyze_sdh,
+        calibrate_subtitle_confidence,
+        common_detection_languages,
+        detect_common_variant,
+        normalized_evidence_sample,
+        subtitle_quality_issue,
+    )
 
     media = plex_authorized_file(request.path)
+    from app.v86 import assert_media_editable
+    assert_media_editable(str(media))
     info = probe(media)
     duration = float((info.get("format") or {}).get("duration") or 0)
     subtitles = []
@@ -492,8 +508,19 @@ def image_subtitle_report(kind: str) -> dict:
             "ORDER BY path,type_index,external_path",
             IMAGE_SUBTITLE_CODECS,
         ).fetchall()
+    active_paths = set()
+    with connection() as db:
+        active = db.execute("SELECT payload_json FROM preflight_requests WHERE operation_type=? AND status IN ('pending','running')", ("image_subtitle_convert_bulk",)).fetchall()
+    for active_row in active:
+        try:
+            active_payload = json.loads(active_row["payload_json"] or "{}")
+            active_paths.update(str(item.get("path") or "") for item in active_payload.get("_bulk_items", []))
+        except (TypeError, json.JSONDecodeError):
+            continue
     refs_by_path = {}
     for row in rows:
+        if str(row["path"]) in active_paths:
+            continue
         refs_by_path.setdefault(str(row["path"]), []).append(dict(row))
     by_path = {path: len(refs) for path, refs in refs_by_path.items()}
     if kind == "movies":
@@ -549,8 +576,10 @@ def html_subtitle_report(kind: str) -> dict:
             "SELECT path,source,type_index,external_path,codec FROM subtitle_extended_index "
             "WHERE markup LIKE ? AND lower(codec) IN (" + placeholders + ") "
             "AND path NOT IN (SELECT CAST(payload_json AS JSONB)->>'path' FROM task_queue "
-            "WHERE task_type IN ('subtitle_html_preflight','subtitle_html_cleanup') "
+            "WHERE task_type IN ('subtitle_html_cleanup') "
             "AND status IN ('pending','running')) "
+            "AND path NOT IN (SELECT media_path FROM preflight_requests "
+            "WHERE operation_type='subtitle_html_cleanup' AND status IN ('pending','running')) "
             "AND path NOT IN (SELECT path FROM index_task_queue WHERE job='subtitles' "
             "AND status IN ('pending','running')) "
             "ORDER BY path,type_index,external_path",
@@ -664,6 +693,8 @@ def queue_report_subtitle_action(request: ReportSubtitleActionRequest) -> dict:
     queued = 0
     errors = []
     seen = set()
+    html_items = []
+    image_items = []
     for raw in request.streams:
         path = str(raw.get("path") or "").strip()
         if not path:
@@ -677,19 +708,25 @@ def queue_report_subtitle_action(request: ReportSubtitleActionRequest) -> dict:
         seen.add(key)
         if request.action == "html_cleanup":
             payload = {"path": path, "type_index": type_index if source != "external" else None, "external_path": external_path or None}
-            task_queue.enqueue("subtitle_html_preflight", payload, "Preflight HTML cleanup from report match", deduplicate=True)
-            queued += 1
+            html_items.append(payload)
             continue
         language = str(raw.get("language") or "").strip()
-        if not language or language.casefold() in {"und", "unknown", "zxx"}:
-            errors.append(f"{Path(path).name}: image subtitle language is not set")
-            continue
-        payload = {"path": path, "type_index": type_index, "external_path": external_path or None, "language": language, "region": str(raw.get("region") or "")}
-        task_queue.enqueue("image_subtitle_convert", payload, "Convert image subtitle to SRT", deduplicate=True)
-        queued += 1
+        payload = {"path": path, "source": source, "type_index": type_index, "external_path": external_path or None, "language": language, "region": str(raw.get("region") or "")}
+        image_items.append(payload)
+    preflight = None
+    preflight_ids = []
+    if html_items:
+        preflight = enqueue_bulk_preflight("subtitle_html_cleanup", html_items, mode="queued", priority=70, deduplicate=True)
+        preflight_ids.append(preflight.get("id"))
+        queued += len(html_items)
+    if image_items:
+        image_preflight = enqueue_bulk_preflight("image_subtitle_convert_bulk", image_items, mode="queued", priority=35, deduplicate=True)
+        preflight_ids.append(image_preflight.get("id"))
+        preflight = preflight or image_preflight
+        queued += len(image_items)
     if queued:
-        logger.info("task_queue event=report_subtitle_action action=%s queued=%d errors=%d", request.action, queued, len(errors))
-    return {"queued": queued, "errors": errors}
+        logger.info("task_queue event=report_subtitle_action action=%s queued=%d errors=%d preflight=%s", request.action, queued, len(errors), preflight.get("id") if preflight else None)
+    return {"queued": queued, "errors": errors, "preflight_id": preflight.get("id") if preflight else None, "preflight_ids": [value for value in preflight_ids if value]}
 
 
 @app.get("/api/v19/reports/portuguese-language")
@@ -788,6 +825,43 @@ class LanguageDetectionFixRequest(BaseModel):
     kind: Literal["tv", "movies"]
 
 
+def preflight_language_fix(payload: dict, fingerprint: dict) -> dict:
+    path = str(payload.get("path") or "")
+    if not fingerprint.get("exists"):
+        return {"decision": "invalid", "reason": "Media file is not accessible", "path": path}
+    requested = list(payload.get("tracks") or [])
+    approved_tracks = []
+    with connection() as db:
+        for track in requested:
+            try:
+                index = int(track.get("type_index", -1))
+            except (TypeError, ValueError):
+                continue
+            row = db.execute("SELECT d.detected_language,d.confidence,s.language,s.region FROM portuguese_language_detection d LEFT JOIN media_stream_index s ON s.path=d.path AND s.source='embedded' AND s.type_index=d.type_index WHERE d.path=? AND d.source='embedded' AND d.type_index=?", (path, index)).fetchone()
+            pair = _detected_language_pair(row["detected_language"] if row else "") if row else None
+            if not row or not pair or float(row["confidence"] or 0) < 0.80:
+                continue
+            if str(row["language"] or "").casefold() == pair[0].casefold() and str(row["region"] or "").casefold() == pair[1].casefold():
+                continue
+            approved_tracks.append({"codec_type": "subtitle", "type_index": index, "language": pair[0], "region": pair[1]})
+    if not approved_tracks:
+        return {"decision": "skipped", "reason": "No high-confidence language mismatch remains", "path": path}
+    return {"decision": "approved", "path": path, "tracks": approved_tracks, "fingerprint": fingerprint}
+
+def approve_language_fix_bulk(payload: dict, result: dict) -> dict:
+    from app import v65 as tasks
+    child_ids = []
+    for item in payload.get("_bulk_items", []):
+        plan = item.get("_preflight_result") or {}
+        tracks = plan.get("tracks") or item.get("tracks") or []
+        if not tracks:
+            continue
+        edit = {"path": str(item.get("path") or ""), "tracks": tracks}
+        child = tasks.enqueue("media_edit", {"edit": edit, "reindex_indexes": ["core", "subtitles"]}, "Fix detected subtitle languages (above 80%)", deduplicate=True)
+        if child and child.get("id") is not None:
+            child_ids.append(int(child["id"]))
+    return {"task_ids": child_ids, "queued": len(child_ids), "task_type": "media_edit"}
+
 def _detected_language_pair(value: str) -> tuple[str, str] | None:
     key = str(value or "").strip().casefold().replace("_", "-")
     if key in {"pt-br", "pob", "por-br"}: return "pt", "BR"
@@ -796,12 +870,13 @@ def _detected_language_pair(value: str) -> tuple[str, str] | None:
     return None
 
 
+register_handler("language_detection_fix_bulk", preflight_language_fix)
+register_approval_handler("language_detection_fix_bulk", approve_language_fix_bulk)
+
 @app.post("/api/v19/reports/portuguese-language/fix")
 def fix_portuguese_language_report(request: LanguageDetectionFixRequest) -> dict:
-    # Build one queued media_edit per file, grouping all embedded subtitle
-    # streams above 80% certainty so each file is processed only once.
     with connection() as db:
-        rows = db.execute("""SELECT d.path,d.source,d.type_index,d.detected_language,d.confidence,p.kind
+        rows = db.execute("""SELECT d.path,d.type_index,d.detected_language,d.confidence,p.kind
             FROM portuguese_language_detection d JOIN plex_media p ON p.path=d.path
             WHERE d.confidence>=0.80 AND d.source='embedded'
               AND ((?='movies' AND p.kind='movie') OR (?='tv' AND p.kind='episode'))
@@ -809,20 +884,15 @@ def fix_portuguese_language_report(request: LanguageDetectionFixRequest) -> dict
     grouped: dict[str, list[dict]] = {}
     skipped = 0
     for row in rows:
-        pair = _detected_language_pair(row["detected_language"])
-        if not pair:
+        if not _detected_language_pair(row["detected_language"]):
             skipped += 1
             continue
-        grouped.setdefault(str(row["path"]), []).append({"codec_type": "subtitle", "type_index": int(row["type_index"]), "language": pair[0], "region": pair[1]})
-    from app import v65 as task_queue
-    queued = 0
-    task_ids = []
-    for path, tracks in grouped.items():
-        task = task_queue.enqueue("media_edit", {"edit": {"path": path, "tracks": tracks}, "reindex_indexes": ["core", "subtitles"]}, "Fix detected subtitle languages (above 80%)", deduplicate=True)
-        task_ids.append(task["id"]); queued += len(tracks)
-    logger.info("task_queue event=language_detection_fix kind=%s media=%d streams=%d skipped=%d", request.kind, len(task_ids), queued, skipped)
-    return {"queued_media": len(task_ids), "queued_streams": queued, "skipped": skipped, "task_ids": task_ids}
-
+        grouped.setdefault(str(row["path"]), []).append({"type_index": int(row["type_index"]), "detected_language": str(row["detected_language"] or "")})
+    items = [{"path": path, "tracks": tracks} for path, tracks in grouped.items()]
+    preflight = enqueue_bulk_preflight("language_detection_fix_bulk", items, mode="queued", priority=60, deduplicate=True) if items else None
+    queued_streams = sum(len(item["tracks"]) for item in items)
+    logger.info("preflight event=language_detection_fix kind=%s media=%d streams=%d skipped=%d id=%s", request.kind, len(items), queued_streams, skipped, preflight.get("id") if preflight else None)
+    return {"queued_media": len(items), "queued_streams": queued_streams, "skipped": skipped, "task_ids": [], "preflight_id": preflight.get("id") if preflight else None}
 
 
 
@@ -944,6 +1014,103 @@ def forced_stream_report(kind: str) -> dict:
                 items.append({"title": str(show["name"]), "root_name": str(show.get("root_name") or ""), "media_count": len(episodes), "forced_count": sum(e["forced_count"] for e in episodes), "episodes": episodes})
     items.sort(key=lambda item: item["title"].casefold())
     return {"kind": kind, "items": items, "title_count": len(items), "media_count": sum(item["media_count"] for item in items)}
+
+
+def _configured_common_languages() -> list[str]:
+    with connection() as db:
+        row = db.execute("SELECT value FROM language_detection_settings WHERE key=\'common_languages\'").fetchone()
+    try:
+        values = json.loads(row["value"]) if row else ["pt", "pt-BR", "en"]
+    except (TypeError, ValueError, json.JSONDecodeError):
+        values = ["pt", "pt-BR", "en"]
+    return [str(value).strip() for value in values if str(value).strip()]
+
+
+def _uncommon_language_rows() -> tuple[dict[str, list[dict]], set[str], set[str]]:
+    """Return indexed streams outside configured common-language bases."""
+    configured = _configured_common_languages()
+    bases = {str(value).strip().casefold().replace("_", "-").split("-", 1)[0] for value in configured if str(value).strip()}
+    with connection() as db:
+        rows = db.execute("""SELECT path,source,stream_type,type_index,external_path,codec,
+            language,region,track_name,filename_tags FROM media_stream_index
+            WHERE stream_type IN ('audio','subtitle','external')
+            AND path NOT IN (SELECT path FROM index_task_queue WHERE status IN ('pending','running'))
+            ORDER BY path,stream_type,type_index""").fetchall()
+    result: dict[str, list[dict]] = {}
+    for row in rows:
+        value = dict(row)
+        language = str(value.get("language") or "").strip()
+        normalized = language.casefold().replace("_", "-")
+        base = normalized.split("-", 1)[0]
+        if not normalized or normalized == "und" or base in bases:
+            continue
+        try:
+            value["filename_tags"] = json.loads(value.get("filename_tags") or "[]")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            value["filename_tags"] = []
+        value["stream_type"] = "subtitle" if value.get("stream_type") == "external" else value.get("stream_type")
+        value["language"] = language
+        result.setdefault(str(value["path"]), []).append(value)
+    return result, bases, set(configured)
+
+
+@app.get("/api/v19/reports/uncommon-languages")
+def uncommon_language_report(kind: str) -> dict:
+    if kind not in {"tv", "movies"}:
+        raise HTTPException(400, "Kind must be tv or movies")
+    by_path, _bases, configured = _uncommon_language_rows()
+    def qualifies(rows: list[dict]) -> bool:
+        audio = {str(row["language"]).casefold() for row in rows if row["stream_type"] == "audio"}
+        subtitle = {str(row["language"]).casefold() for row in rows if row["stream_type"] == "subtitle"}
+        return len(audio) > 2 or len(subtitle) > 2
+    if kind == "movies":
+        items = []
+        for movie in plex_movies():
+            path = str(movie["path"]); rows = by_path.get(path, [])
+            if rows and qualifies(rows):
+                items.append({"title": Path(str(movie.get("name") or path)).stem, "path": path,
+                              "root_name": movie.get("root_name") or "", "streams": rows})
+    else:
+        items = []
+        for show in plex_tv():
+            episodes = []
+            for season in show["seasons"]:
+                for episode in season["episodes"]:
+                    path = str(episode["path"]); rows = by_path.get(path, [])
+                    if rows and qualifies(rows):
+                        episodes.append({"episode": episode.get("name") or Path(path).stem, "path": path, "streams": rows})
+            if episodes:
+                items.append({"title": str(show["name"]), "root_name": str(show.get("root_name") or ""),
+                              "media_count": len(episodes), "episodes": episodes})
+    items.sort(key=lambda item: item["title"].casefold())
+    return {"kind": kind, "configured_languages": sorted(configured, key=str.casefold),
+            "items": items, "title_count": len(items),
+            "media_count": sum(item.get("media_count", 1) for item in items)}
+
+
+class UncommonLanguageRemoval(BaseModel):
+    kind: Literal["tv", "movies"]
+    paths: list[str] = Field(min_length=1, max_length=30000)
+    languages: list[str] = Field(min_length=1, max_length=200)
+    stream_types: list[Literal["audio", "subtitle", "external"]] = Field(min_length=1)
+    mode: Literal["now", "queue"] = "queue"
+
+
+@app.post("/api/v19/reports/uncommon-languages/remove")
+def remove_uncommon_languages(request: UncommonLanguageRemoval) -> dict:
+    """Use the normal preflight/edit pipeline for report removals."""
+    filters = {"presence": "have", "stream_type": None, "stream_types": request.stream_types,
+               "language": None, "languages": list(dict.fromkeys(request.languages)),
+               "region": None, "language_regions": None, "track_name": None, "filename_tag": None}
+    payload = {"paths": list(dict.fromkeys(request.paths)), "filters": filters,
+               "changed_fields": ["remove"], "language": "", "region": "", "track_name": "",
+               "integrate": False, "remove": True, "default_action": "unchanged",
+               "forced_action": "unchanged", "mode": request.mode}
+    if request.kind == "tv":
+        from app.v79 import SeasonStreamBulkEdit, season_stream_bulk_edit
+        return season_stream_bulk_edit(SeasonStreamBulkEdit.model_validate(payload))
+    from app.v82 import MovieStreamBulkEdit, movie_stream_bulk_edit
+    return movie_stream_bulk_edit(MovieStreamBulkEdit.model_validate(payload))
 
 
 @app.middleware("http")

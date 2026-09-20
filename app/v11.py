@@ -3,10 +3,10 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
-import time
 from pathlib import Path
 
 from fastapi import HTTPException, Request
@@ -15,9 +15,9 @@ from pydantic import BaseModel
 
 import app.v5 as v5_module
 import app.v7 as v7_module
+from app.plex_secret import decrypt_token, encrypt_token
 from app.v2 import connection, resolve_existing
 from app.v8 import STATIC_DIR, app, asset
-from app.plex_secret import decrypt_token, encrypt_token
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -180,7 +180,7 @@ def get_plex_config() -> dict:
     with connection() as db:
         libraries = [dict(item) for item in db.execute("SELECT library_key AS key, title, kind, selected FROM plex_libraries ORDER BY kind, title COLLATE NOCASE")]
         count = db.execute("SELECT COUNT(*) FROM plex_media").fetchone()[0]
-    return {"url": row["url"] if row else "", "has_token": bool(row and row["token"]), "server_name": row["server_name"] if row else "", "auth_method": row["auth_method"] if row and "auth_method" in row.keys() else "manual", "last_sync": row["last_sync"] if row else None, "libraries": libraries, "media_count": count}
+    return {"url": row["url"] if row else "", "has_token": bool(row and row["token"]), "server_name": row["server_name"] if row else "", "auth_method": row["auth_method"] if row and "auth_method" in row else "manual", "last_sync": row["last_sync"] if row else None, "libraries": libraries, "media_count": count}
 
 
 @app.post("/api/v11/plex/config")
@@ -224,10 +224,10 @@ def clear_reviewed_for_sync_records(records: list[tuple]) -> int:
     with connection() as db:
         for record in records:
             entity_type, entity_key = ("movie", str(record[0])) if record[1] == "movie" else ("tv", f"{record[3]}:{record[6] or 'Unknown show'}")
-            row = db.execute("SELECT reviewed,note FROM media_notes WHERE entity_type=? AND entity_key=?", (entity_type, entity_key)).fetchone()
-            if not row or not row["reviewed"]:
+            row = db.execute("SELECT reviewed,note,final_version FROM media_notes WHERE entity_type=? AND entity_key=?", (entity_type, entity_key)).fetchone()
+            if not row or (not row["reviewed"] and not row["final_version"]):
                 continue
-            db.execute("UPDATE media_notes SET plex_sync_change=1,updated_at=CURRENT_TIMESTAMP WHERE entity_type=? AND entity_key=?", (entity_type, entity_key))
+            db.execute("UPDATE media_notes SET plex_sync_change=1,final_version=0,updated_at=CURRENT_TIMESTAMP WHERE entity_type=? AND entity_key=?", (entity_type, entity_key))
             cleared += 1
     return cleared
 

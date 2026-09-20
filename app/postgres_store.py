@@ -8,12 +8,11 @@ contract without mutating the existing database during development.
 from __future__ import annotations
 
 import os
+from collections.abc import Iterator
 from contextlib import contextmanager
-from typing import Iterator
 
 import psycopg
 from psycopg.rows import dict_row
-
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 
@@ -185,11 +184,23 @@ def _workflow_id(group_id: str) -> uuid.UUID:
         return uuid.uuid5(uuid.NAMESPACE_URL, f"videostreamedit:group:{group_id}")
 
 
+def _lock_workflow_mutation(db) -> None:
+    """Serialize tiny workflow metadata transactions across queue workers.
+
+    Stage registration inserts a group and then a stage while stage completion
+    updates the stage and its group. PostgreSQL FK checks can otherwise take
+    those relation locks in opposite order when an enqueue races completion,
+    producing a deadlock even though media processing itself is independent.
+    """
+    db.execute("SELECT pg_advisory_xact_lock(hashtext('videostreamedit:workflow-mutation-v2'))")
+
+
 def register_task_stage(group_id: str | None, task_type: str, path: str, payload: dict, task_id: int | None = None) -> None:
     if not group_id or not DATABASE_URL:
         return
     workflow_id = _workflow_id(group_id)
     with connection() as db:
+        _lock_workflow_mutation(db)
         db.execute(
             """INSERT INTO workflow_groups(group_id, kind, resource_key, status, definition, input_signature)
                VALUES (%s, %s, %s, 'pending', %s::jsonb, %s::jsonb)
@@ -211,6 +222,47 @@ def begin_task_stage(group_id: str | None, task_type: str, path: str, task_id: i
     workflow_id = _workflow_id(group_id)
     resource = path or f"task:{workflow_id}"
     with connection() as db:
+        _lock_workflow_mutation(db)
+        # Reconcile pending stages with their exact queue task and group.
+        # Cancelled/deleted/recovered tasks must not leave an orphaned
+        # predecessor blocking the rest of a workflow forever.
+        db.execute(
+            """UPDATE workflow_stages stage
+               SET status=CASE task.status
+                              WHEN 'succeeded' THEN 'succeeded'
+                              WHEN 'cancelled' THEN 'cancelled'
+                              WHEN 'failed' THEN 'failed'
+                              ELSE stage.status
+                          END,
+                   error=CASE WHEN task.status IN ('failed','cancelled')
+                              THEN COALESCE(task.error, 'Queue task was not completed')
+                              ELSE stage.error END,
+                   finished_at=CASE WHEN task.status IN ('succeeded','failed','cancelled')
+                                    THEN COALESCE(stage.finished_at, now())
+                                    ELSE stage.finished_at END,
+                   updated_at=now()
+               FROM task_queue task
+               WHERE stage.group_id=%s
+                 AND stage.status='pending'
+                 AND task.id::text=stage.payload->>'task_id'
+                 AND task.group_id=%s
+                 AND task.status IN ('succeeded','failed','cancelled')""",
+            (workflow_id, group_id),
+        )
+        db.execute(
+            """UPDATE workflow_stages stage
+               SET status='cancelled',
+                   error=COALESCE(stage.error, 'Orphaned workflow stage: queue task is missing from this group'),
+                   finished_at=COALESCE(stage.finished_at, now()), updated_at=now()
+               WHERE stage.group_id=%s AND stage.status='pending'
+                 AND stage.payload->>'task_id' IS NOT NULL
+                 AND NOT EXISTS (
+                     SELECT 1 FROM task_queue task
+                      WHERE task.id::text=stage.payload->>'task_id'
+                        AND task.group_id=%s
+                 )""",
+            (workflow_id, group_id),
+        )
         stage = db.execute(
             """SELECT stage_id FROM workflow_stages current
                WHERE current.group_id=%s AND current.task_type=%s AND current.status='pending'
@@ -250,6 +302,7 @@ def finish_task_stage(group_id: str | None, task_type: str, path: str, result: d
     workflow_id = _workflow_id(group_id)
     resource = path or f"task:{workflow_id}"
     with connection() as db:
+        _lock_workflow_mutation(db)
         stage = db.execute("SELECT stage_id FROM workflow_stages WHERE group_id=%s AND task_type=%s AND status='running' AND payload->>'task_id'=%s ORDER BY stage_number LIMIT 1", (workflow_id, task_type, str(task_id))).fetchone()
         if not stage:
             return
@@ -265,6 +318,7 @@ def fail_task_stage(group_id: str | None, task_type: str, path: str, error: str,
     workflow_id = _workflow_id(group_id)
     resource = path or f"task:{workflow_id}"
     with connection() as db:
+        _lock_workflow_mutation(db)
         stage = db.execute("SELECT stage_id FROM workflow_stages WHERE group_id=%s AND task_type=%s AND status='running' AND payload->>'task_id'=%s ORDER BY stage_number LIMIT 1", (workflow_id, task_type, str(task_id))).fetchone()
         if not stage:
             return
@@ -279,6 +333,7 @@ def reset_task_stage_for_retry(group_id: str | None, task_id: int | None = None)
         return
     workflow_id = _workflow_id(group_id)
     with connection() as db:
+        _lock_workflow_mutation(db)
         db.execute(
             """UPDATE workflow_stages
                SET status='pending', error=NULL, started_at=NULL, finished_at=NULL, updated_at=now()

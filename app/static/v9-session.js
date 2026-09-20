@@ -41,7 +41,11 @@ function updateQueuedChangeLabels(){
 }
 
 function captureEditorBaseline(){
-  editorBaseline=editorSnapshot();const content=$('#stream-content');
+  const content=$('#stream-content');
+  // Loading a fresh media snapshot must never inherit dirty markers from a
+  // previous editor instance or a report-originated navigation.
+  content.querySelectorAll('[data-dirty]').forEach(input=>{delete input.dataset.dirty});
+  editorBaseline=editorSnapshot();
   content.addEventListener('input',updateQueuedChangeLabels);content.addEventListener('change',updateQueuedChangeLabels);content.addEventListener('click',updateQueuedChangeLabels);
   if(editorObserver)editorObserver.disconnect();editorObserver=new MutationObserver(updateQueuedChangeLabels);editorObserver.observe(content,{childList:true});
   updateQueuedChangeLabels();
@@ -72,6 +76,13 @@ $('#stream-form').onsubmit=async function(e){
     if(streamQueued){setApplyProgress(2,4,"Updating media container",queuedChangeSummary());result=await api("/api/v7/media/edit",{method:"POST",body:JSON.stringify({path,tracks,external_subtitles:external,order,default_audio:defaults.audio,forced_audio:forced.audio,default_subtitle:defaults.subtitle,forced_subtitle:forced.subtitle,remove})})};setApplyProgress(3,4,"Updating indexes","Queueing refreshed stream and media indexes");await api("/api/v80/index/request",{method:"POST",body:JSON.stringify({path,indexes:result.operation==="single_remux"?["core","subtitles","previews"]:["core"],reason:"Clone last change completed"})})
     if(renameQueued){setApplyProgress(3,4,"Renaming media",filename);const renamed=await api("/api/v37/media/rename",{method:"POST",body:JSON.stringify({path,filename})});finalPath=renamed.path;adoptRenamedMediaPath(path,finalPath)}
     if(usedValues.length){setApplyProgress(3,4,"Saving reusable values","Recording successfully used metadata values");await offerSavedValues(usedValues)}
-    setApplyProgress(4,4,"Refreshing properties","Reading updated streams from the media file");toast(result.warnings.length?result.warnings.join(" "):queued+" change"+(queued===1?"":"s")+" applied",result.warnings.length>0);const indexes=result.operation==='single_remux'?['core','subtitles','previews']:result.subtitle_html_cleaned?['core','subtitles','previews']:['core'];await openEditor(finalPath,label);document.dispatchEvent(new CustomEvent("media-properties-applied",{detail:{path:finalPath,indexes}}));applySucceeded=true;
-  }catch(error){applyError=error.message;toast(error.message,true)}finally{if(document.querySelector("#stream-content .stream-row"))updateQueuedChangeLabels();else{button.disabled=false;button.textContent="Apply changes";$("#stream-form .dialog-actions [data-close-stream]").textContent="Close"}applyProgressBusy=false;if(typeof endGlobalBusy==='function')endGlobalBusy();setApplyProgress(4,4,applySucceeded?"Complete":"Could not complete",applySucceeded?queued+" change"+(queued===1?"":"s")+" applied":applyError)}
+    setApplyProgress(4,4,"Refreshing properties","Reading updated streams from the media file");toast(result.warnings.length?result.warnings.join(" "):queued+" change"+(queued===1?"":"s")+" applied",result.warnings.length>0);const indexes=result.operation==='single_remux'?['core','subtitles','previews']:result.subtitle_html_cleaned?['core','subtitles','previews']:['core'];
+    // A successful apply starts a new edit session. Clear the old baseline
+    // before reloading so a report-originated editor cannot reopen its just-
+    // applied values as pending changes.
+    editorBaseline=null;
+    await openEditor(finalPath,label);
+    if(document.querySelector('#stream-content .stream-row')){captureEditorBaseline();updateQueuedChangeLabels()}
+    document.dispatchEvent(new CustomEvent("media-properties-applied",{detail:{path:finalPath,indexes}}));applySucceeded=true;
+  }catch(error){applyError=error.message;pendingLastChange=null;toast(error.message,true)}finally{if(document.querySelector("#stream-content .stream-row"))updateQueuedChangeLabels();else{button.disabled=false;button.textContent="Apply changes";$("#stream-form .dialog-actions [data-close-stream]").textContent="Close"}applyProgressBusy=false;if(typeof endGlobalBusy==='function')endGlobalBusy();setApplyProgress(4,4,applySucceeded?"Complete":"Could not complete",applySucceeded?queued+" change"+(queued===1?"":"s")+" applied":applyError)}
 };

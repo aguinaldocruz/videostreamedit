@@ -6,13 +6,13 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
+from fastapi import HTTPException
+
 import app.v11 as plex
 import app.v65 as tasks
 import app.v68 as plex_sync
-from fastapi import HTTPException
 from app.plex_secret import decrypt_token
 from app.v73 import app  # noqa: F401 - importing this layer registers task handlers
-
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -86,8 +86,7 @@ def process_plex_import_refresh(task_id: int, payload: dict) -> dict:
     records, aliases = plex_sync.rows_for_items(dict(library), [found])
     plex_sync.persist_library(dict(library), records, aliases, int(time.time()), False)
     tasks.update_progress(task_id, 3, 4, "Queueing media indexes")
-    from app.v80 import request_media_indexes
-    from app.v80 import detection_scope_for_operation
+    from app.v80 import detection_scope_for_operation, request_media_indexes
     request_media_indexes(str(target), ["core", "subtitles"], "Plex import discovered", detection_scope=detection_scope_for_operation("media_added_or_changed"))
     tasks.update_progress(task_id, 4, 4, "Plex catalog updated; indexes queued")
     logger.info("plex_sync event=post_import_completed library=%s rating_key=%s file=%s", library_key, str(found.get("ratingKey") or ""), str(target).replace("\n", "\\n"))

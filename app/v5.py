@@ -1,9 +1,6 @@
 from __future__ import annotations
 
-import os
 import re
-import subprocess
-import uuid
 from pathlib import Path
 from typing import Literal
 
@@ -11,7 +8,7 @@ from fastapi import HTTPException, Request
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
-from app.v2 import TYPE_SPECIFIER, app, authorized_file, make_language, probe
+from app.v2 import app, authorized_file, probe
 
 STATIC_DIR = Path(__file__).parent / "static"
 SUBTITLE_EXTENSIONS = {".srt", ".ass", ".ssa", ".vtt", ".sub"}
@@ -188,48 +185,14 @@ def checked_external(media: Path, value: str) -> Path:
 
 @app.post("/api/media/edit-single")
 def edit_single(request: SingleEditRequest) -> dict:
-    source = authorized_file(request.path)
-    original = source.stat()
-    source_probe = probe(source)
-    counts = {kind: sum(1 for stream in source_probe.get("streams", []) if stream.get("codec_type") == kind) for kind in TYPE_SPECIFIER}
-    external = [(item, checked_external(source, item.path)) for item in request.external_subtitles if item.embed]
-    temporary = source.with_name(f".{source.stem}.{uuid.uuid4().hex}.vse{source.suffix}")
-    command = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-i", str(source)]
-    for _, subtitle in external:
-        command += ["-i", str(subtitle)]
-    command += ["-map", "0"]
-    for input_index in range(1, len(external) + 1):
-        command += ["-map", f"{input_index}:0"]
-    command += ["-map_metadata", "0", "-c", "copy"]
-    for update in request.tracks:
-        if update.type_index >= counts[update.codec_type]:
-            continue
-        selector = f'{TYPE_SPECIFIER[update.codec_type]}:{update.type_index}'
-        if update.language is not None or update.region is not None:
-            command += [f"-metadata:s:{selector}", f"language={make_language(update.language, update.region)}"]
-        if update.title is not None:
-            command += [f"-metadata:s:{selector}", f"title={update.title.strip()}"]
-    for index in range(counts["audio"]):
-        command += [f"-disposition:a:{index}", "+forced" if request.forced_audio == index else "-forced"]
-    for index in range(counts["subtitle"]):
-        command += [f"-disposition:s:{index}", "+forced" if request.forced_subtitle == index else "-forced"]
-    for external_index, (item, _) in enumerate(external):
-        output_index = counts["subtitle"] + external_index
-        command += [f"-metadata:s:s:{output_index}", f"language={make_language(item.language, item.region)}", f"-metadata:s:s:{output_index}", f"title={item.title.strip()}", f"-disposition:s:{output_index}", "+forced" if item.forced else "-forced"]
-    command.append(str(temporary))
-    try:
-        subprocess.run(command, capture_output=True, text=True, timeout=3600, check=True)
-        os.chmod(temporary, original.st_mode)
-        os.utime(temporary, ns=(original.st_atime_ns, original.st_mtime_ns))
-        os.replace(temporary, source)
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
-        temporary.unlink(missing_ok=True)
-        message = getattr(exc, "stderr", None) or "Media edit failed"
-        raise HTTPException(422, message[-2000:]) from exc
-    warnings = []
-    for _, subtitle in external:
-        try:
-            subtitle.unlink()
-        except OSError as exc:
-            warnings.append(f"Embedded but could not remove {subtitle.name}: {exc}")
-    return {"edited": str(source), "embedded": [str(path) for _, path in external], "warnings": warnings}
+    """Legacy single-edit URL backed by the canonical v43 editor."""
+    from app.v7 import ExternalSubtitleChange, ReorderEditRequest
+    from app.v43 import optimized_media_edit
+    external = [ExternalSubtitleChange(**item.model_dump()) for item in request.external_subtitles]
+    forced_audio = f"embedded:audio:{request.forced_audio}" if request.forced_audio is not None else None
+    forced_subtitle = f"embedded:subtitle:{request.forced_subtitle}" if request.forced_subtitle is not None else None
+    result = optimized_media_edit(ReorderEditRequest(
+        path=request.path, tracks=[item.model_dump() for item in request.tracks],
+        external_subtitles=external, forced_audio=forced_audio, forced_subtitle=forced_subtitle,
+    ))
+    return {"edited": result.get("edited") or request.path, "embedded": [item.path for item in external if item.embed], "warnings": result.get("warnings", [])}

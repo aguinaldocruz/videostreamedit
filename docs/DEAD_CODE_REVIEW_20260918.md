@@ -13,7 +13,7 @@ A low-risk cleanup was applied:
 - removed unused standard-library imports from `postgres_store`, `v11`, `v13`, `v28`, `v51`, `v63`, `v64`, `v65`, `v68`, and `v71`;
 - removed unused locals in `v19`, `v68`, and `v74` without changing subprocess or database side effects;
 - removed unused `markup_kind`/`canonical_language` imports from `v79`;
-- retained side-effect imports in `v64`, `v71`, `v73`–`v76`, and `v85`, with comments explaining why they remain.
+- retained side-effect imports in `v64`, `v71`, and `v73`–`v76`, with comments explaining why they remain; the empty `v85` wrapper was collapsed into the direct `v84` import.
 
 Validation: Ruff unused-import/local checks pass and `git diff --check` passes.
 
@@ -35,7 +35,7 @@ These are candidates for a separately approved removal after a clean deployment 
 2. `app.v70.preserve_existing_preview_samples`. It is a one-time migration hook and should be retired only after confirming every deployed database has recorded `preview_anchor_5min_v1`.
 3. Legacy preview routes and subtitle-preview layers in `v49`/`v50`/`v55`. They remain reachable through the route chain and must be checked by endpoint-level smoke tests before consolidation.
 4. Legacy projection table definitions and old v38/v79/v54 routes remain only as defensive compatibility surfaces for older API callers; they receive no canonical writes. They should be removed in a later API-version cleanup after endpoint usage telemetry confirms zero callers.
-5. `app/main.py` and any direct legacy entrypoint. It is not used by Docker, but should be removed only after a repository-wide deployment/test reference search confirms no manual operational workflow depends on it.
+5. Direct legacy entrypoints. The original `app/main.py` prototype and its standalone assets were removed after a repository-wide deployment/test reference search; no Docker or production import path uses them.
 
 ## Static assets
 
@@ -89,3 +89,34 @@ The old projection table definitions/routes are intentionally retained as a shor
 - Full-catalog incremental coverage is queued in the dedicated core, subtitle-inspection, and preview-cache queues. Preview extraction is now processed by the preview worker rather than silently marked maintenance-only.
 
 The catalog run is intentionally asynchronous and remains visible in the index queue controls.
+
+## Dependency-aware index scheduling
+
+The index queues now use a central dependency planner:
+
+- Core/common-filter indexing is the first gate for new or changed media.
+- Subtitle inspection is queued only after core succeeds and only when canonical stream data contains subtitle/external subtitle streams.
+- Preview-cache indexing is queued after subtitle inspection, or directly after core for media without subtitles.
+- Explicit user requests are reduced to the minimum prerequisite chain; requesting all three no longer starts three concurrent scans.
+- The redundant full-catalog subtitle/preview rows were cancelled and will be regenerated through dependency completion.
+
+This keeps future media and targeted edits incremental while allowing the current core catalog pass to feed the downstream queues progressively.
+## Runtime loose-end fixes
+
+The cleanup pass also fixed confirmed undefined runtime references found by focused static analysis: language-detection settings/request normalization, audio-language code reuse, Plex-change read-model invalidation imports, episode progress regex support, the index request enqueue counter, and the compatibility follow-up logger. Focused `F401`, `F841`, and `F821` checks now pass, and the application was rebuilt and smoke-tested successfully.
+## Optional cleanup completion
+
+The safe lint pass is complete: automatic import/format cleanups and mechanical warning fixes were applied, while broad exception handlers and compatibility globals were retained where they are part of recovery or side-effect startup behavior. Focused runtime rules (`F401`, `F841`, `F821`, plus mechanical modernization checks) pass.
+
+## Compatibility editor consolidation — 2026-09-19
+
+The remaining editor compatibility URLs now delegate to the canonical `app.v43.optimized_media_edit` implementation:
+
+- `/api/v7/media/edit`
+- `/api/v40/media/edit`
+- `/api/media/edit`
+- `/api/media/edit-single`
+
+Their legacy response shapes are preserved where callers depend on them, but they no longer carry independent remux, detection invalidation, index planning, LUW, signature, or final-version-lock logic. The low-level v7 remux routine remains private because v43 uses it only as its container-rewrite fallback. This leaves one write pipeline for immediate and queued media edits.
+
+Validation after consolidation: focused Ruff checks (`F401`, `F841`, `F821`), Python compilation, container import, route registration, and `/api/health` all pass.

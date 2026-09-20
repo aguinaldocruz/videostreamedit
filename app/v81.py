@@ -17,7 +17,6 @@ from app.v11 import connection
 from app.v28 import authorized_import_file
 from app.v80 import app
 
-
 logger = logging.getLogger("uvicorn.error")
 monitor_thread: threading.Thread | None = None
 last_risks: tuple[str, ...] = ()

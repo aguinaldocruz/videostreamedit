@@ -12,18 +12,29 @@ from pydantic import BaseModel, Field
 
 import app.v54 as indexes
 import app.v65 as tasks
-from app.v11 import connection, column_exists
-from app.v13 import media_details_with_ietf
-from app.v51 import damage_kind, decode_external, extracted_text
-from app.v43 import optimized_media_edit
-from app.v5 import SUBTITLE_EXTENSIONS, external_filename_metadata, external_subtitles, plex_language_pair
-from app.v78 import app
+from app.v5 import (
+    SUBTITLE_EXTENSIONS,
+    external_filename_metadata,
+    external_subtitles,
+    plex_language_pair,
+)
 from app.v7 import ReorderEditRequest
-
+from app.v11 import connection
+from app.v13 import media_details_with_ietf
+from app.v43 import optimized_media_edit
+from app.v51 import damage_kind, decode_external, extracted_text
+from app.v78 import app
+from app.preflight_dispatcher import enqueue_bulk_preflight, register_approval_handler, register_handler
 
 logger = logging.getLogger("videostreamedit")
 _legacy_processors = dict(indexes.processors)
 from app.subtitle_detector_config import SUBTITLE_DETECTOR_VERSION
+
+_audio_language_code = tasks._audio_language_code
+
+
+class LanguageDetectionSettings(BaseModel):
+    common_languages: list[str] = Field(default_factory=list, max_length=200)
 
 
 class SeasonStreamRequest(BaseModel):
@@ -160,8 +171,8 @@ class DetectionQueueRequest(BaseModel):
 @app.post("/api/v79/language-detection/queue")
 def queue_language_detection(request: DetectionQueueRequest) -> dict:
     """Queue subtitle and voice detection without doing media work in the request."""
-    from app.v80 import enqueue_many as enqueue_index_many
     from app.v65 import enqueue as enqueue_task
+    from app.v80 import enqueue_many as enqueue_index_many
     with connection() as db:
         media = [dict(row) for row in db.execute("SELECT path,title FROM plex_media WHERE kind IN ('movie','episode') ORDER BY path").fetchall()]
         if request.mode == "full":
@@ -206,6 +217,23 @@ class StreamLanguageDetectionRequest(BaseModel):
     external: bool = False
 
 
+@app.post("/api/v79/language-detection/reset-media")
+def reset_media_language_detection(request: AudioLanguageDetectionRequest) -> dict:
+    """Clear media-level subtitle detection markers after an interactive review.
+
+    The editor keeps the just-computed result in its local view, while listing
+    dots are intentionally cleared so a completed manual check cannot leave a
+    stale aggregate warning beside the movie or episode.
+    """
+    path = str(Path(request.path).resolve())
+    with connection() as db:
+        removed = db.execute("DELETE FROM portuguese_language_detection WHERE path=?", (path,)).rowcount
+        removed += db.execute("DELETE FROM subtitle_detection_stream_state WHERE path=?", (path,)).rowcount
+        db.execute("DELETE FROM portuguese_detection_state WHERE path=?", (path,))
+    logger.info("language_detection event=interactive_media_reset file=%s rows=%d", path.replace("\n", "\\n"), removed)
+    return {"path": path, "reset": True, "removed": removed}
+
+
 @app.post("/api/v79/language-detection/stream")
 def detect_stream_language(request: StreamLanguageDetectionRequest) -> dict:
     path = str(Path(request.path).resolve())
@@ -213,6 +241,8 @@ def detect_stream_language(request: StreamLanguageDetectionRequest) -> dict:
         media = db.execute("SELECT kind FROM plex_media WHERE path=?", (path,)).fetchone()
     if not media or media["kind"] not in {"movie", "episode"} or not Path(path).is_file():
         raise HTTPException(404, "Media is not an accessible synchronized Plex item")
+    from app.v86 import assert_media_editable
+    assert_media_editable(path)
     if request.codec_type == "audio":
         try:
             result = tasks.process_audio_language_detection(0, {"path": path})
@@ -234,7 +264,51 @@ def detect_stream_language(request: StreamLanguageDetectionRequest) -> dict:
         detected, confidence, evidence = detect_common_variant(text, allowed)
     except (OSError, ValueError, TypeError) as exc:
         raise HTTPException(422, f"Subtitle language detection failed: {exc}") from exc
-    return {"status": "completed", "codec_type": "subtitle", "detected_language": detected, "confidence": confidence, "evidence": evidence}
+
+    # An interactive check is authoritative evidence for this exact stream.
+    # Persist it so a correct manual result does not reappear as a stale
+    # no-confidence marker when the editor or report is reopened.
+    confidence = float(confidence or 0.0)
+    with connection() as db:
+        metadata = db.execute(
+            "SELECT language,region,codec,external_path FROM media_stream_index "
+            "WHERE path=? AND stream_type='subtitle' AND source=? AND type_index=?",
+            (path, source, request.type_index),
+        ).fetchone()
+        metadata_language = str(metadata["language"] if metadata else "")
+        metadata_region = str(metadata["region"] if metadata else "")
+        external_path = str(metadata["external_path"] if metadata else "")
+        if not detected or confidence <= 0.60:
+            status, reason = "no_confidence", "No confident common language detected"
+        else:
+            expected = (
+                "pt-BR" if metadata_language == "pt" and metadata_region.upper() == "BR"
+                else "pt-PT" if metadata_language == "pt"
+                else "en" if metadata_language == "en"
+                else "und"
+            )
+            detected_base = detected.casefold().split("-", 1)[0]
+            metadata_base = metadata_language.casefold().split("-", 1)[0]
+            agrees = bool(metadata_language) and (detected.casefold() == expected.casefold() or (detected_base == metadata_base and detected in {"pt", "en"}))
+            status = "complete" if agrees else "mismatch"
+            reason = ("Detected base language agrees; regional variant not distinguishable" if detected == "pt" and metadata_base == "pt" else "Detected language agrees with metadata") if status == "complete" else (evidence or "Detected language differs from metadata")
+        signature = hashlib.sha256(json.dumps([path, source, request.type_index, external_path, text], ensure_ascii=False).encode()).hexdigest()
+        db.execute(
+            "DELETE FROM portuguese_language_detection WHERE path=? AND source=? AND type_index=? AND external_path=?",
+            (path, source, request.type_index, external_path),
+        )
+        db.execute(
+            "INSERT INTO portuguese_language_detection "
+            "(path,source,type_index,external_path,metadata_language,metadata_region,detected_language,confidence,evidence,analysis_status,analysis_reason,analysis_signature,detector_version,checked_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)",
+            (path, source, request.type_index, external_path, metadata_language, metadata_region, detected or "", confidence, evidence or "", status, reason, signature, SUBTITLE_DETECTOR_VERSION),
+        )
+        db.execute(
+            "INSERT OR REPLACE INTO subtitle_detection_stream_state "
+            "(path,source,type_index,external_path,signature,status,reason,checked_at) VALUES(?,?,?,?,?,?,?,CURRENT_TIMESTAMP)",
+            (path, source, request.type_index, external_path, signature, status, reason),
+        )
+    return {"status": "completed", "codec_type": "subtitle", "detected_language": detected, "confidence": confidence, "evidence": evidence, "analysis_status": status, "analysis_reason": reason}
 
 
 @app.post("/api/v79/audio-language-detection/queue")
@@ -474,10 +548,10 @@ _PT_PT_SPELLING = set(_PT_VARIANT_DATA.get("pt_spelling") or ())
 # an otherwise Portuguese subtitle merely because the old list was tiny.
 _PT_COMMON_WORDS = {"o", "a", "os", "as", "um", "uma", "de", "do", "da", "dos", "das", "e", "que", "em", "no", "na", "nos", "nas", "para", "por", "com", "sem", "se", "não", "sim", "eu", "ele", "ela", "eles", "elas", "me", "te", "seu", "sua", "seus", "suas", "está", "estão", "foi", "ser", "como", "mais", "mas", "ou", "já", "aqui", "isso", "esse", "essa", "onde", "quando", "porque", "vai", "vou", "tem", "têm"}
 _EN_WORDS = {"the", "and", "you", "that", "what", "with", "this", "not", "have", "for", "are", "your", "who", "is", "am", "i", "me", "my", "we", "they", "to", "of", "in", "on", "it", "was", "be", "will", "where", "why", "how", "can", "do", "does", "from", "all", "after", "before", "there", "here", "tell", "must", "never", "someone"}
-_PT_BR_RE = re.compile(r"\b(?:estou|estamos|está|estão)\s+(?:fazendo|dizendo|vendo|falando|chegando|entrando|saindo|trabalhando|ligando|tentando)\b", re.I)
-_PT_PT_RE = re.compile(r"\b(?:estou|estamos|está|estão)\s+a\s+(?:fazer|dizer|ver|falar|chegar|entrar|sair|trabalhar|ligar|tentar)\b", re.I)
-_PT_PT_CONTEXT_RE = re.compile(r"\b(?:percebido|estamos\s+a\s+chegar|estão\s+a\s+chegar|se\s+faz\s+favor|com\s+certeza)\b", re.I)
-_PT_BR_CONTEXT_RE = re.compile(r"\b(?:estou|estamos|está|estão)\s+(?:fazendo|dizendo|vendo|falando|chegando|entrando|saindo|trabalhando|ligando|tentando)\b", re.I)
+_PT_BR_RE = re.compile(r"\b(?:estou|estamos|está|estão)\s+(?:fazendo|dizendo|vendo|falando|chegando|entrando|saindo|trabalhando|ligando|tentando)\b", re.IGNORECASE)
+_PT_PT_RE = re.compile(r"\b(?:estou|estamos|está|estão)\s+a\s+(?:fazer|dizer|ver|falar|chegar|entrar|sair|trabalhar|ligar|tentar)\b", re.IGNORECASE)
+_PT_PT_CONTEXT_RE = re.compile(r"\b(?:percebido|estamos\s+a\s+chegar|estão\s+a\s+chegar|se\s+faz\s+favor|com\s+certeza)\b", re.IGNORECASE)
+_PT_BR_CONTEXT_RE = re.compile(r"\b(?:estou|estamos|está|estão)\s+(?:fazendo|dizendo|vendo|falando|chegando|entrando|saindo|trabalhando|ligando|tentando)\b", re.IGNORECASE)
 
 def _resource_pattern_count(patterns: tuple[str, ...], value: str) -> int:
     # Repetition is common in songs, credits and malformed OCR. Cap each
@@ -523,6 +597,15 @@ def detect_common_variant(text: str, allowed_languages: set[str] | None = None) 
         # for the no-confidence report instead of silently discarding evidence.
         if portuguese >= 6 and en >= 6 and 0.45 <= portuguese / max(en, 1) <= 2.20:
             return "", 0.0, "Mixed Portuguese/English subtitle evidence"
+        # Generic Portuguese subtitles often contain no reliable regional
+        # markers. Return the base language when the corpus is substantial and
+        # clearly dominant; callers can then treat pt as compatible with either
+        # Plex Portuguese region without inventing PT-BR/PT-PT certainty.
+        if "pt" in allowed and pt_common >= 12 and portuguese >= en * 1.5:
+            score = pt_common
+            total = pt_common + en
+            confidence = min(0.89, 0.60 + max(0.0, score / max(total, 1) - 0.50) * 0.40)
+            return "pt", confidence, "Portuguese base-language vocabulary"
         return "", 0.0, ""
     dominance = score / max(total, 1)
     evidence_strength = min(score / 12, 1.0)
@@ -534,8 +617,8 @@ def detect_common_variant(text: str, allowed_languages: set[str] | None = None) 
     return detected, confidence, evidence
 
 
-_SDH_SOUND_RE = re.compile(r"(?:\[[^\]]{1,120}\]|\([^\)]{1,120}\)|♪|♫|\b(?:music|singing|song|laughs?|crying|sobbing|sighs?|gasps?|door|phone|telephone|alarm|applause|inaudible|música|cantando|risos?|choro|suspiro|porta|telefone|alarme|aplausos|inaudível)\b)", re.I)
-_SDH_SPEAKER_RE = re.compile(r"(?:^|\n)\s*(?:\[[^\]]{1,60}\]|[A-ZÀ-Ý][A-ZÀ-Ý .'-]{2,}\s*:)", re.M)
+_SDH_SOUND_RE = re.compile(r"(?:\[[^\]]{1,120}\]|\([^\)]{1,120}\)|♪|♫|\b(?:music|singing|song|laughs?|crying|sobbing|sighs?|gasps?|door|phone|telephone|alarm|applause|inaudible|música|cantando|risos?|choro|suspiro|porta|telefone|alarme|aplausos|inaudível)\b)", re.IGNORECASE)
+_SDH_SPEAKER_RE = re.compile(r"(?:^|\n)\s*(?:\[[^\]]{1,60}\]|[A-ZÀ-Ý][A-ZÀ-Ý .'-]{2,}\s*:)", re.MULTILINE)
 
 def analyze_sdh(text: str) -> tuple[str, float, str]:
     normalized = re.sub(r"\s+", " ", text or "")
@@ -544,7 +627,7 @@ def analyze_sdh(text: str) -> tuple[str, float, str]:
     cues = max(1, len(re.findall(r"-->[^\n]*", text or "")))
     sound_hits = len(_SDH_SOUND_RE.findall(normalized))
     speaker_hits = len(_SDH_SPEAKER_RE.findall(text or ""))
-    music_hits = len(re.findall(r"[♪♫]|\b(?:music|song|música|canção)\b", normalized, re.I))
+    music_hits = len(re.findall(r"[♪♫]|\b(?:music|song|música|canção)\b", normalized, re.IGNORECASE))
     score = min(0.99, sound_hits / max(cues * 0.18, 1) * 0.45 + speaker_hits / max(cues * 0.12, 1) * 0.35 + music_hits / max(cues * 0.08, 1) * 0.20)
     if score >= 0.72:
         label = "Likely SDH"
@@ -573,7 +656,7 @@ def subtitle_quality_issue(text: str, damage: str = "") -> str:
     """Return a conservative user-facing quality issue, if one is present."""
     if str(damage or "") not in {"", "None"}:
         return f"Subtitle text flagged as {damage}"
-    if re.search(r"(?:https?://|www\.|\b(?:discord|t\.me|telegram)\b)", text or "", re.I):
+    if re.search(r"(?:https?://|www\.|\b(?:discord|t\.me|telegram)\b)", text or "", re.IGNORECASE):
         return "Subtitle contains advertising or link-like text"
     return ""
 
@@ -720,10 +803,14 @@ def inspect_portuguese_language(path: str, detection_scope: dict | None = None, 
                 base.update(analysis_status="no_confidence", analysis_reason=reason)
             else:
                 expected = "pt-BR" if metadata_language == "pt" and str(stream["region"] or "").upper() == "BR" else "pt-PT" if metadata_language == "pt" else "en" if metadata_language == "en" else "und"
-                if metadata_language in {"", "und"} or detected.casefold() != expected.casefold():
+                detected_base = detected.casefold().split("-", 1)[0]
+                metadata_base = metadata_language.casefold().split("-", 1)[0]
+                agrees = metadata_language not in {"", "und"} and (detected.casefold() == expected.casefold() or (detected_base == metadata_base and detected in {"pt", "en"}))
+                if metadata_language in {"", "und"} or not agrees:
                     base.update(analysis_status="mismatch", analysis_reason=evidence or "Detected language differs from metadata")
                 else:
-                    base.update(analysis_status="complete", analysis_reason="Detected language agrees with metadata")
+                    reason = "Detected base language agrees; regional variant not distinguishable" if detected == "pt" and metadata_base == "pt" else "Detected language agrees with metadata"
+                    base.update(analysis_status="complete", analysis_reason=reason)
         except (OSError, ValueError, TypeError) as exc:
             base.update(analysis_status="unreadable", analysis_reason=f"Subtitle text could not be read: {str(exc)[:240]}")
         results.append(base)
@@ -742,8 +829,22 @@ def inspect_portuguese_language(path: str, detection_scope: dict | None = None, 
         full_signature = hashlib.sha256(json.dumps(["detector-v9-phase1", stat.st_size, stat.st_mtime_ns, configured, [(row["source"], row["type_index"], row["external_path"], row["analysis_signature"]) for row in results]], ensure_ascii=False, sort_keys=True).encode()).hexdigest()
         db.execute("INSERT OR REPLACE INTO portuguese_detection_state(path,signature,detector_version,checked_at) VALUES(?,?,?,CURRENT_TIMESTAMP)", (path, full_signature, SUBTITLE_DETECTOR_VERSION))
 
+def _is_final_version(path: str) -> bool:
+    """Final-version media remains indexed but skips advisory re-analysis."""
+    with connection() as db:
+        media = db.execute("SELECT kind,library_key,show_title FROM plex_media WHERE path=?", (str(path),)).fetchone()
+        if not media:
+            return False
+        entity = ("movie", str(path)) if media["kind"] == "movie" else ("tv", f"{media['library_key']}:{media['show_title'] or 'Unknown show'}")
+        row = db.execute("SELECT final_version FROM media_notes WHERE entity_type=? AND entity_key=?", entity).fetchone()
+    return bool(row and row["final_version"])
+
+
 def subtitle_index_with_sidecars(item: dict) -> None:
     path = str(item["path"])
+    if _is_final_version(path):
+        logger.info("subtitle_index event=skipped_final_version file=%s", path.replace("\n", "\\n"))
+        return
     text_cache = {}
     indexed_item = dict(item)
     indexed_item["_subtitle_text_cache"] = text_cache
@@ -755,6 +856,10 @@ def subtitle_index_with_sidecars(item: dict) -> None:
 
 
 def preview_index_with_sidecars(item: dict) -> None:
+    path = str(item["path"])
+    if _is_final_version(path):
+        logger.info("preview_cache event=skipped_final_version file=%s", path.replace("\n", "\\n"))
+        return
     _legacy_processors["previews"](item)
     persist_external_sidecars("previews", str(item["path"]))
 
@@ -778,6 +883,9 @@ def selected_episode_rows(paths: list[str]) -> list[dict]:
             found.extend(dict(row) for row in rows)
     if {item["path"] for item in found} != set(unique):
         raise HTTPException(409, "The selected season changed. Refresh TV Shows and try again")
+    from app.v86 import assert_media_editable
+    for item in found:
+        assert_media_editable(item["path"])
     return found
 
 
@@ -1028,7 +1136,7 @@ def process_tv_filtered_stream_edit(task_id: int, payload: dict) -> dict:
     request_data["paths"] = [path]
     request_data["mode"] = "now"
     request = SeasonStreamBulkEdit.model_validate(request_data)
-    episode = (re.search(r"(?:^|[^A-Za-z])(S\d{1,2}E\d{1,2})(?:[^A-Za-z]|$)", path, re.I) or [None, ""])[1].upper()
+    episode = (re.search(r"(?:^|[^A-Za-z])(S\d{1,2}E\d{1,2})(?:[^A-Za-z]|$)", path, re.IGNORECASE) or [None, ""])[1].upper()
     prefix = f"Processing episode {episode} · " if episode else "Processing media · "
     tasks.update_progress(task_id, 0, 2, prefix + "Checking current streams")
     edit, matched = episode_bulk_edit(path, request)
@@ -1094,47 +1202,48 @@ def enqueue_tv_filtered_edits(paths: list[str], request: SeasonStreamBulkEdit) -
     return len(task_ids), task_ids
 
 
-def process_tv_bulk_preflight(task_id: int, payload: dict) -> dict:
+def preflight_tv_bulk_item(payload: dict, fingerprint: dict) -> dict:
+    path = str(payload.get("path") or "")
+    expected = payload.get("_preflight_fingerprint") or {}
+    if not fingerprint.get("exists"):
+        return {"decision": "invalid", "reason": "Media file is not accessible", "path": path}
+    if expected and (int(expected.get("size", -1)) != int(fingerprint.get("size", -2)) or int(expected.get("mtime_ns", -1)) != int(fingerprint.get("mtime_ns", -2))):
+        return {"decision": "stale", "reason": "Media changed after bulk request", "path": path}
     request_data = dict(payload.get("request") or {})
-    paths = list(dict.fromkeys(payload.get("paths") or []))
-    request_data.update({"paths": paths, "mode": "now"})
-    request = SeasonStreamBulkEdit.model_validate(request_data)
-    targets = indexed_target_keys(paths, request.filters)
-    candidates: list[tuple[str, dict]] = []
-    skipped = 0
-    task_type = "tv_filtered_stream_edit_now" if str(payload.get("mode") or "queue") == "now" else "tv_filtered_stream_edit"
-    tasks.update_progress(task_id, 0, max(1, len(paths)), "Checking bulk changes")
-    for number, path in enumerate(paths, 1):
-        if targets.get(path):
-            per_media = {**request.model_dump(exclude={"paths", "mode"}), "target_keys": targets[path]}
-            try:
-                preview, matched = episode_bulk_edit(path, SeasonStreamBulkEdit.model_validate({**per_media, "paths": [path], "mode": "now"}))
-                if matched and edit_has_effective_changes(preview):
-                    candidates.append((path, per_media))
-                else:
-                    skipped += 1
-            except Exception as exc:
-                logger.warning("tv_stream_bulk_preflight event=media_failed path=%s error=%s", path, str(exc).replace("\n", " ")[-300:])
-                skipped += 1
-        else:
-            skipped += 1
-        tasks.update_progress(task_id, number, max(1, len(paths)), f"Checked {number} of {len(paths)} media")
-    child_ids: list[int] = []
-    now = tasks.utc_now()
-    with connection() as db:
-        for path, per_media in candidates:
-            signed = tasks.attach_media_signature(task_type, {"path": path, "request": per_media})
-            cursor = db.execute("INSERT INTO task_queue(task_type,label,payload_json,status,progress_message,created_at,updated_at) VALUES(?,?,?,'pending','Waiting',?,?)", (task_type, f"TV filtered stream edit · {Path(path).name}", json.dumps(signed, ensure_ascii=False, separators=(",", ":")), now, now))
-            db.execute("INSERT OR REPLACE INTO media_change_request(task_id,path,requested_at) VALUES(?,?,?)", (cursor.lastrowid, path, now))
-            child_ids.append(int(cursor.lastrowid))
-    tasks.wake_queue()
-    logger.info("tv_stream_bulk_preflight event=completed checked=%d queued=%d skipped=%d", len(paths), len(child_ids), skipped)
-    return {"queued": len(child_ids), "skipped": skipped, "task_ids": child_ids}
+    request_data["paths"] = [path]
+    request_data["mode"] = "now"
+    try:
+        request = SeasonStreamBulkEdit.model_validate(request_data)
+        targets = indexed_target_keys([path], request.filters).get(path, [])
+        if not targets:
+            return {"decision": "skipped", "reason": "No current stream matches the selected filter", "path": path}
+        per_media = {**request.model_dump(exclude={"paths", "mode"}), "target_keys": targets}
+        preview, matched = episode_bulk_edit(path, SeasonStreamBulkEdit.model_validate({**per_media, "paths": [path], "mode": "now"}))
+        if not matched or not edit_has_effective_changes(preview):
+            return {"decision": "skipped", "reason": "Media already has the requested values", "path": path}
+        return {"decision": "approved", "path": path, "matched": matched, "request": per_media}
+    except Exception as exc:
+        return {"decision": "invalid", "reason": str(exc), "path": path}
 
+
+def approve_tv_bulk(payload: dict, result: dict) -> dict:
+    task_ids = []
+    for item in payload.get("_bulk_items") or []:
+        plan = dict((item.get("_preflight_result") or {}).get("request") or {})
+        if not plan:
+            continue
+        mode = str((item.get("request") or {}).get("mode") or "queue")
+        task_type = "tv_filtered_stream_edit_now" if mode == "now" else "tv_filtered_stream_edit"
+        child = tasks.enqueue(task_type, {"path": item.get("path"), "request": plan}, f"TV filtered stream edit · {Path(str(item.get('path') or '')).name}", deduplicate=True)
+        task_ids.append(child["id"])
+    return {"task_ids": task_ids, "queued": len(task_ids), "task_type": "tv_filtered_stream_edit"}
+
+
+register_handler("tv_stream_edit_bulk", preflight_tv_bulk_item)
+register_approval_handler("tv_stream_edit_bulk", approve_tv_bulk)
 
 tasks.TASK_HANDLERS["tv_filtered_stream_edit"] = process_tv_filtered_stream_edit
 tasks.TASK_HANDLERS["tv_filtered_stream_edit_now"] = process_tv_filtered_stream_edit
-tasks.TASK_HANDLERS["tv_bulk_preflight"] = process_tv_bulk_preflight
 
 @app.post("/api/v79/tv/season-stream-bulk-edit")
 def season_stream_bulk_edit(request: SeasonStreamBulkEdit) -> dict:
@@ -1157,5 +1266,6 @@ def season_stream_bulk_edit(request: SeasonStreamBulkEdit) -> dict:
     # Both modes use an asynchronous preflight. Signature capture and current
     # stream verification can be expensive for large shows; keeping them in the
     # queue makes the response immediate and gives the user a real progress view.
-    preflight = tasks.enqueue("tv_bulk_preflight", {"paths": request.paths, "request": request.model_dump(exclude={"paths", "mode"}), "mode": request.mode}, "Preflight TV bulk stream change")
-    return {"mode": request.mode, "queued": 1, "preflight": True, "task_ids": [preflight["id"]], "applied": 0, "streams": 0, "skipped": [], "failed": []}
+    items = [{"path": path, "request": request.model_dump(exclude={"paths"})} for path in request.paths]
+    preflight = enqueue_bulk_preflight("tv_stream_edit_bulk", items, mode="immediate" if request.mode == "now" else "queued", priority=80, deduplicate=True)
+    return {"mode": request.mode, "queued": len(items), "preflight": True, "preflight_id": preflight["id"], "task_ids": [], "applied": 0, "streams": 0, "skipped": [], "failed": []}

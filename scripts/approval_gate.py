@@ -3,13 +3,12 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import time
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
-import json
 from urllib.parse import quote
-
+from urllib.request import Request, urlopen
 
 PATHS = (
     "/api/v19/movies",

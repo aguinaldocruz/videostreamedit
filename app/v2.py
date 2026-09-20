@@ -1,17 +1,17 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import sqlite3
 import subprocess
-import uuid
 from pathlib import Path
 from typing import Literal
 
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import FileResponse
 from fastapi.middleware.gzip import GZipMiddleware
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from app.pg_compat import connect as postgres_connect
@@ -24,6 +24,8 @@ MEDIA_EXTENSIONS = {".mkv", ".mp4", ".m4v", ".avi", ".mov", ".webm", ".ts", ".m2
 BLOCKED_PATHS = {Path("/proc"), Path("/sys"), Path("/dev"), CONFIG_DIR.resolve()}
 TYPE_SPECIFIER = {"video": "v", "audio": "a", "subtitle": "s"}
 SEASON_PATTERN = re.compile(r"(?:season|series|s)[ ._-]*(\d+)", re.IGNORECASE)
+
+logger = logging.getLogger("uvicorn.error")
 
 app = FastAPI(title="VideoStreamEdit", version="0.2.0")
 app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=5)
@@ -308,7 +310,11 @@ def _schedule_smart_followups(path: Path, updates: list[StreamUpdate], streams: 
     if not tracks:
         return
     try:
-        from app.v80 import detection_scope_for_edit, media_indexes_for_edit, request_media_indexes
+        from app.v80 import (
+            detection_scope_for_edit,
+            media_indexes_for_edit,
+            request_media_indexes,
+        )
         edit = {"path": str(path), "tracks": tracks, "remove": [], "order": [], "external_subtitles": []}
         request_media_indexes(str(path), media_indexes_for_edit(edit), "Compatibility media edit completed", detection_scope=detection_scope_for_edit(edit))
     except Exception as exc:
@@ -330,33 +336,19 @@ def make_language(language: str | None, region: str | None) -> str:
 
 @app.post("/api/media/edit")
 def edit_media(request: EditRequest) -> dict:
+    """Legacy batch URL backed by the canonical v43 media editor."""
+    from app.v7 import ReorderEditRequest
+    from app.v43 import optimized_media_edit
+    if any(update.codec_type == "video" for update in request.streams):
+        raise HTTPException(400, "Video stream metadata is not editable through the canonical stream editor")
     edited, skipped, failures = [], [], []
-    for value in dict.fromkeys(request.paths):
-        source = authorized_file(value)
-        original = source.stat()
-        streams = probe(source).get("streams", [])
-        counts = {kind: sum(1 for stream in streams if stream.get("codec_type") == kind) for kind in TYPE_SPECIFIER}
-        applicable = [update for update in request.streams if update.type_index < counts[update.codec_type]]
-        if not applicable:
-            skipped.append(str(source))
-            continue
-        temporary = source.with_name(f".{source.stem}.{uuid.uuid4().hex}.vse{source.suffix}")
-        command = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-i", str(source), "-map", "0", "-map_metadata", "0", "-c", "copy"]
-        for update in applicable:
-            selector = f'{TYPE_SPECIFIER[update.codec_type]}:{update.type_index}'
-            if update.language is not None or update.region is not None:
-                command += [f"-metadata:s:{selector}", f"language={make_language(update.language, update.region)}"]
-            if update.title is not None:
-                command += [f"-metadata:s:{selector}", f"title={update.title.strip()}"]
-        command.append(str(temporary))
+    for path in dict.fromkeys(request.paths):
+        tracks = [update.model_dump() for update in request.streams]
         try:
-            subprocess.run(command, capture_output=True, text=True, timeout=3600, check=True)
-            os.chmod(temporary, original.st_mode)
-            os.utime(temporary, ns=(original.st_atime_ns, original.st_mtime_ns))
-            os.replace(temporary, source)
-            _schedule_smart_followups(source, applicable, probe(source).get("streams", []))
-            edited.append(str(source))
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
-            temporary.unlink(missing_ok=True)
-            failures.append({"path": str(source), "error": (getattr(exc, "stderr", None) or "Edit failed")[-1500:]})
+            result = optimized_media_edit(ReorderEditRequest(path=path, tracks=tracks))
+            edited.append(str(result.get("edited") or path))
+        except HTTPException as exc:
+            failures.append({"path": path, "error": str(exc.detail)})
+        except Exception as exc:
+            failures.append({"path": path, "error": str(exc)})
     return {"edited": edited, "skipped": skipped, "failures": failures}

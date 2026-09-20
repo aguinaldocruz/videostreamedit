@@ -28,3 +28,36 @@
 .reports-loading,.reports-empty,.reports-error{border:1px dashed var(--vse-border,#303947);border-radius:var(--vse-radius-sm,8px);background:var(--vse-surface-subtle,#12171d);margin:.5rem 0}
 .forced-exclusion-row .vse-btn,.forced-exclusion-add .vse-btn{min-height:1.9rem}
 \n.language-detection-no-confidence{display:inline-flex;align-items:center;justify-content:center;width:.72rem;height:.72rem;min-width:.72rem;margin-left:.3rem;border-radius:50%;background:#c95f68;color:#fff;font-size:.62rem;font-weight:800;line-height:1;vertical-align:middle;box-shadow:0 0 0 1px #0008;cursor:help}\n
+.report-show-group{margin:.55rem 0;border:1px solid var(--vse-border,#303947);border-radius:var(--vse-radius-sm,8px);background:var(--vse-surface,#151b22);overflow:hidden}
+.report-show-group>summary{display:flex;align-items:center;justify-content:space-between;gap:.75rem;cursor:pointer;padding:.7rem .85rem;color:var(--vse-text,#e7edf5);font-weight:650;list-style-position:inside}
+.report-show-group>summary::marker{color:var(--vse-accent,#62b0ff)}
+.report-show-group>summary span{color:var(--vse-muted,#9aa8b8);font-size:.8rem;font-weight:500}
+.report-show-episodes{padding:.2rem .7rem .65rem;border-top:1px solid var(--vse-border,#303947)}
+.report-episode-row{display:grid;grid-template-columns:minmax(120px,1fr) auto auto;align-items:center;gap:.7rem;padding:.55rem .2rem;border-bottom:1px solid var(--vse-border,#303947)}
+.report-episode-row:last-child{border-bottom:0}
+.report-episode-name{font-weight:600;color:var(--vse-accent,#62b0ff)}
+.report-episode-row>span:nth-child(2){color:var(--vse-muted,#9aa8b8);font-size:.8rem}
+@media(max-width:620px){.report-episode-row{grid-template-columns:1fr;gap:.3rem}.report-episode-row .report-item-action{justify-self:start}}
+
+
+/* TV reports use a compact file-explorer tree: show folders with indented episode leaves. */
+.report-show-group{border:0;border-radius:0;background:transparent;overflow:visible;margin:.35rem 0}
+.report-show-group>summary{position:relative;display:flex;align-items:center;gap:.5rem;min-height:2.15rem;padding:.45rem .65rem;border:1px solid var(--vse-border,#303947);border-radius:var(--vse-radius-sm,8px);background:var(--vse-surface,#151b22);list-style:none;cursor:pointer}
+.report-show-group>summary::-webkit-details-marker{display:none}
+.report-show-group>summary::before{content:'▸';width:.8rem;color:var(--vse-accent,#62b0ff);font-size:.9rem;transition:transform .12s ease}
+.report-show-group[open]>summary::before{content:'▾'}
+.report-show-group>summary::after{content:'📁';margin-left:.05rem;font-size:.88rem;opacity:.9}
+.report-show-group>summary strong{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.report-show-group>summary span{margin-left:auto;white-space:nowrap}
+.report-show-episodes,.report-show-group> .report-item{position:relative;margin-left:1.25rem;padding-left:1.1rem;border:0;border-left:1px solid var(--vse-border,#303947);border-radius:0;background:transparent}
+.report-show-episodes{padding-top:.2rem;padding-bottom:.2rem}
+.report-show-episodes::before{content:'';position:absolute;left:-1px;top:0;bottom:50%;border-left:1px solid var(--vse-border,#303947)}
+.report-show-episodes>.report-item,.report-show-episodes>.report-episode-row{position:relative}
+.report-show-episodes>.report-item::before,.report-show-episodes>.report-episode-row::before,.report-show-group> .report-item::before{content:'';position:absolute;left:-1.1rem;top:50%;width:.85rem;border-top:1px solid var(--vse-border,#303947)}
+.report-show-episodes>.report-item:last-child::after{content:'';position:absolute;left:-1.1rem;top:50%;bottom:-.3rem;border-left:2px solid var(--vse-surface,#151b22)}
+.report-show-group>.report-item{margin-top:.35rem;padding-top:.45rem;padding-bottom:.45rem}
+.report-show-group>.report-item + .report-item{margin-top:.35rem}
+.report-show-group>.report-item .report-title-link,.report-show-episodes .report-episode-name{font-weight:600}
+@media(max-width:620px){.report-show-group>summary{padding:.4rem .5rem}.report-show-episodes,.report-show-group> .report-item{margin-left:.8rem;padding-left:.9rem}.report-show-episodes>.report-item::before,.report-show-episodes>.report-episode-row::before,.report-show-group> .report-item::before{left:-.9rem;width:.65rem}}
+
+.report-preflight-panel{margin:.5rem 1rem;padding:.55rem;border:1px solid var(--line);border-radius:7px;color:var(--muted);font-size:.8rem}.report-preflight-panel[hidden]{display:none}.report-preflight-request{padding:.35rem 0}.report-preflight-request ul{margin:.3rem 0;padding-left:1.2rem;max-height:10rem;overflow:auto}.report-preflight-request li{margin:.15rem 0}

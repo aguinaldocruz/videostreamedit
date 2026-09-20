@@ -1,4 +1,16 @@
 (function(){
+  async function waitForBulkPreflight(requestId){
+    if(!requestId)return {succeeded:0,failed:0,items:[]};
+    for(let attempt=0;attempt<600;attempt++){
+      const status=await api('/api/v89/preflight/'+encodeURIComponent(requestId));
+      if(status.status==='pending'||status.status==='running'){await new Promise(resolve=>setTimeout(resolve,500));continue}
+      if(status.status!=='approved')throw new Error(status.error||status.result?.reason||'Bulk validation did not approve the request');
+      const ids=(status.result?.execution?.task_ids||[]).map(Number).filter(Boolean);
+      if(ids.length&&typeof waitForGlobalTasks==='function')return await waitForGlobalTasks(ids);
+      return {succeeded:Number(status.result?.approved||0),failed:0,items:[]};
+    }
+    throw new Error('Bulk validation is taking too long; the request remains queued');
+  }
   const table=$('#movie-list')?.closest('table'),head=table?.querySelector('thead tr');
   if(!head)return;
   const action=head.lastElementChild;
@@ -57,7 +69,7 @@
     const paths=[...matchingPaths()],filters=selectedFilters(),inputs=[...editContent.querySelectorAll('input')],changed=inputs.filter(input=>input.dataset.dirty==='true');if(!changed.length)return;
     const mode=await requestMode(paths.length,filters);if(!mode)return;
     const textInputs=inputs.filter(input=>input.type==='text'),values=Object.fromEntries(textInputs.map(input=>[input.name,input.value])),default_action=editContent.querySelector('[data-action=default]')?.dataset.state||'unchanged',forced_action=editContent.querySelector('[data-action=forced]')?.dataset.state||'unchanged',integrate=Boolean(editContent.querySelector('[name=integrate]')?.checked),remove=Boolean(editContent.querySelector('[name=remove]')?.checked);
-    try{let result=await api('/api/v82/movies/stream-bulk-edit',{method:'POST',body:JSON.stringify({paths,filters,changed_fields:changed.map(input=>input.name),...values,default_action,forced_action,integrate,remove,mode})});if(mode==='now'&&result.task_ids?.length&&typeof waitForGlobalTasks==='function'){let progress=await waitForGlobalTasks(result.task_ids);if(result.preflight){const childIds=[];for(const item of(progress.items||[])){try{const detail=JSON.parse(item.result_json||'{}');childIds.push(...(detail.task_ids||[]))}catch(_){}}if(childIds.length)progress=await waitForGlobalTasks(childIds)}result={...result,applied:progress.succeeded,failed:Array.from({length:progress.failed},()=>({}))};}const used=[];for(const input of changed.filter(input=>input.type==='text')){const field=input.name==='track_name'?(filters.stream_type==='audio'?'title_audio':'title_subtitle'):input.name;if(input.value.trim())used.push({field,value:input.value.trim()},{field,value:input.value.trim()})}if(used.length&&typeof offerSavedValues==='function')await offerSavedValues(used);toast(mode==='queue'?`${result.queued}  movie changes added to the queue`:`${result.applied}  movies updated${result.failed.length?` · ${result.failed.length} failed`:''}`,result.failed.length>0);closeEditor();if(mode==='queue'&&result.task_ids?.length){if(typeof markMediaChangeRequested==='function')markMediaChangeRequested(paths,`${filters.stream_type||'Stream'}: ${changed.map(input=>input.name).join(', ')} change requested`);renderMovies();}if(mode==='now'){records=[];scope='';filterRow.classList.add('hidden');await loadMovies()}}
+    try{let result=await api('/api/v82/movies/stream-bulk-edit',{method:'POST',body:JSON.stringify({paths,filters,changed_fields:changed.map(input=>input.name),...values,default_action,forced_action,integrate,remove,mode})});if(mode==='now'&&result.preflight_id){const progress=await waitForBulkPreflight(result.preflight_id);result={...result,applied:progress.succeeded,failed:Array.from({length:progress.failed||0},()=>({}))};}const used=[];for(const input of changed.filter(input=>input.type==='text')){const field=input.name==='track_name'?(filters.stream_type==='audio'?'title_audio':'title_subtitle'):input.name;if(input.value.trim())used.push({field,value:input.value.trim()},{field,value:input.value.trim()})}if(used.length&&typeof offerSavedValues==='function')await offerSavedValues(used);toast(mode==='queue'?`${result.queued}  movie changes added to the queue`:`${result.applied}  movies updated${result.failed.length?` · ${result.failed.length} failed`:''}`,result.failed.length>0);closeEditor();if(mode==='queue'&&(result.preflight_id||result.task_ids?.length)){if(typeof markMediaChangeRequested==='function')markMediaChangeRequested(paths,`${filters.stream_type||'Stream'}: ${changed.map(input=>input.name).join(', ')} change requested`);renderMovies();}if(mode==='now'){records=[];scope='';filterRow.classList.add('hidden');await loadMovies()}}
     catch(error){toast(error.message,true)}
   }
   async function monitorBulkCompletion(taskIds){

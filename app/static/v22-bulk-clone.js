@@ -5,11 +5,12 @@ function ensureBulkCloneUi() {
     $('.episode-heading').insertAdjacentHTML('beforeend', '<button type="button" id="bulk-clone-button" class="bulk-clone-button hidden">Clone last change</button>');
   }
   if (!$('#bulk-clone-dialog')) {
-    document.body.insertAdjacentHTML('beforeend', '<dialog id="bulk-clone-dialog" class="bulk-clone-dialog"><form id="bulk-clone-form"><div class="dialog-title"><div><h2>Clone last change in bulk</h2><p id="bulk-clone-scope"></p></div><button type="button" class="icon-close" data-close-bulk-clone>×</button></div><div class="bulk-clone-content"><section><h3>Changes</h3><ul id="bulk-clone-changes"></ul></section><section><h3 id="bulk-clone-list-title">Episodes</h3><ol id="bulk-clone-list"></ol></section></div><div class="dialog-actions"><div id="bulk-clone-progress" class="apply-progress"><strong>Ready</strong><small>Review affected episodes before proceeding</small></div><button type="button" data-close-bulk-clone>Cancel</button><button type="submit" class="primary">Apply bulk clone</button></div></form></dialog>');
+    document.body.insertAdjacentHTML('beforeend', '<dialog id="bulk-clone-dialog" class="bulk-clone-dialog"><form id="bulk-clone-form"><div class="dialog-title"><div><h2>Clone last change in bulk</h2><p id="bulk-clone-scope"></p></div><button type="button" class="icon-close" data-close-bulk-clone>×</button></div><div class="bulk-clone-content"><section><h3>Changes</h3><ul id="bulk-clone-changes"></ul></section><section><h3 id="bulk-clone-list-title">Episodes</h3><ol id="bulk-clone-list"></ol></section></div><div class="dialog-actions"><div id="bulk-clone-progress" class="apply-progress"><strong>Ready</strong><small>Review affected episodes before proceeding</small></div><button type="button" data-close-bulk-clone>Cancel</button><button type="button" id="queue-bulk-clone" class="primary">Queue bulk clone</button><button type="submit" class="primary">Apply bulk clone</button></div></form></dialog>');
   }
   document.querySelectorAll('[data-close-bulk-clone]').forEach(button => button.onclick = () => $('#bulk-clone-dialog').close());
   $('#bulk-clone-button').onclick = openBulkCloneReview;
   $('#bulk-clone-form').onsubmit = applyBulkClone;
+  $('#queue-bulk-clone').onclick = queueBulkClone;
 }
 
 function listedEpisodeLabels() {
@@ -104,6 +105,45 @@ function bulkClonePayload(path, details, saved) {
   return {path, tracks, external_subtitles: external, order, default_audio: actualKey(saved.after.defaultAudio), forced_audio: actualKey(saved.after.forcedAudio), default_subtitle: actualKey(saved.after.defaultSubtitle), forced_subtitle: actualKey(saved.after.forcedSubtitle), remove};
 }
 
+async function collectBulkCloneItems(inspection, progressMessage) {
+  const items = [];
+  for (let index = 0; index < inspection.candidates.length; index++) {
+    const path = inspection.candidates[index];
+    const label = listedEpisodeLabels().get(path) || path.split('/').pop();
+    if (progressMessage) progressMessage(index + 1, inspection.count, label);
+    const details = await api(`/api/v13/media/details?path=${encodeURIComponent(path)}`);
+    items.push({path, edit: bulkClonePayload(path, details, inspection.saved)});
+  }
+  return items;
+}
+
+async function queueBulkClone() {
+  if (!bulkCloneInspection?.count) return;
+  const inspection = bulkCloneInspection;
+  const button = $('#queue-bulk-clone');
+  const closeButtons = [...document.querySelectorAll('[data-close-bulk-clone]')];
+  button.disabled = true; closeButtons.forEach(item => item.disabled = true);
+  try {
+    const items = await collectBulkCloneItems(inspection, (number, total, label) => {
+      $('#bulk-clone-progress').innerHTML = `<strong>Preparing ${number} of ${total}</strong><small>${esc(label)}</small>`;
+    });
+    const result = await api('/api/v25/templates/bulk-queue', {method: 'POST', body: JSON.stringify({items, template_id: inspection.saved.id || null})});
+    const skipped = result.skipped?.length || 0, conflicts = result.conflicts?.length || 0;
+    const details = [skipped ? `${skipped} skipped` : '', conflicts ? `${conflicts} conflicts` : ''].filter(Boolean).join(' · ');
+    $('#bulk-clone-progress').innerHTML = `<strong>${result.queued || 0} queued</strong><small>${details || 'Signature-checked tasks are ready'}</small>`;
+    toast(`${result.queued || 0} template changes queued${details ? ` · ${details}` : ''}`);
+    button.textContent = 'Queued';
+    $('#bulk-clone-form [data-close-bulk-clone]:not(.icon-close)').textContent = 'Close';
+    scheduleBulkCloneInspection();
+  } catch (error) {
+    $('#bulk-clone-progress').innerHTML = `<strong class="error">Queue failed</strong><small>${esc(error.message)}</small>`;
+    toast(error.message, true);
+    button.disabled = false;
+  } finally {
+    closeButtons.forEach(item => item.disabled = false);
+  }
+}
+
 async function applyBulkClone(event) {
   event.preventDefault();
   if (!bulkCloneInspection?.count) return;
@@ -123,7 +163,7 @@ async function applyBulkClone(event) {
     }
     const beforeMetadata = new Map(inspection.saved.before.rows.map(row => [row.id, row]));
     const metadata = inspection.saved.after.rows.flatMap(row => ['language', 'region', 'title'].filter(field => beforeMetadata.get(row.id)[field] !== row[field] && row[field].trim()).map(field => ({field, value: row[field].trim()})));
-    await offerSavedValues(Array.from({length: completed}, () => metadata).flat());
+    await offerSavedValues(metadata);
     $('#bulk-clone-progress').innerHTML = `<strong>Complete</strong><small>${completed} episodes updated successfully</small>`;
     toast(`${completed} episodes updated from the last change`);
     button.disabled = true;

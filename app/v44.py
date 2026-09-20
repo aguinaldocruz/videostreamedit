@@ -8,7 +8,6 @@ from pydantic import BaseModel
 from app.v11 import connection
 from app.v43 import app
 
-
 logger = logging.getLogger("uvicorn.error")
 
 

@@ -8,7 +8,6 @@ from app.v2 import connection
 from app.v8 import ValueField
 from app.v32 import app
 
-
 logger = logging.getLogger("videostreamedit")
 
 

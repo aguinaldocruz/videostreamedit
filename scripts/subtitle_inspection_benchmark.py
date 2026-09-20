@@ -14,8 +14,8 @@ import time
 from pathlib import Path
 
 from app.v11 import connection
-from app.v79 import analyze_sdh, detect_common_variant, normalized_evidence_sample
 from app.v51 import damage_kind
+from app.v79 import analyze_sdh, detect_common_variant, normalized_evidence_sample
 
 MAX_MEDIA = 6
 TIMEOUT_SECONDS = 20
@@ -37,13 +37,13 @@ def main() -> int:
         if codec in codecs and len(selected) < MAX_MEDIA//2:
             continue
         if Path(path).is_file():
-            selected.append(dict(path=path,type_index=int(row['type_index']),codec=codec)); paths.add(path); codecs.add(codec)
+            selected.append({'path': path, 'type_index': int(row['type_index']), 'codec': codec}); paths.add(path); codecs.add(codec)
         if len(selected)>=MAX_MEDIA: break
     if len(selected)<MAX_MEDIA:
         for row in rows:
             path=str(row['path'])
             if path in paths or not Path(path).is_file(): continue
-            selected.append(dict(path=path,type_index=int(row['type_index']),codec=str(row['codec'] or 'unknown').lower())); paths.add(path)
+            selected.append({'path': path, 'type_index': int(row['type_index']), 'codec': str(row['codec'] or 'unknown').lower()}); paths.add(path)
             if len(selected)>=MAX_MEDIA: break
     timings=[]; results=[]
     for item in selected:
@@ -54,11 +54,11 @@ def main() -> int:
             if out.returncode and not text:
                 status=f'ffmpeg_exit_{out.returncode}'
             chars=len(normalized_evidence_sample(text, 100000)); cues=len(__import__('re').findall(r'-->[^\n]*',text))
-            detected,confidence,evidence=detect_common_variant(text, {'pt','en'})
+            detected,confidence,_evidence=detect_common_variant(text, {'pt','en'})
             sdh,sdh_conf,_=analyze_sdh(text)
             damage=damage_kind(text)
         except subprocess.TimeoutExpired:
-            status='timeout'; detected=''; confidence=0; evidence=''; sdh=''; sdh_conf=0; damage=''; text=''
+            status='timeout'; detected=''; confidence=0; _evidence=''; sdh=''; sdh_conf=0; damage=''; text=''
         elapsed=time.perf_counter()-started; timings.append(elapsed)
         print(json.dumps({'sample':len(results)+1,'codec':item['codec'],'seconds':round(elapsed,3),'status':status},ensure_ascii=False),flush=True)
         results.append({'codec':item['codec'],'seconds':round(elapsed,3),'status':status,'cues':cues,'text_chars':chars,'detected':detected,'confidence':round(float(confidence),3),'sdh':sdh,'sdh_confidence':round(float(sdh_conf),3),'damage':damage})

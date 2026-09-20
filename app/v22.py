@@ -58,15 +58,29 @@ def normalized_clone_state(path: str) -> dict:
 
 def _normalize_clone_state(state: dict) -> dict:
     import copy
+
     value = copy.deepcopy(state or {})
+    aliases = {
+        "por": "pt", "pob": "pt", "eng": "en", "fra": "fr", "fre": "fr",
+        "deu": "de", "ger": "de", "ita": "it", "spa": "es", "jpn": "ja",
+        "jpn": "ja", "kor": "ko", "zho": "zh", "chi": "zh", "rus": "ru",
+    }
     for row in value.get("rows", []):
-        language = str(row.get("language") or "").strip().lower()
-        if language == "por":
-            row["language"] = "pt"
-        if str(row.get("language") or "").lower() == "pt" and not str(row.get("region") or "").strip():
-            row["region"] = "PT"
-        row["region"] = str(row.get("region") or "").strip().upper()
+        language = str(row.get("language") or "").strip().lower().replace("_", "-")
+        region = str(row.get("region") or "").strip().upper()
+        if "-" in language:
+            parts = language.split("-", 1)
+            language = parts[0]
+            region = region or parts[1].upper()
+        language = aliases.get(language, language)
+        if language == "pt" and not region:
+            region = "PT"
+        row["language"] = language
+        row["region"] = region
+        row["title"] = str(row.get("title") or "").strip()
+        row["codec"] = str(row.get("codec") or "").strip().lower()
     return value
+
 
 def inspect_clone_candidate(path: str, expected: dict) -> dict:
     try:

@@ -1,16 +1,29 @@
-from pydantic import BaseModel, Field
-from typing import Literal
 import logging
-from fastapi import HTTPException
+from typing import Literal
 
-from app.v11 import connection, column_exists
-from app.v85 import app
+from fastapi import HTTPException
+from pydantic import BaseModel, Field
+
 from app.postgres_store import (
     initialize_schema as initialize_postgres_workflow_schema,
-    workflow_details, rollback_workflow, recover_luws, luw_details, luw_read_model, workflow_read_model, read_model_state, read_model_summary,
 )
+from app.postgres_store import (
+    luw_details,
+    luw_read_model,
+    read_model_state,
+    read_model_summary,
+    recover_luws,
+    rollback_workflow,
+    workflow_details,
+    workflow_read_model,
+)
+from app.v11 import column_exists, connection
+from app.v84 import app
 
 logger = logging.getLogger("videostreamedit")
+
+# Phase 1 durable preflight dispatcher routes and lifecycle hooks.
+from app import preflight_dispatcher as _preflight_dispatcher  # noqa: F401,E402
 
 
 class LanguageRegionUse(BaseModel):
@@ -28,6 +41,7 @@ class MediaNoteRequest(BaseModel):
     note: str = Field(default="", max_length=4000)
     reviewed: bool | None = None
     plex_sync_change: bool | None = None
+    final_version: bool | None = None
 
 
 @app.on_event("startup")
@@ -53,6 +67,8 @@ def initialize_language_region_usage() -> None:
             db.execute("ALTER TABLE media_notes ADD COLUMN reviewed INTEGER NOT NULL DEFAULT 0")
         if not column_exists(db, "media_notes", "plex_sync_change"):
             db.execute("ALTER TABLE media_notes ADD COLUMN plex_sync_change INTEGER NOT NULL DEFAULT 0")
+        if not column_exists(db, "media_notes", "final_version"):
+            db.execute("ALTER TABLE media_notes ADD COLUMN final_version INTEGER NOT NULL DEFAULT 0")
 
 
 @app.on_event("startup")
@@ -64,6 +80,26 @@ def remove_legacy_projection_schema() -> None:
             db.execute(f"DROP TABLE IF EXISTS {table}")
             removed.append(table)
     logger.info("canonical_index event=legacy_projection_schema_removed tables=%s", ",".join(removed))
+
+
+
+def final_version_entity_for_path(path: str) -> tuple[str, str] | None:
+    with connection() as db:
+        row = db.execute("SELECT kind,library_key,show_title FROM plex_media WHERE path=?", (str(path),)).fetchone()
+    if not row:
+        return None
+    if row["kind"] == "movie":
+        return ("movie", str(path))
+    return ("tv", f"{row['library_key']}:{row['show_title'] or 'Unknown show'}")
+
+def assert_media_editable(path: str) -> None:
+    entity = final_version_entity_for_path(path)
+    if not entity:
+        return
+    with connection() as db:
+        row = db.execute("SELECT final_version FROM media_notes WHERE entity_type=? AND entity_key=?", entity).fetchone()
+    if row and bool(row["final_version"]):
+        raise HTTPException(423, "This media is marked Final version and is view-only. Open its notes and unfreeze it before making changes.")
 
 
 @app.get("/api/v86/workflows/{group_id}")
@@ -212,7 +248,9 @@ def dashboard_stats() -> dict:
               (SELECT coalesce(sum(size),0) FROM plex_media WHERE kind='movie') AS movie_bytes,
               (SELECT coalesce(sum(size),0) FROM plex_media WHERE kind='episode') AS episode_bytes,
               (SELECT count(DISTINCT path) FROM media_stream_index) AS indexed_media,
-              (SELECT count(*) FROM plex_media) AS catalog_media
+              (SELECT count(*) FROM plex_media) AS catalog_media,
+              (SELECT count(DISTINCT i.path) FROM media_stream_index i JOIN plex_media p ON p.path=i.path WHERE p.kind='movie') AS indexed_movies,
+              (SELECT count(DISTINCT i.path) FROM media_stream_index i JOIN plex_media p ON p.path=i.path WHERE p.kind='episode') AS indexed_episodes
         """).fetchone()
         language_rows = db.execute("""
             SELECT p.kind, i.stream_type, lower(trim(i.language)) AS language, count(DISTINCT i.path) AS media_count
@@ -230,7 +268,7 @@ def dashboard_stats() -> dict:
         target = 'movies' if row['kind'] == 'movie' else 'tv'
         distributions[target][row['stream_type']].append({'language': row['language'], 'media_count': row['media_count']})
     return {
-        'counts': {key: counts[key] for key in ('movies','shows','episodes','movie_bytes','episode_bytes','indexed_media','catalog_media')},
+        'counts': {key: counts[key] for key in ('movies','shows','episodes','movie_bytes','episode_bytes','indexed_media','catalog_media','indexed_movies','indexed_episodes')},
         'languages': distributions,
         'libraries': [dict(row) for row in libraries],
     }
@@ -239,34 +277,35 @@ def dashboard_stats() -> dict:
 @app.get("/api/v86/notes")
 def list_media_notes(entity_type: Literal["movie", "tv"] | None = None) -> dict:
     with connection() as db:
-        query = "SELECT entity_type,entity_key,note,reviewed,plex_sync_change FROM media_notes WHERE (note!='' OR reviewed=1 OR plex_sync_change=1)"
+        query = "SELECT entity_type,entity_key,note,reviewed,plex_sync_change,final_version FROM media_notes WHERE (note!='' OR reviewed=1 OR plex_sync_change=1 OR final_version=1)"
         args = []
         if entity_type:
             query += " AND entity_type=?"; args.append(entity_type)
         rows = db.execute(query, args).fetchall()
-    return {"items": {f"{row['entity_type']}:{row['entity_key']}": {"note": row["note"], "reviewed": bool(row["reviewed"]), "plex_sync_change": bool(row["plex_sync_change"])} for row in rows}, "by_key": {row["entity_key"]: {"note": row["note"], "reviewed": bool(row["reviewed"]), "plex_sync_change": bool(row["plex_sync_change"])} for row in rows}}
+    return {"items": {f"{row['entity_type']}:{row['entity_key']}": {"note": row["note"], "reviewed": bool(row["reviewed"]), "plex_sync_change": bool(row["plex_sync_change"]), "final_version": bool(row["final_version"])} for row in rows}, "by_key": {row["entity_key"]: {"note": row["note"], "reviewed": bool(row["reviewed"]), "plex_sync_change": bool(row["plex_sync_change"]), "final_version": bool(row["final_version"])} for row in rows}}
 
 
 @app.get("/api/v86/note")
 def get_media_note(entity_type: Literal["movie", "tv"], entity_key: str) -> dict:
     with connection() as db:
-        row = db.execute("SELECT note,reviewed,plex_sync_change FROM media_notes WHERE entity_type=? AND entity_key=?", (entity_type, entity_key)).fetchone()
-    return {"entity_type": entity_type, "entity_key": entity_key, "note": row["note"] if row else "", "reviewed": bool(row["reviewed"]) if row else False, "plex_sync_change": bool(row["plex_sync_change"]) if row else False}
+        row = db.execute("SELECT note,reviewed,plex_sync_change,final_version FROM media_notes WHERE entity_type=? AND entity_key=?", (entity_type, entity_key)).fetchone()
+    return {"entity_type": entity_type, "entity_key": entity_key, "note": row["note"] if row else "", "reviewed": bool(row["reviewed"]) if row else False, "plex_sync_change": bool(row["plex_sync_change"]) if row else False, "final_version": bool(row["final_version"]) if row else False}
 
 
 @app.put("/api/v86/note")
 def save_media_note(request: MediaNoteRequest) -> dict:
     note = request.note.strip()
     with connection() as db:
-        current = db.execute("SELECT reviewed,plex_sync_change FROM media_notes WHERE entity_type=? AND entity_key=?", (request.entity_type, request.entity_key)).fetchone()
+        current = db.execute("SELECT reviewed,plex_sync_change,final_version FROM media_notes WHERE entity_type=? AND entity_key=?", (request.entity_type, request.entity_key)).fetchone()
         reviewed = bool(request.reviewed) if request.reviewed is not None else bool(current["reviewed"]) if current else False
         plex_sync_change = bool(request.plex_sync_change) if request.plex_sync_change is not None else bool(current["plex_sync_change"]) if current else False
-        if note or reviewed or plex_sync_change:
-            db.execute("INSERT INTO media_notes(entity_type,entity_key,note,reviewed,plex_sync_change,updated_at) VALUES(?,?,?,?,?,CURRENT_TIMESTAMP) ON CONFLICT(entity_type,entity_key) DO UPDATE SET note=excluded.note,reviewed=excluded.reviewed,plex_sync_change=excluded.plex_sync_change,updated_at=CURRENT_TIMESTAMP", (request.entity_type, request.entity_key, note, int(reviewed), int(plex_sync_change)))
+        final_version = bool(request.final_version) if request.final_version is not None else bool(current["final_version"]) if current else False
+        if note or reviewed or plex_sync_change or final_version:
+            db.execute("INSERT INTO media_notes(entity_type,entity_key,note,reviewed,plex_sync_change,final_version,updated_at) VALUES(?,?,?,?,?,?,CURRENT_TIMESTAMP) ON CONFLICT(entity_type,entity_key) DO UPDATE SET note=excluded.note,reviewed=excluded.reviewed,plex_sync_change=excluded.plex_sync_change,final_version=excluded.final_version,updated_at=CURRENT_TIMESTAMP", (request.entity_type, request.entity_key, note, int(reviewed), int(plex_sync_change), int(final_version)))
         else:
             db.execute("DELETE FROM media_notes WHERE entity_type=? AND entity_key=?", (request.entity_type, request.entity_key))
-    logger.info("change=media_note_saved type=%s key=%s present=%s reviewed=%s plex_sync_change=%s", request.entity_type, request.entity_key.replace("\n", " ")[:200], bool(note), reviewed, plex_sync_change)
-    return {"entity_type": request.entity_type, "entity_key": request.entity_key, "note": note, "reviewed": reviewed, "plex_sync_change": plex_sync_change}
+    logger.info("change=media_note_saved type=%s key=%s present=%s reviewed=%s plex_sync_change=%s final_version=%s", request.entity_type, request.entity_key.replace("\n", " ")[:200], bool(note), reviewed, plex_sync_change, final_version)
+    return {"entity_type": request.entity_type, "entity_key": request.entity_key, "note": note, "reviewed": reviewed, "plex_sync_change": plex_sync_change, "final_version": final_version}
 
 @app.on_event("startup")
 def initialize_postgres_workflow() -> None:

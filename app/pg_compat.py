@@ -11,12 +11,12 @@ from __future__ import annotations
 import os
 import re
 import sqlite3
+from collections.abc import Iterable
 from contextlib import AbstractContextManager
-from typing import Any, Iterable
+from typing import Any
 
 import psycopg
 from psycopg.rows import dict_row
-
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 
@@ -37,27 +37,27 @@ def _replace_qmarks(sql: str) -> str:
 def _translate_sql(sql: str) -> str:
     text = _replace_qmarks(sql.strip())
     text = re.sub(r'=([\s]*)"([^"\n]+)"', r"=\1'\2'", text)
-    text = re.sub(r"\bdatetime\s*\(\s*'now'\s*\)", "CURRENT_TIMESTAMP", text, flags=re.I)
-    text = re.sub(r"\bCURRENT_TIMESTAMP\b", "CURRENT_TIMESTAMP", text, flags=re.I)
-    text = re.sub(r"\bCOLLATE\s+NOCASE\b", "COLLATE \"C\"", text, flags=re.I)
-    text = re.sub(r"\bINTEGER\s+PRIMARY\s+KEY\s+AUTOINCREMENT\b", "BIGSERIAL PRIMARY KEY", text, flags=re.I)
-    text = re.sub(r"\bINT\s+PRIMARY\s+KEY\s+AUTOINCREMENT\b", "BIGSERIAL PRIMARY KEY", text, flags=re.I)
-    replace = re.match(r"INSERT\s+OR\s+REPLACE\s+INTO\s+([\w\"]+)\s*\(([^)]+)\)\s*(VALUES|SELECT)\s*", text, re.I | re.S)
-    ignore = bool(re.match(r"INSERT\s+OR\s+IGNORE\s+INTO\b", text, re.I))
+    text = re.sub(r"\bdatetime\s*\(\s*'now'\s*\)", "CURRENT_TIMESTAMP", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bCURRENT_TIMESTAMP\b", "CURRENT_TIMESTAMP", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bCOLLATE\s+NOCASE\b", "COLLATE \"C\"", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bINTEGER\s+PRIMARY\s+KEY\s+AUTOINCREMENT\b", "BIGSERIAL PRIMARY KEY", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bINT\s+PRIMARY\s+KEY\s+AUTOINCREMENT\b", "BIGSERIAL PRIMARY KEY", text, flags=re.IGNORECASE)
+    replace = re.match(r"INSERT\s+OR\s+REPLACE\s+INTO\s+([\w\"]+)\s*\(([^)]+)\)\s*(VALUES|SELECT)\s*", text, re.IGNORECASE | re.DOTALL)
+    ignore = bool(re.match(r"INSERT\s+OR\s+IGNORE\s+INTO\b", text, re.IGNORECASE))
     if replace:
-        table, columns, keyword = replace.groups()
+        _table, columns, _keyword = replace.groups()
         names = [column.strip() for column in columns.split(",")]
         updates = ", ".join(f"{name}=EXCLUDED.{name}" for name in names if name.strip('\"') != "id")
-        text = re.sub(r"^INSERT\s+OR\s+REPLACE\s+INTO", "INSERT INTO", text, count=1, flags=re.I)
+        text = re.sub(r"^INSERT\s+OR\s+REPLACE\s+INTO", "INSERT INTO", text, count=1, flags=re.IGNORECASE)
         text += f" ON CONFLICT DO UPDATE SET {updates}" if updates else " ON CONFLICT DO NOTHING"
     elif ignore:
-        text = re.sub(r"^INSERT\s+OR\s+IGNORE\s+INTO", "INSERT INTO", text, count=1, flags=re.I)
+        text = re.sub(r"^INSERT\s+OR\s+IGNORE\s+INTO", "INSERT INTO", text, count=1, flags=re.IGNORECASE)
         text += " ON CONFLICT DO NOTHING"
     return text
 
 
 class Cursor:
-    def __init__(self, owner: "Connection", cursor: psycopg.Cursor, statement: str = ""):
+    def __init__(self, owner: Connection, cursor: psycopg.Cursor, statement: str = ""):
         self.owner = owner
         self.cursor = cursor
         self.statement = statement
@@ -88,7 +88,7 @@ class Connection(AbstractContextManager):
         self.total_changes = 0
 
     def _special(self, sql: str) -> Cursor | None:
-        match = re.fullmatch(r"PRAGMA\s+table_info\(([^)]+)\)", sql.strip(), re.I)
+        match = re.fullmatch(r"PRAGMA\s+table_info\(([^)]+)\)", sql.strip(), re.IGNORECASE)
         if match:
             table = match.group(1).strip(" `\"")
             cur = self.raw.execute("""
@@ -101,22 +101,22 @@ class Connection(AbstractContextManager):
                  ORDER BY ordinal_position
             """, (table,))
             return Cursor(self, cur, sql)
-        if re.fullmatch(r"PRAGMA\s+(?:synchronous|busy_timeout)(?:\s*=\s*[^ ]+)?", sql.strip(), re.I):
+        if re.fullmatch(r"PRAGMA\s+(?:synchronous|busy_timeout)(?:\s*=\s*[^ ]+)?", sql.strip(), re.IGNORECASE):
             return Cursor(self, self.raw.execute("SELECT 1 AS ok"), sql)
-        if re.fullmatch(r"PRAGMA\s+journal_mode(?:\s*=\s*\w+)?", sql.strip(), re.I):
+        if re.fullmatch(r"PRAGMA\s+journal_mode(?:\s*=\s*\w+)?", sql.strip(), re.IGNORECASE):
             cur = self.raw.execute("SELECT 'wal' AS journal_mode")
             return Cursor(self, cur, sql)
-        if re.search(r"SELECT\s+sql\s+FROM\s+sqlite_master", sql, re.I):
-            match = re.search(r"name\s*=\s*'([^']+)'", sql, re.I)
+        if re.search(r"SELECT\s+sql\s+FROM\s+sqlite_master", sql, re.IGNORECASE):
+            match = re.search(r"name\s*=\s*'([^']+)'", sql, re.IGNORECASE)
             table = match.group(1) if match else ""
             rows = self.raw.execute("SELECT column_name FROM information_schema.columns WHERE table_schema='public' AND table_name=%s", (table,)).fetchall()
             columns = {row["column_name"] for row in rows}
-            schema = "CREATE TABLE %s (%s)" % (table, ", ".join(sorted(columns))) if columns else ""
+            schema = f"CREATE TABLE {table} ({", ".join(sorted(columns))})" if columns else ""
             cur = self.raw.execute("SELECT %s AS sql", (schema,))
             return Cursor(self, cur, sql)
-        if re.search(r"sqlite_master", sql, re.I):
-            text = re.sub(r"sqlite_master", "information_schema.tables", sql, flags=re.I)
-            text = re.sub(r"type\s*=\s*'table'", "table_type='BASE TABLE'", text, flags=re.I)
+        if re.search(r"sqlite_master", sql, re.IGNORECASE):
+            text = re.sub(r"sqlite_master", "information_schema.tables", sql, flags=re.IGNORECASE)
+            text = re.sub(r"type\s*=\s*'table'", "table_type='BASE TABLE'", text, flags=re.IGNORECASE)
             text = text.replace("name", "table_name")
             cur = self.raw.execute(_replace_qmarks(text), ())
             return Cursor(self, cur, sql)
@@ -128,7 +128,7 @@ class Connection(AbstractContextManager):
             return special
         translated = _translate_sql(sql)
         if "ON CONFLICT DO UPDATE SET" in translated:
-            table_match = re.search(r"INSERT\s+INTO\s+([\w\"]+)", translated, re.I)
+            table_match = re.search(r"INSERT\s+INTO\s+([\w\"]+)", translated, re.IGNORECASE)
             table_name = table_match.group(1).strip('"') if table_match else ""
             pk_rows = self.raw.execute("""
                 SELECT a.attname AS name
@@ -153,8 +153,8 @@ class Connection(AbstractContextManager):
             raise sqlite3.OperationalError('duplicate column: ' + str(exc)) from exc
         self.total_changes += max(cur.rowcount, 0)
         wrapper = Cursor(self, cur, translated)
-        if re.match(r"\s*INSERT\s+INTO\b", translated, re.I):
-            table = re.search(r"INSERT\s+INTO\s+([\w\"]+)", translated, re.I)
+        if re.match(r"\s*INSERT\s+INTO\b", translated, re.IGNORECASE):
+            table = re.search(r"INSERT\s+INTO\s+([\w\"]+)", translated, re.IGNORECASE)
             if table:
                 table_name = table.group(1).strip('"')
                 has_id = self.raw.execute("SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name=%s AND column_name='id'", (table_name,)).fetchone()
@@ -170,7 +170,7 @@ class Connection(AbstractContextManager):
         cur = self.raw.cursor()
         translated = _translate_sql(sql)
         if "ON CONFLICT DO UPDATE SET" in translated:
-            table_match = re.search(r'INSERT\s+INTO\s+([\w"]+)', translated, re.I)
+            table_match = re.search(r'INSERT\s+INTO\s+([\w"]+)', translated, re.IGNORECASE)
             table_name = table_match.group(1).strip('"') if table_match else ""
             pk_rows = self.raw.execute("""
                 SELECT a.attname AS name
@@ -205,7 +205,7 @@ class Connection(AbstractContextManager):
     def close(self) -> None:
         self.raw.close()
 
-    def __enter__(self) -> "Connection":
+    def __enter__(self) -> Connection:
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:

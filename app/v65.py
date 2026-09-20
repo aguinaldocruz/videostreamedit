@@ -8,8 +8,8 @@ import subprocess
 import tempfile
 import threading
 import time
-import urllib.request
 import urllib.error
+import urllib.request
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -17,18 +17,37 @@ from typing import Any, Literal
 
 from fastapi import HTTPException
 from pydantic import BaseModel, Field
-from pydantic import BaseModel, Field
 
-import app.v54 as indexes
 import app.v7 as media_editor
+import app.v54 as indexes
+from app.postgres_store import (
+    acquire_luw_lock,
+    append_luw_journal,
+    begin_task_stage,
+    cleanup_succeeded_workflow_group_artifacts,
+    commit_luw,
+    commit_task_artifacts,
+    create_luw,
+    fail_task_stage,
+    finish_task_stage,
+    mark_read_models_fresh,
+    prepare_task_artifact,
+    register_task_stage,
+    release_luw_lock,
+    reset_task_stage_for_retry,
+    task_stage_exists,
+    transition_luw,
+    workflow_details,
+)
+from app.postgres_store import (
+    cleanup_succeeded_workflow_artifacts as cleanup_succeeded_workflow_artifacts_startup,
+)
+from app.v5 import external_subtitles
 from app.v7 import ReorderEditRequest
-from app.v11 import connection, column_exists
+from app.v11 import column_exists, connection
 from app.v37 import MediaRenameRequest, rename_media
 from app.v43 import optimized_media_edit
 from app.v64 import app
-from app.postgres_store import register_task_stage, begin_task_stage, finish_task_stage, fail_task_stage, task_stage_exists, reset_task_stage_for_retry, prepare_task_artifact, commit_task_artifacts, cleanup_succeeded_workflow_group_artifacts, cleanup_succeeded_workflow_artifacts as cleanup_succeeded_workflow_artifacts_startup, workflow_details, create_luw, transition_luw, acquire_luw_lock, release_luw_lock, append_luw_journal, commit_luw, mark_read_models_fresh
-from app.v5 import external_subtitles
-
 
 logger = logging.getLogger("uvicorn.error")
 queue_condition = threading.Condition()
@@ -125,7 +144,7 @@ def _active_expedite_expiry(db, group_id: str | None = None, path: str | None = 
 def affected_media_path(task_type: str, payload: dict) -> str:
     if task_type == "media_edit":
         return str((payload.get("edit") or payload).get("path") or "")
-    if task_type in {"subtitle_html_cleanup", "subtitle_html_preflight"}:
+    if task_type == "subtitle_html_cleanup":
         return str(payload.get("path") or "")
     if task_type in {"tv_filtered_stream_edit", "tv_filtered_stream_edit_now", "filtered_stream_edit", "filtered_stream_edit_now", "plex_import_refresh"}:
         return str(payload.get("path") or "")
@@ -429,6 +448,20 @@ def extract_audio_sample(path: str, stream_index: int, start: float, seconds: in
 
 def process_audio_language_detection(task_id: int, payload: dict) -> dict:
     path = str(payload.get('path') or '')
+    # Final-version media is intentionally view-only. Core reconciliation still
+    # runs so Plex/file replacements can clear the lock, but advisory voice
+    # detection must not rewrite its state while the lock is active.
+    try:
+        from app.v86 import final_version_entity_for_path
+        entity = final_version_entity_for_path(path)
+        if entity:
+            with connection() as db:
+                final = db.execute("SELECT final_version FROM media_notes WHERE entity_type=? AND entity_key=?", entity).fetchone()
+            if final and bool(final["final_version"]):
+                logger.info("audio_language_detection event=skipped_final_version file=%s", path.replace('\n', '\\n'))
+                return {'path': path, 'streams': 0, 'mismatches': 0, 'skipped': 'final_version'}
+    except Exception as exc:
+        logger.debug("audio_language_detection final-version check unavailable: %s", exc)
     if not path or not Path(path).is_file():
         raise RuntimeError(f'Media file is not accessible: {path}')
     probe = json.loads(subprocess.check_output(['ffprobe', '-v', 'error', '-show_entries', 'format=duration:stream=codec_type:stream_tags=language', '-of', 'json', path, '-select_streams', 'a'], text=True))
@@ -620,11 +653,15 @@ def run_queue(lane: str = "main") -> None:
                 transition_luw(luw_id, "applying", "apply", "Applying media edit")
             if not begin_task_stage(task_payload.get("_queue_group"), task_type, stage_path, task_id):
                 with connection() as db:
-                    db.execute("UPDATE task_queue SET status='pending',progress_message='Waiting for workflow resource',started_at=NULL,updated_at=? WHERE id=?", (utc_now(), task_id))
+                    db.execute("UPDATE task_queue SET status='pending',progress_message='Waiting for workflow resource',attempts=CASE WHEN attempts>0 THEN attempts-1 ELSE 0 END,started_at=NULL,updated_at=? WHERE id=?", (utc_now(), task_id))
                 if luw_id:
                     release_luw_lock(luw_id, luw_path)
                     transition_luw(luw_id, "waiting", "workflow", "Waiting for workflow stage")
                 logger.info("workflow event=stage_waiting id=%d type=%s resource=%s", task_id, task_type, stage_path)
+                # Do not reclaim a blocked stage in a tight loop. This gives
+                # its predecessor time to advance and protects the worker
+                # from malformed/orphaned workflow groups.
+                time.sleep(0.5)
                 continue
             stage_started = True
             # Private queue metadata is persisted for validation but must not

@@ -1,17 +1,86 @@
 const CHANGE_HISTORY_KEY = 'videostreamedit.stream-change-history.v1';
 let bulkHistoryMatches = [];
+let durableTemplateCache = [];
+let durableTemplatesLoaded = false;
 
-function templateFingerprint(template) {
-  return JSON.stringify({before: template.before, after: template.after});
+function durableTemplateFingerprint(template) { return templateFingerprint(template); }
+function mergedTemplateHistory() {
+  const combined = [...durableTemplateCache.filter(template => template.enabled !== false), ...readLocalTemplateHistory()];
+  const seen = new Set();
+  return combined.filter(template => {
+    if (!template?.before || !template?.after) return false;
+    const key = durableTemplateFingerprint(template);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  }).slice(0, 100);
 }
 
-function readChangeHistory() {
+function readLocalTemplateHistory() {
   let history = [];
   try { history = JSON.parse(localStorage.getItem(CHANGE_HISTORY_KEY) || '[]'); }
   catch (_) { history = []; }
   const legacy = readLastChange();
   if (legacy && !history.some(template => templateFingerprint(template) === templateFingerprint(legacy))) history.unshift(legacy);
   return history.filter(template => template?.before && template?.after).slice(0, 10);
+}
+
+async function loadDurableTemplates() {
+  try {
+    const result = await api('/api/v25/templates?include_disabled=true');
+    durableTemplateCache = Array.isArray(result.templates) ? result.templates : [];
+    durableTemplatesLoaded = true;
+    updateCloneButton();
+    if (typeof renderTemplateMaintenance === 'function') renderTemplateMaintenance();
+  } catch (error) {
+    console.warn('Durable template store unavailable; using browser history', error);
+  }
+}
+
+async function persistDurableTemplate(template) {
+  try {
+    const result = await api('/api/v25/templates', {method:'POST', body: JSON.stringify({
+      name: template.name || (template.changes || []).join(' · ') || 'Stream change template',
+      description: template.description || '', scope: 'media', before: template.before, after: template.after, changes: template.changes || []
+    })});
+    if (result.template) {
+      durableTemplateCache = [result.template, ...durableTemplateCache.filter(item => durableTemplateFingerprint(item) !== durableTemplateFingerprint(result.template))].slice(0, 100);
+      if (typeof renderTemplateMaintenance === 'function') renderTemplateMaintenance();
+      return result.template;
+    }
+  } catch (error) {
+    console.warn('Could not persist stream change template', error);
+  }
+  return null;
+}
+
+async function recordDurableTemplateUse(template) {
+  if (!template?.id) return;
+  try {
+    const result = await api(`/api/v25/templates/${encodeURIComponent(template.id)}/use`, {method:'POST'});
+    if (result.template) durableTemplateCache = durableTemplateCache.map(item => item.id === template.id ? result.template : item);
+  } catch (error) { console.warn('Could not record template use', error); }
+}
+
+function templateFingerprint(template) {
+  return JSON.stringify({before: template.before, after: template.after});
+}
+
+
+function allTemplateHistory() {
+  const combined = [...durableTemplateCache, ...readLocalTemplateHistory()];
+  const seen = new Set();
+  return combined.filter(template => {
+    if (!template?.before || !template?.after) return false;
+    const key = templateFingerprint(template);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  }).slice(0, 100);
+}
+
+function readChangeHistory() {
+  return durableTemplatesLoaded ? mergedTemplateHistory() : readLocalTemplateHistory();
 }
 
 function saveChangeHistory(template) {
@@ -26,7 +95,8 @@ function compatibleHistoryTemplates(current) {
 }
 
 function templateSummary(template) {
-  const time = template.savedAt ? new Date(template.savedAt).toLocaleString() : 'Saved change';
+  const timestamp = template.savedAt || template.updated_at || template.created_at;
+  const time = timestamp ? new Date(timestamp).toLocaleString() : 'Saved change';
   return {time, detail: (template.changes || []).join(' · ') || 'Stream property changes'};
 }
 
@@ -37,11 +107,11 @@ function ensureTemplateChoiceDialog() {
 }
 
 function chooseIndividualTemplate(templates) {
-  if (templates.length === 1) { chooseCloneMode(templates[0]); return; }
+  if (templates.length === 1) { recordDurableTemplateUse(templates[0]); chooseCloneMode(templates[0]); return; }
   ensureTemplateChoiceDialog();
   $('#template-choice-scope').textContent = `${templates.length} saved templates match this media`;
   $('#template-choice-list').innerHTML = templates.map((template, index) => {const summary = templateSummary(template);return `<button type="button" data-template-index="${index}"><strong>${esc(summary.time)}</strong><small>${esc(summary.detail)}</small></button>`;}).join('');
-  $('#template-choice-list').querySelectorAll('button').forEach(button => button.onclick = () => {const template = templates[Number(button.dataset.templateIndex)];$('#template-choice-dialog').close();chooseCloneMode(template)});
+  $('#template-choice-list').querySelectorAll('button').forEach(button => button.onclick = () => {const template = templates[Number(button.dataset.templateIndex)];$('#template-choice-dialog').close(); recordDurableTemplateUse(template); chooseCloneMode(template)});
   $('#template-choice-dialog').showModal();
 }
 
@@ -59,7 +129,7 @@ updateCloneButton = function () {
 };
 
 document.addEventListener('media-properties-applied', event => {
-  const template = readLastChange();
+  const template = event.detail?.template;
   if (!template) return;
   if (window.templateSavePromptsEnabled === false) {
     updateCloneButton();
@@ -71,7 +141,9 @@ document.addEventListener('media-properties-applied', event => {
 
 ${summary.detail}`);
   if (!saveTemplate) { updateCloneButton(); scheduleBulkCloneInspection(); return; }
-  saveChangeHistory({...template, sourcePath: event.detail.path, sourceLabel: $('#selected-file').textContent});
+  const savedTemplate = {...template, sourcePath: event.detail.path, sourceLabel: $('#selected-file').textContent};
+  saveChangeHistory(savedTemplate);
+  persistDurableTemplate(savedTemplate).then(() => updateCloneButton());
   updateCloneButton();
   scheduleBulkCloneInspection();
 });
@@ -103,14 +175,17 @@ function chooseBulkHistoryTemplate() {
   if (bulkHistoryMatches.length === 1) {
     const match = bulkHistoryMatches[0];
     bulkCloneInspection = {count: match.count, candidates: match.candidates, saved: match.saved};
+    recordDurableTemplateUse(match.saved);
     openBulkCloneReview();
     return;
   }
   ensureTemplateChoiceDialog();
   $('#template-choice-scope').textContent = `${bulkHistoryMatches.length} saved templates match listed episodes`;
   $('#template-choice-list').innerHTML = bulkHistoryMatches.map((match, index) => {const summary = templateSummary(match.saved);return `<button type="button" data-template-index="${index}"><strong>${match.count} episode${match.count === 1 ? '' : 's'} · ${esc(summary.time)}</strong><small>${esc(summary.detail)}</small></button>`;}).join('');
-  $('#template-choice-list').querySelectorAll('button').forEach(button => button.onclick = () => {const match = bulkHistoryMatches[Number(button.dataset.templateIndex)];bulkCloneInspection = {count: match.count, candidates: match.candidates, saved: match.saved};$('#template-choice-dialog').close();openBulkCloneReview()});
+  $('#template-choice-list').querySelectorAll('button').forEach(button => button.onclick = () => {const match = bulkHistoryMatches[Number(button.dataset.templateIndex)];bulkCloneInspection = {count: match.count, candidates: match.candidates, saved: match.saved};$('#template-choice-dialog').close(); recordDurableTemplateUse(match.saved); openBulkCloneReview()});
   $('#template-choice-dialog').showModal();
 }
 
 scheduleBulkCloneInspection();
+
+loadDurableTemplates();

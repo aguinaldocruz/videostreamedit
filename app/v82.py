@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 import subprocess
 from pathlib import Path
 
@@ -13,14 +14,14 @@ import app.v54 as indexes
 import app.v65 as tasks
 import app.v79 as tv_bulk
 import app.v80 as queues
-from app.v5 import external_subtitles, split_tag, plex_language_pair
+from app.v2 import probe
+from app.v5 import external_subtitles, plex_language_pair, split_tag
+from app.v7 import ReorderEditRequest
 from app.v11 import column_exists, connection
 from app.v13 import media_details_with_ietf
-from app.v2 import probe
 from app.v43 import optimized_media_edit
-from app.v7 import ReorderEditRequest
 from app.v81 import app
-
+from app.preflight_dispatcher import enqueue_bulk_preflight, register_approval_handler, register_handler
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -304,6 +305,9 @@ def selected_movies(paths: list[str]) -> list[dict]:
             found.extend(dict(row) for row in rows)
     if {row["path"] for row in found} != set(unique):
         raise HTTPException(409, "The movie selection changed. Refresh Movies and try again")
+    from app.v86 import assert_media_editable
+    for row in found:
+        assert_media_editable(row["path"])
     return found
 
 
@@ -344,7 +348,7 @@ def process_filtered_stream_edit(task_id: int, payload: dict) -> dict:
     request_data["paths"] = [path]
     request_data["mode"] = "now"
     request = tv_bulk.SeasonStreamBulkEdit.model_validate(request_data)
-    episode = (re.search(r"(?:^|[^A-Za-z])(S\d{1,2}E\d{1,2})(?:[^A-Za-z]|$)", path, re.I) or [None, ""])[1].upper()
+    episode = (re.search(r"(?:^|[^A-Za-z])(S\d{1,2}E\d{1,2})(?:[^A-Za-z]|$)", path, re.IGNORECASE) or [None, ""])[1].upper()
     prefix = f"Processing episode {episode} · " if episode else "Processing media · "
     tasks.update_progress(task_id, 0, 2, prefix + "Checking current streams")
     edit, matched = tv_bulk.episode_bulk_edit(path, request)
@@ -388,46 +392,48 @@ def enqueue_filtered_movie_edits(paths: list[str], request: MovieStreamBulkEdit)
     return queued, task_ids
 
 
-def process_movie_bulk_preflight(task_id: int, payload: dict) -> dict:
+def preflight_movie_bulk_item(payload: dict, fingerprint: dict) -> dict:
+    path = str(payload.get("path") or "")
+    expected = payload.get("_preflight_fingerprint") or {}
+    if not fingerprint.get("exists"):
+        return {"decision": "invalid", "reason": "Media file is not accessible", "path": path}
+    if expected and (int(expected.get("size", -1)) != int(fingerprint.get("size", -2)) or int(expected.get("mtime_ns", -1)) != int(fingerprint.get("mtime_ns", -2))):
+        return {"decision": "stale", "reason": "Media changed after bulk request", "path": path}
     request_data = dict(payload.get("request") or {})
-    paths = list(dict.fromkeys(payload.get("paths") or []))
-    request_data.update({"paths": paths, "mode": "now"})
-    request = MovieStreamBulkEdit.model_validate(request_data)
-    targets = tv_bulk.indexed_target_keys(paths, request.filters)
-    candidates: list[tuple[str, dict]] = []
-    skipped = 0
-    tasks.update_progress(task_id, 0, max(1, len(paths)), "Checking bulk changes")
-    for number, path in enumerate(paths, 1):
-        if targets.get(path):
-            per_media = {**request.model_dump(exclude={"paths", "mode"}), "target_keys": targets[path]}
-            try:
-                preview, matched = tv_bulk.episode_bulk_edit(path, tv_bulk.SeasonStreamBulkEdit.model_validate({**per_media, "paths": [path], "mode": "now"}))
-                if matched and tv_bulk.edit_has_effective_changes(preview):
-                    candidates.append((path, per_media))
-                else:
-                    skipped += 1
-            except Exception as exc:
-                logger.warning("movie_stream_bulk_preflight event=media_failed path=%s error=%s", path, str(exc).replace("\n", " ")[-300:])
-                skipped += 1
-        else:
-            skipped += 1
-        tasks.update_progress(task_id, number, max(1, len(paths)), f"Checked {number} of {len(paths)} media")
-    child_ids: list[int] = []
-    now = tasks.utc_now()
-    with connection() as db:
-        for path, per_media in candidates:
-            signed = tasks.attach_media_signature("filtered_stream_edit", {"path": path, "request": per_media})
-            cursor = db.execute("INSERT INTO task_queue(task_type,label,payload_json,status,progress_message,created_at,updated_at) VALUES(?,?,?,'pending','Waiting',?,?)", ("filtered_stream_edit", f"Movie filtered stream edit · {Path(path).name}", json.dumps(signed, ensure_ascii=False, separators=(",", ":")), now, now))
-            db.execute("INSERT OR REPLACE INTO media_change_request(task_id,path,requested_at) VALUES(?,?,?)", (cursor.lastrowid, path, now))
-            child_ids.append(int(cursor.lastrowid))
-    tasks.wake_queue()
-    logger.info("movie_stream_bulk_preflight event=completed checked=%d queued=%d skipped=%d", len(paths), len(child_ids), skipped)
-    return {"queued": len(child_ids), "skipped": skipped, "task_ids": child_ids}
+    request_data["paths"] = [path]
+    request_data["mode"] = "now"
+    try:
+        request = MovieStreamBulkEdit.model_validate(request_data)
+        targets = tv_bulk.indexed_target_keys([path], request.filters).get(path, [])
+        if not targets:
+            return {"decision": "skipped", "reason": "No current stream matches the selected filter", "path": path}
+        per_media = {**request.model_dump(exclude={"paths", "mode"}), "target_keys": targets}
+        preview, matched = tv_bulk.episode_bulk_edit(path, tv_bulk.SeasonStreamBulkEdit.model_validate({**per_media, "paths": [path], "mode": "now"}))
+        if not matched or not tv_bulk.edit_has_effective_changes(preview):
+            return {"decision": "skipped", "reason": "Media already has the requested values", "path": path}
+        return {"decision": "approved", "path": path, "matched": matched, "request": per_media}
+    except Exception as exc:
+        return {"decision": "invalid", "reason": str(exc), "path": path}
 
+
+def approve_movie_bulk(payload: dict, result: dict) -> dict:
+    task_ids = []
+    for item in payload.get("_bulk_items") or []:
+        plan = dict((item.get("_preflight_result") or {}).get("request") or {})
+        if not plan:
+            continue
+        mode = str((item.get("request") or {}).get("mode") or "queue")
+        task_type = "filtered_stream_edit_now" if mode == "now" else "filtered_stream_edit"
+        child = tasks.enqueue(task_type, {"path": item.get("path"), "request": plan}, f"Movie filtered stream edit · {Path(str(item.get('path') or '')).name}", deduplicate=True)
+        task_ids.append(child["id"])
+    return {"task_ids": task_ids, "queued": len(task_ids), "task_type": "filtered_stream_edit"}
+
+
+register_handler("movie_stream_edit_bulk", preflight_movie_bulk_item)
+register_approval_handler("movie_stream_edit_bulk", approve_movie_bulk)
 
 tasks.TASK_HANDLERS["filtered_stream_edit"] = process_filtered_stream_edit
 tasks.TASK_HANDLERS["filtered_stream_edit_now"] = process_filtered_stream_edit
-tasks.TASK_HANDLERS["movie_bulk_preflight"] = process_movie_bulk_preflight
 
 
 @app.post("/api/v82/movies/stream-bulk-edit")
@@ -451,8 +457,9 @@ def movie_stream_bulk_edit(request: MovieStreamBulkEdit) -> dict:
     # Both modes use an asynchronous preflight. Signature capture and current
     # stream verification can be expensive for large movie selections; keeping
     # them in the queue makes the response immediate and observable.
-    preflight = tasks.enqueue("movie_bulk_preflight", {"paths": request.paths, "request": request.model_dump(exclude={"paths", "mode"}), "mode": request.mode}, "Preflight movie bulk stream change")
-    return {"mode": request.mode, "queued": 1, "preflight": True, "task_ids": [preflight["id"]], "applied": 0, "streams": 0, "skipped": [], "failed": []}
+    items = [{"path": path, "request": request.model_dump(exclude={"paths"})} for path in request.paths]
+    preflight = enqueue_bulk_preflight("movie_stream_edit_bulk", items, mode="immediate" if request.mode == "now" else "queued", priority=80, deduplicate=True)
+    return {"mode": request.mode, "queued": len(items), "preflight": True, "preflight_id": preflight["id"], "task_ids": [], "applied": 0, "streams": 0, "skipped": [], "failed": []}
 
 
 
@@ -734,8 +741,6 @@ def core_index_compatibility() -> dict:
         audit = db.execute(
             "SELECT sample_limit,sample_kind,checked,mismatches,missing,checked_at FROM core_index_parity_audit ORDER BY id DESC LIMIT 1"
         ).fetchone()
-    catalog_media_count = counts["catalog_media"]
-    audit_complete = bool(audit and str(audit["sample_kind"] or "") == "__full__" and int(audit["checked"] or 0) >= catalog_media_count and not int(audit["mismatches"] or 0) and not int(audit["missing"] or 0))
     return {
         "canonical_authoritative": True,
         "legacy_projection_writes_enabled": False,

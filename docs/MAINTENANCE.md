@@ -4,7 +4,7 @@
 
 The container starts `uvicorn app.v86:app`. The application is assembled through the versioned modules imported by that module; the version numbers are compatibility boundaries from the project's iterative development history, not separate services. The active chain includes the Plex/catalog layer, stream editor, task queue, reports, dashboard, and index queues. Do not delete an apparently old `vNN` module without first checking imports and route registration.
 
-`app/main.py` is the original standalone prototype and is not the production entrypoint. `Dockerfile.orig` and other generated/runtime files must not be committed.
+The original standalone prototype entrypoint and its `app/static/index.html`, `app.css`, and `app.js` assets have been removed. `Dockerfile.orig` and other generated/runtime files must not be committed.
 
 ## Verification
 
@@ -37,4 +37,4 @@ Every persistent setting, queue type, API behavior, or destructive media operati
 
 ## Verified legacy modules
 
-A static dependency audit from `app.v86` found three versioned modules that are not imported by the production chain: `app/v3.py`, `app/v4.py`, and `app/v6.py`. They are retained intentionally as historical development entrypoints because users may still invoke them manually; they are not loaded by the Docker image. `app/main.py` is likewise a standalone prototype. They should only be removed in a deliberate major-version cleanup after confirming no external deployment references them.
+A static dependency audit from `app.v86` found three versioned modules that are not imported by the production chain: `app/v3.py`, `app/v4.py`, and `app/v6.py`. They are not loaded by the Docker image and are not part of the production source tree. The standalone prototype was removed after repository-wide reference checks.

@@ -14,3 +14,5 @@
 .list-filters .list-note-filter input[data-symbol="×"],.list-filters .list-plex-filter input[data-symbol="×"],.list-filters .list-index-filter input[data-symbol="×"]{border-color:#e79a9a;background:#45252a}.list-filters .list-note-filter input[data-symbol="×"]::after,.list-filters .list-plex-filter input[data-symbol="×"]::after,.list-filters .list-index-filter input[data-symbol="×"]::after{color:#ffb0b0}
 
 .plex-sync-tag{display:inline-grid;place-items:center;width:1.05rem;height:1.05rem;margin-left:.2rem;border:1px solid #e6b86b;border-radius:50%;color:#e6b86b;font-size:.66rem;font-weight:700;vertical-align:middle;cursor:help}.note-dialog [data-note-plex-reset]{min-width:9.5rem}
+
+.final-version-tag{display:inline-grid;place-items:center;width:1.05rem;height:1.05rem;margin-left:.2rem;border:1px solid #d7a85b;border-radius:50%;color:#d7a85b;font-size:.66rem;font-weight:700;vertical-align:middle;cursor:help}.edit-file:disabled{opacity:.55;cursor:not-allowed}

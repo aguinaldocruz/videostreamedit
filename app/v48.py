@@ -10,7 +10,6 @@ from app.v11 import connection
 from app.v40 import TrackNameSuggestionRequest
 from app.v44 import app
 
-
 logger = logging.getLogger("uvicorn.error")
 
 

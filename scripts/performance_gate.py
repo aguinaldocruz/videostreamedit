@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Read-only latency and payload gate for production redesign endpoints."""
 from __future__ import annotations
+
 import argparse
 import gzip
 import sys

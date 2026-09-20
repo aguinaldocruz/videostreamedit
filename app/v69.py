@@ -9,11 +9,20 @@ import time
 from fastapi import Query
 from fastapi.responses import FileResponse, Response, StreamingResponse
 
-import app.v63 as preview_cache
 import app.v54 as preview_jobs
-from app.v63 import PREVIEW_ENCODER_VERSION, PREVIEW_SAMPLE_SECONDS, PREVIEW_START_SECONDS, audio_command, cache_entry_valid, enforce_lru, preview_media_signature, register_file
+import app.v63 as preview_cache
 from app.v2 import probe
 from app.v28 import authorized_import_file
+from app.v63 import (
+    PREVIEW_ENCODER_VERSION,
+    PREVIEW_SAMPLE_SECONDS,
+    PREVIEW_START_SECONDS,
+    audio_command,
+    cache_entry_valid,
+    enforce_lru,
+    preview_media_signature,
+    register_file,
+)
 from app.v68 import app
 
 

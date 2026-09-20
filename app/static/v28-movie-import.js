@@ -17,16 +17,44 @@ function ensureMovieImportUi() {
 
 function ensureImportSetupCards() {
   const setup = $('#setup');
-  if (!$('#movie-import-settings')) setup.insertAdjacentHTML('beforeend', '<div class="import-setup-grid"><article id="movie-import-settings"><h3>Movie import</h3><p>Choose the folder where new movies arrive inside this container.</p><div id="movie-import-input-path" class="import-path">Not configured</div><button type="button" id="browse-import-input">Choose input folder</button></article><article id="template-maintenance"><h3>Saved change templates</h3><p>Review or delete browser-local stream change templates.</p><div id="template-maintenance-list"></div><button type="button" id="clear-change-templates" class="danger">Delete all templates</button></article><article id="saved-property-maintenance"><h3>Saved stream properties</h3><p>Edit or remove reusable languages, regions, and track names.</p><div id="saved-property-list"></div></article></div>');
+  if (!$('#movie-import-settings')) setup.insertAdjacentHTML('beforeend', '<div class="import-setup-grid"><article id="movie-import-settings"><h3>Movie import</h3><p>Choose the folder where new movies arrive inside this container.</p><div id="movie-import-input-path" class="import-path">Not configured</div><button type="button" id="browse-import-input">Choose input folder</button></article><article id="template-maintenance"><h3>Saved change templates</h3><p>Manage durable stream change templates; local history remains a fallback.</p><div id="template-maintenance-list"></div><button type="button" id="clear-change-templates" class="danger">Delete all templates</button></article><article id="saved-property-maintenance"><h3>Saved stream properties</h3><p>Edit or remove reusable languages, regions, and track names.</p><div id="saved-property-list"></div></article></div>');
   $('#browse-import-input').onclick = () => openImportFolderPicker(importConfig?.input_folder || '/');
-  $('#clear-change-templates').onclick = () => {if(window.confirm('Delete all saved change templates?')){localStorage.removeItem(CHANGE_HISTORY_KEY);localStorage.removeItem(LAST_CHANGE_KEY);renderTemplateMaintenance();scheduleBulkCloneInspection()}};
+  $('#clear-change-templates').onclick = async () => {if(!window.confirm('Delete all saved change templates?')) return; try { await api('/api/v25/templates', {method:'DELETE'}); if(typeof durableTemplateCache !== 'undefined') durableTemplateCache=[]; } catch (error) { console.warn('Could not clear durable templates', error); } localStorage.removeItem(CHANGE_HISTORY_KEY); localStorage.removeItem(LAST_CHANGE_KEY); renderTemplateMaintenance(); scheduleBulkCloneInspection()};
 }
 
 function renderTemplateMaintenance() {
-  const list = $('#template-maintenance-list'), templates = readChangeHistory();
-  list.innerHTML = templates.length ? templates.map((template,index)=>{const summary=templateSummary(template);return`<div class="template-maintenance-item"><div><strong>${esc(summary.time)}</strong><small>${esc(summary.detail)}</small></div><button type="button" class="danger" data-delete-template="${index}">Delete</button></div>`}).join('') : '<p class="muted">No saved templates.</p>';
-  list.querySelectorAll('[data-delete-template]').forEach(button => button.onclick = () => {const templates=readChangeHistory(),removed=templates.splice(Number(button.dataset.deleteTemplate),1);if(removed.length&&readLastChange()&&templateFingerprint(removed[0])===templateFingerprint(readLastChange()))localStorage.removeItem(LAST_CHANGE_KEY);localStorage.setItem(CHANGE_HISTORY_KEY,JSON.stringify(templates.slice(0,10)));renderTemplateMaintenance();scheduleBulkCloneInspection()});
+  const list = $('#template-maintenance-list'), templates = typeof allTemplateHistory === 'function' ? allTemplateHistory() : readChangeHistory();
+  list.innerHTML = templates.length ? templates.map((template,index)=>{
+    const summary=templateSummary(template), durable=Boolean(template.id);
+    return `<div class="template-maintenance-item" data-template-row="${index}">
+      <div class="template-maintenance-fields">
+        ${durable ? `<input type="text" value="${attr(template.name || summary.detail)}" data-template-name aria-label="Template name">` : `<strong>${esc(summary.time)}</strong>`}
+        ${durable ? `<input type="text" value="${attr(template.description || '')}" placeholder="Description" data-template-description aria-label="Template description">` : `<small>${esc(summary.detail)}</small>`}
+        ${durable ? `<small>${template.use_count || 0} uses · ${template.enabled ? 'Enabled' : 'Disabled'}</small>` : ''}
+      </div>
+      ${durable ? `<label class="template-enabled"><input type="checkbox" data-template-enabled ${template.enabled ? 'checked' : ''}> Enabled</label><button type="button" data-save-template>Save</button>` : ''}
+      <button type="button" class="danger" data-delete-template="${index}">Delete</button>
+    </div>`;
+  }).join('') : '<p class="muted">No saved templates.</p>';
+  list.querySelectorAll('[data-save-template]').forEach(button => button.onclick = async () => {
+    const row=button.closest('[data-template-row]'), template=templates[Number(row.dataset.templateRow)];
+    if(!template?.id) return;
+    button.disabled=true;
+    try {
+      const result=await api(`/api/v25/templates/${encodeURIComponent(template.id)}`, {method:'PUT', body:JSON.stringify({name:row.querySelector('[data-template-name]').value.trim(), description:row.querySelector('[data-template-description]').value.trim(), enabled:row.querySelector('[data-template-enabled]').checked})});
+      if(typeof durableTemplateCache !== 'undefined') durableTemplateCache=durableTemplateCache.map(item=>item.id===template.id?result.template:item);
+      toast('Template saved'); renderTemplateMaintenance(); scheduleBulkCloneInspection();
+    } catch(error) { toast(error.message,true); button.disabled=false; }
+  });
+  list.querySelectorAll('[data-delete-template]').forEach(button => button.onclick = async () => {
+    const current=readChangeHistory(), removed=current.splice(Number(button.dataset.deleteTemplate),1), item=removed[0];
+    if(item?.id){ try { await api(`/api/v25/templates/${encodeURIComponent(item.id)}`, {method:'DELETE'}); if(typeof durableTemplateCache !== 'undefined') durableTemplateCache=durableTemplateCache.filter(template=>template.id!==item.id); } catch(error){ toast(error.message,true); return; } }
+    if(removed.length&&readLastChange()&&templateFingerprint(removed[0])===templateFingerprint(readLastChange()))localStorage.removeItem(LAST_CHANGE_KEY);
+    localStorage.setItem(CHANGE_HISTORY_KEY,JSON.stringify(current.filter(template=>!template.id).slice(0,10)));
+    renderTemplateMaintenance(); scheduleBulkCloneInspection();
+  });
 }
+
 
 async function renderSavedPropertyMaintenance(){const list=$("#saved-property-list");if(!list)return;try{const data=await api("/api/v8/saved-values"),labels={language:"Languages",region:"Regions",title_audio:"Audio track names",title_subtitle:"Subtitle track names"};list.innerHTML=Object.entries(labels).map(([field,label])=>`<section class="saved-property-group"><strong>${label}</strong>${(data[field]||[]).length?(data[field]||[]).map(value=>`<div class="saved-property-item"><input type="text" value="${attr(value)}" data-saved-field="${field}" data-saved-original="${attr(value)}"><button type="button" data-update-saved>Save</button><button type="button" class="danger" data-remove-saved>Delete</button></div>`).join(""):`<small class="muted">None saved</small>`}</section>`).join("");list.querySelectorAll("[data-update-saved]").forEach(button=>button.onclick=()=>updateSavedProperty(button));list.querySelectorAll("[data-remove-saved]").forEach(button=>button.onclick=()=>removeSavedProperty(button))}catch(error){list.innerHTML=`<p class="error">${esc(error.message)}</p>`}}
 async function updateSavedProperty(button){const input=button.parentElement.querySelector("input"),newValue=input.value.trim();if(!newValue){toast("Saved value cannot be empty",true);return}try{const result=await api("/api/v34/saved-values",{method:"PUT",body:JSON.stringify({field:input.dataset.savedField,value:input.dataset.savedOriginal,new_value:newValue})});if(!result.updated)throw new Error("Saved value was not found");toast("Saved property updated");await renderSavedPropertyMaintenance()}catch(error){toast(error.message,true)}}

@@ -9,8 +9,15 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from app.subtitle_detector_config import SUBTITLE_DETECTOR_VERSION
-from app.v79 import _subtitle_analysis_signature, analyze_sdh, calibrate_subtitle_confidence, detect_common_variant, normalized_evidence_sample, subtitle_quality_issue
 from app.v51 import damage_kind
+from app.v79 import (
+    _subtitle_analysis_signature,
+    analyze_sdh,
+    calibrate_subtitle_confidence,
+    detect_common_variant,
+    normalized_evidence_sample,
+    subtitle_quality_issue,
+)
 from app.v80 import detection_scope_for_edit, detection_scope_for_operation
 
 
@@ -74,7 +81,7 @@ def main() -> int:
     pt_detected, _, _ = detect_common_variant("acção óptimo direcção recepção", {"pt"})
     if br_detected != "pt-BR" or pt_detected != "pt-PT":
         raise AssertionError("Portuguese spelling evidence must distinguish regional variants")
-    gibberish = "\n".join(["1", "00:00:01,000 --> 00:00:02,000", "a b c d e f g h i j k l"])
+    gibberish = "1\n00:00:01,000 --> 00:00:02,000\na b c d e f g h i j k l"
     if "OCR gibberish" not in damage_kind(gibberish):
         raise AssertionError("isolated OCR characters must be classified as damage")
 

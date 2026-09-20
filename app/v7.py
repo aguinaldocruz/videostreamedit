@@ -148,6 +148,8 @@ def persist_remux_language_tags(
 
 
 def _reorder_edit_impl(request: ReorderEditRequest) -> dict:
+    from app.v86 import assert_media_editable
+    assert_media_editable(request.path)
     source = authorized_file(request.path)
     original = source.stat()
     data = probe(source)
@@ -267,7 +269,7 @@ def _reorder_edit_impl(request: ReorderEditRequest) -> dict:
     for track in request.tracks:
         changed = []
         if track.language is not None or track.region is not None:
-            changed.append("language=%s region=%s" % (track.language or "", track.region or ""))
+            changed.append(f"language={track.language or ''} region={track.region or ''}")
         if track.title is not None:
             changed.append(f"title={track.title}")
         if changed:
@@ -284,19 +286,12 @@ def _reorder_edit_impl(request: ReorderEditRequest) -> dict:
 
 @app.post("/api/v7/media/edit")
 def reorder_edit(request: ReorderEditRequest) -> dict:
-    """Compatibility edit route with the same scoped follow-up planner as v43."""
-    result = _reorder_edit_impl(request)
-    try:
-        from app.v80 import detection_scope_for_edit, media_indexes_for_edit, request_media_indexes
-        payload = request.model_dump()
-        remuxed = True  # this legacy path always rewrites the container
-        request_media_indexes(
-            str(result.get("edited") or request.path),
-            media_indexes_for_edit(payload, remuxed=remuxed),
-            "Compatibility media edit completed",
-            defer_detection=request.defer_language_detection,
-            detection_scope=detection_scope_for_edit(payload, remuxed=remuxed),
-        )
-    except Exception as exc:
-        logger.warning("subtitle_detection event=compatibility_post_edit_reindex_failed file=%s error=%s", str(request.path).replace(chr(10), " ")[-300:], str(exc).replace(chr(10), " ")[-300:])
-    return result
+    """Stable compatibility URL delegating to the canonical v43 editor.
+
+    Older clients can keep their URL, but they now receive the same LUW,
+    signature validation, targeted detection invalidation, index planning,
+    final-version lock, and error semantics as current clients. The low-level
+    remux helper above remains private because v43 uses it for its fallback.
+    """
+    from app.v43 import optimized_media_edit
+    return optimized_media_edit(request)

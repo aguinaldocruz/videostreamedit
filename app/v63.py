@@ -21,7 +21,6 @@ from app.v28 import authorized_import_file
 from app.v55 import cached_subtitle_preview
 from app.v59 import app
 
-
 logger = logging.getLogger("uvicorn.error")
 DEFAULT_CACHE_LIMIT = 512 * 1024**2
 PREVIEW_SAMPLE_SECONDS = 25
@@ -138,9 +137,8 @@ def preview_claim(path: str, type_index: int, segment: int):
     with _preview_lock_guard:
         lock = _preview_key_locks.setdefault(key, threading.Lock())
     try:
-        with lock:
-            with _preview_slot:
-                yield
+        with lock, _preview_slot:
+            yield
     finally:
         # Keep the lock map bounded after the request has completed. A racing
         # request may retain the lock briefly; removing only unlocked entries

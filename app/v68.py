@@ -1,16 +1,17 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
 import re
-import subprocess
 import shutil
+import subprocess
 import tempfile
-import hashlib
 import threading
 import time
 import urllib.parse
+import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Literal
@@ -23,10 +24,17 @@ import app.v11 as plex
 import app.v19 as titles
 import app.v54 as indexes
 import app.v65 as tasks
-from app.v51 import SubtitleCleanup, apply_subtitle_cleanup, TEXT_SUBTITLE_CODECS, complete_extracted_text, HTML_TAG
+from app.postgres_store import mark_read_models_fresh
 from app.v2 import probe
+from app.v51 import (
+    HTML_TAG,
+    TEXT_SUBTITLE_CODECS,
+    SubtitleCleanup,
+    apply_subtitle_cleanup,
+    complete_extracted_text,
+)
 from app.v67 import app
-
+from app.preflight_dispatcher import enqueue_bulk_preflight, enqueue_preflight, register_approval_handler, register_handler
 
 logger = logging.getLogger("uvicorn.error")
 plex_sync_lock = threading.Lock()
@@ -161,7 +169,7 @@ def file_changed_records(records: list[tuple], previous: dict[str, tuple[int, in
     """Select new, moved, or content-changed files; ignore Plex-only metadata changes."""
     return [
         record for record in records
-        if previous.get(str(record[0])) != (int(record[9] or 0), int(record[10] or 0))
+        if previous.get(str(record[0])) != (int(record[9] or 0), record[10] or 0)
     ]
 
 
@@ -314,7 +322,7 @@ def process_plex_sync(task_id: int, payload: dict) -> dict:
                     changed_path = str(record[0])
                     from app.v80 import detection_scope_for_operation
                     request_media_indexes(changed_path, ["core", "subtitles"], "Plex catalog media added or changed", detection_scope=detection_scope_for_operation("media_added_or_changed"))
-                    mark_read_models_fresh(changed_path, "plex", {"modified": int(record[10] or 0), "size": int(record[9] or 0)})
+                    mark_read_models_fresh(changed_path, "plex", {"modified": record[10] or 0, "size": int(record[9] or 0)})
             changed += len(changed_records)
             catalog_records += len(records)
             logger.info("plex_sync event=library_processed mode=%s library=%s items=%d catalog_items=%d media=%d file_changes=%d step=%d total=%d", "rebuild" if rebuild else "incremental", library["title"].replace("\n", "\\n"), len(items), len(all_items), len(records), len(changed_records), number, len(libraries))
@@ -330,50 +338,67 @@ def process_plex_sync(task_id: int, payload: dict) -> dict:
         plex_sync_lock.release()
 
 
-def process_subtitle_html_preflight(task_id: int, payload: dict) -> dict:
-    request = SubtitleCleanup.model_validate(payload)
-    if request.external_path:
-        suffix = Path(request.external_path).suffix.lower().lstrip(".")
-        if suffix not in {"srt", "ass", "ssa", "vtt", "webvtt", "sub", "txt"}:
-            tasks.update_progress(task_id, 1, 1, "Skipped: external subtitle is not text")
-            return {"queued": 0, "skipped": True, "reason": "Only text subtitles can have markup removed"}
-    else:
-        streams = probe(Path(request.path)).get("streams", [])
-        subtitles = [stream for stream in streams if stream.get("codec_type") == "subtitle"]
-        index = request.type_index if request.type_index is not None else -1
-        codec = str(subtitles[index].get("codec_name") or "").lower() if 0 <= index < len(subtitles) else ""
-        if codec not in TEXT_SUBTITLE_CODECS:
-            tasks.update_progress(task_id, 1, 1, "Skipped: subtitle is not text")
-            return {"queued": 0, "skipped": True, "reason": "Only text subtitles can have markup removed"}
-        # Codec metadata alone is not sufficient: some damaged/unsupported
-        # text tracks cannot be extracted by ffmpeg.  Do this check in the
-        # asynchronous preflight so the child cleanup task is never created
-        # for a stream that would inevitably fail.
-        text = complete_extracted_text(Path(request.path), f"0:s:{index}")
-        if not text:
-            tasks.update_progress(task_id, 1, 1, "Skipped: subtitle text could not be extracted")
-            return {"queued": 0, "skipped": True, "reason": "Subtitle text could not be extracted"}
-        if not HTML_TAG.search(text):
-            tasks.update_progress(task_id, 1, 1, "Skipped: no HTML tags found")
-            return {"queued": 0, "skipped": True, "reason": "No HTML tags found"}
-    child = tasks.enqueue("subtitle_html_cleanup", request.model_dump(), "Remove subtitle HTML tags", deduplicate=True)
-    tasks.update_progress(task_id, 1, 1, "HTML cleanup queued")
-    return {"queued": 1, "task_id": child["id"]}
-
-
 def process_subtitle_html(task_id: int, payload: dict) -> dict:
     tasks.update_progress(task_id, 0, 2, "Removing subtitle HTML tags")
     result = apply_subtitle_cleanup(SubtitleCleanup.model_validate(payload), operation_id=f"task-{task_id}")
     tasks.update_progress(task_id, 1, 2, "Queueing subtitle indexes")
     from app.v80 import request_media_indexes
-    from app.v80 import detection_scope_for_operation
-    request_media_indexes(result["path"], ["subtitles", "previews"], "Subtitle HTML removed", detection_scope=detection_scope_for_operation("subtitle_content"))
+    # HTML/ASS markup cleanup changes presentation only.  Preserve existing
+    # subtitle language detection; subtitle indexing still refreshes HTML,
+    # damage and preview metadata.
+    request_media_indexes(result["path"], ["subtitles", "previews"], "Subtitle HTML removed")
     tasks.update_progress(task_id, 2, 2, "Subtitle cleanup completed")
     return result
 
 
+def preflight_html_cleanup(payload: dict, fingerprint: dict) -> dict:
+    """Validate HTML cleanup without creating execution work."""
+    request = SubtitleCleanup.model_validate(payload)
+    if not fingerprint.get("exists"):
+        return {"decision": "invalid", "reason": "Media file is not accessible"}
+    if request.external_path:
+        external = Path(request.external_path)
+        suffix = external.suffix.lower().lstrip(".")
+        if suffix not in {"srt", "ass", "ssa", "vtt", "webvtt", "sub", "txt"}:
+            return {"decision": "skipped", "reason": "Only text subtitles can have markup removed"}
+        if not external.is_file():
+            return {"decision": "invalid", "reason": "External subtitle file is not accessible"}
+        text = external.read_text(encoding="utf-8", errors="replace")
+    else:
+        if not fingerprint.get("exists"):
+            return {"decision": "invalid", "reason": "Media file is not accessible"}
+        try:
+            subtitles = [stream for stream in probe(Path(request.path)).get("streams", []) if stream.get("codec_type") == "subtitle"]
+            index = request.type_index if request.type_index is not None else -1
+            codec = str(subtitles[index].get("codec_name") or "").lower() if 0 <= index < len(subtitles) else ""
+            if codec not in TEXT_SUBTITLE_CODECS:
+                return {"decision": "skipped", "reason": "Only text subtitles can have markup removed"}
+            text = complete_extracted_text(Path(request.path), f"0:s:{index}")
+        except Exception as exc:
+            return {"decision": "invalid", "reason": f"Subtitle text could not be extracted: {exc}"}
+        if not text:
+            return {"decision": "skipped", "reason": "Subtitle text could not be extracted"}
+    if not HTML_TAG.search(text):
+        return {"decision": "skipped", "reason": "No HTML tags found"}
+    return {"decision": "approved", "reason": "Text subtitle contains removable markup"}
+
+
+def approve_html_cleanup(payload: dict, result: dict) -> dict:
+    items = payload.get("_bulk_items")
+    if items is not None:
+        task_ids = []
+        for item in items:
+            child = tasks.enqueue("subtitle_html_cleanup", item, "Remove subtitle HTML tags", deduplicate=True)
+            task_ids.append(child["id"])
+        return {"task_ids": task_ids, "queued": len(task_ids), "task_type": "subtitle_html_cleanup"}
+    child = tasks.enqueue("subtitle_html_cleanup", payload, "Remove subtitle HTML tags", deduplicate=True)
+    return {"task_id": child["id"], "task_type": "subtitle_html_cleanup"}
+
+
+register_handler("subtitle_html_cleanup", preflight_html_cleanup)
+register_approval_handler("subtitle_html_cleanup", approve_html_cleanup)
+
 tasks.TASK_HANDLERS["plex_sync"] = process_plex_sync
-tasks.TASK_HANDLERS["subtitle_html_preflight"] = process_subtitle_html_preflight
 tasks.TASK_HANDLERS["subtitle_html_cleanup"] = process_subtitle_html
 
 _TESS_LANGUAGES = {"pt": "por", "pt-br": "por", "pt-pt": "por", "en": "eng", "es": "spa", "fr": "fra", "de": "deu", "it": "ita"}
@@ -637,9 +662,9 @@ def _ocr_graphical_subtitle(media: Path, type_index: int, language: str) -> Path
         text = re.sub(r"\s+", " ", text).strip()
         if text:
             def stamp(value):
-                hours, rest = divmod(value, 3600); minutes, seconds = divmod(rest, 60); millis = int(round((seconds - int(seconds)) * 1000)); seconds = int(seconds)
+                hours, rest = divmod(value, 3600); minutes, seconds_float = divmod(rest, 60); seconds = int(seconds_float); millis = round((seconds_float - seconds) * 1000)
                 if millis >= 1000: seconds += 1; millis -= 1000
-                return f"{int(hours):02d}:{int(minutes):02d}:{seconds:02d},{millis:03d}"
+                return f"{hours:02d}:{minutes:02d}:{seconds:02d},{millis:03d}"
             entries.append(f"{len(entries)+1}\n{stamp(timestamp)} --> {stamp(max(timestamp + .2, end))}\n{text}\n")
     if normalized_subtitle:
         shutil.rmtree(normalized_subtitle.parent, ignore_errors=True)
@@ -710,13 +735,52 @@ def process_image_subtitle_convert(task_id: int, payload: dict) -> dict:
         if subtitle.parent.name.startswith("vse-ccx-"):
             shutil.rmtree(subtitle.parent, ignore_errors=True)
     tasks.update_progress(task_id, 3, 4, "Queueing subtitle indexes")
-    from app.v80 import request_media_indexes
-    from app.v80 import detection_scope_for_operation
+    from app.v80 import detection_scope_for_operation, request_media_indexes
     request_media_indexes(str(media), ["subtitles", "core"], "Image subtitle converted to SRT", detection_scope=detection_scope_for_operation("subtitle_conversion"))
     tasks.update_progress(task_id, 4, 4, "Image subtitle conversion completed")
     return {"path": str(media), "type_index": int(payload.get("type_index", -1)), "language": language, "language_confidence": language_confidence, "language_source": language_source}
 
 tasks.TASK_HANDLERS["image_subtitle_convert"] = process_image_subtitle_convert
+
+
+# Dispatcher-backed image subtitle conversion.  Validation is deliberately
+# lightweight and non-destructive; the existing handler remains responsible
+# for staging the original container before replacement.
+def preflight_image_convert(payload: dict, fingerprint: dict) -> dict:
+    path = str(payload.get("path") or "")
+    if not fingerprint.get("exists"):
+        return {"decision": "invalid", "reason": "Media file is not accessible", "path": path}
+    if str(payload.get("source") or "embedded") != "embedded":
+        return {"decision": "skipped", "reason": "External image subtitles are not supported by the staged OCR converter", "path": path}
+    language = str(payload.get("language") or "").strip()
+    if not language or language.casefold() in {"und", "unknown", "zxx", "mis"}:
+        return {"decision": "skipped", "reason": "Image subtitle language is not set", "path": path}
+    try:
+        streams = probe(Path(path)).get("streams", [])
+        subtitles = [stream for stream in streams if stream.get("codec_type") == "subtitle"]
+        index = int(payload.get("type_index", -1))
+        if index < 0 or index >= len(subtitles):
+            return {"decision": "stale", "reason": "Subtitle stream no longer exists", "path": path}
+        codec = str(subtitles[index].get("codec_name") or subtitles[index].get("codec_tag_string") or "").casefold()
+        if codec not in {"dvd_subtitle", "dvb_subtitle", "hdmv_pgs_subtitle", "pgssub", "pgs", "vobsub", "xsub", "sup", "s_hdmv/pgs", "s_vobsub", "s_dvbsub"}:
+            return {"decision": "skipped", "reason": "Subtitle is no longer a graphical format", "path": path, "codec": codec}
+    except Exception as exc:
+        return {"decision": "invalid", "reason": f"Could not inspect subtitle stream: {exc}", "path": path}
+    return {"decision": "approved", "path": path, "language": language, "fingerprint": fingerprint}
+
+def approve_image_convert_bulk(payload: dict, result: dict) -> dict:
+    child_ids = []
+    for item in payload.get("_bulk_items", []):
+        request = dict(item)
+        request.pop("_preflight_fingerprint", None)
+        request.pop("_preflight_result", None)
+        child = tasks.enqueue("image_subtitle_convert", request, "Convert image subtitle to SRT", deduplicate=True)
+        if child and child.get("id") is not None:
+            child_ids.append(int(child["id"]))
+    return {"task_ids": child_ids, "queued": len(child_ids), "task_type": "image_subtitle_convert"}
+
+register_handler("image_subtitle_convert_bulk", preflight_image_convert)
+register_approval_handler("image_subtitle_convert_bulk", approve_image_convert_bulk)
 
 
 @app.get("/api/v68/ocr/staged")
@@ -792,8 +856,7 @@ def finalize_ocr_converted(stage_id: int) -> dict:
     artifact.unlink()
     with plex.connection() as db:
         db.execute("UPDATE ocr_staged_backups SET status='converted',converted_path=?,size_bytes=? WHERE id=?", (str(original), staged.stat().st_size, stage_id))
-    from app.v80 import request_media_indexes
-    from app.v80 import detection_scope_for_operation
+    from app.v80 import detection_scope_for_operation, request_media_indexes
     request_media_indexes(str(original), ["subtitles", "core", "previews"], "OCR converted candidate moved to final media path", detection_scope=detection_scope_for_operation("subtitle_conversion"))
     logger.info("ocr_staging event=converted_finalized id=%d original=%s", stage_id, original)
     return {"id": stage_id, "status": "converted", "path": str(original)}
@@ -827,8 +890,7 @@ def perform_ocr_rollback(stage_id: int, task_id: int | None = None) -> dict:
     _ocr_stage_update(stage_id, "restored")
     with plex.connection() as db:
         db.execute("UPDATE ocr_staged_backups SET converted_path=? WHERE id=?", (str(converted_snapshot), stage_id))
-    from app.v80 import request_media_indexes
-    from app.v80 import detection_scope_for_operation
+    from app.v80 import detection_scope_for_operation, request_media_indexes
     request_media_indexes(str(original), ["subtitles", "core", "previews"], "OCR original restored", detection_scope=detection_scope_for_operation("ocr_restore"))
     logger.info("ocr_staging event=rollback id=%d original=%s", stage_id, original)
     return {"id": stage_id, "status": "restored", "path": str(original)}
@@ -1005,4 +1067,5 @@ def update_plex_schedule(request: PlexSyncSchedule) -> dict:
 @app.post("/api/v68/subtitle-html-cleanup")
 def queue_subtitle_html_cleanup(request: SubtitleCleanup) -> dict:
     name = Path(request.external_path).name if request.external_path else f"subtitle {request.type_index}"
-    return tasks.enqueue("subtitle_html_preflight", request.model_dump(), f"Preflight HTML cleanup for {name}")
+    payload = request.model_dump()
+    return enqueue_preflight("subtitle_html_cleanup", request.path, payload, mode="queued", priority=70)

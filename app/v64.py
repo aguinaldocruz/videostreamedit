@@ -8,8 +8,9 @@ import app.v54 as jobs
 import app.v63 as cache
 from app.v2 import probe
 from app.v11 import connection
-from app.v63 import app  # noqa: F401 - importing this layer registers its routes and handlers
-
+from app.v63 import (
+    app,  # noqa: F401 - importing this layer registers its routes and handlers
+)
 
 logger = logging.getLogger("uvicorn.error")
 

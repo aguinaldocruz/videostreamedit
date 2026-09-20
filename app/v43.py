@@ -8,11 +8,10 @@ from pathlib import Path
 
 from fastapi import HTTPException
 
-import app.v28 as movie_import
 import app.v7 as media_editor
+import app.v28 as movie_import
 from app.v2 import make_language
 from app.v40 import app, record_track_name_corrections
-
 
 logger = logging.getLogger("videostreamedit")
 _remux_edit = media_editor._reorder_edit_impl
@@ -179,7 +178,7 @@ def apply_in_place(source: Path, request: media_editor.ReorderEditRequest, typed
     for track in request.tracks:
         changed = []
         if track.language is not None or track.region is not None:
-            changed.append("language=%s region=%s" % (track.language or "", track.region or ""))
+            changed.append(f"language={track.language or ''} region={track.region or ''}")
         if track.title is not None:
             changed.append(f"title={track.title}")
         if changed:
@@ -196,6 +195,8 @@ def apply_in_place(source: Path, request: media_editor.ReorderEditRequest, typed
 
 @app.post("/api/v43/media/edit")
 def optimized_media_edit(request: media_editor.ReorderEditRequest) -> dict:
+    from app.v86 import assert_media_editable
+    assert_media_editable(request.path)
     # Invalidate only detector rows whose stream content/metadata is affected.
     # Track names, defaults and forced flags intentionally preserve detections.
     try:
@@ -221,7 +222,11 @@ def optimized_media_edit(request: media_editor.ReorderEditRequest) -> dict:
         result["operation"] = "single_remux"
     record_track_name_corrections(request, before)
     try:
-        from app.v80 import detection_scope_for_edit, media_indexes_for_edit, request_media_indexes
+        from app.v80 import (
+            detection_scope_for_edit,
+            media_indexes_for_edit,
+            request_media_indexes,
+        )
         request_media_indexes(str(result.get("edited") or request.path), media_indexes_for_edit(request.model_dump(), remuxed=result.get("operation") == "single_remux"), "Media edit completed", defer_detection=request.defer_language_detection, detection_scope=detection_scope_for_edit(request.model_dump(), remuxed=result.get("operation") == "single_remux"))
     except Exception as exc:
         logger.warning("subtitle_detection event=post_edit_reindex_failed file=%s error=%s", str(request.path).replace("\n", "\\n"), str(exc).replace("\n", " ")[-300:])

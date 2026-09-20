@@ -5,7 +5,6 @@ import logging
 from app.v11 import connection
 from app.v69 import app
 
-
 logger = logging.getLogger("uvicorn.error")
 
 

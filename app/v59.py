@@ -12,7 +12,6 @@ from app.v7 import ReorderEditRequest
 from app.v11 import connection
 from app.v57 import app
 
-
 logger = logging.getLogger("uvicorn.error")
 
 
@@ -157,6 +156,29 @@ def suggestions() -> list[dict]:
 @app.get("/api/v59/settings/track-name-suggestions")
 def list_suggestions() -> dict:
     return {"suggestions": suggestions()}
+
+
+@app.post("/api/v59/settings/track-name-suggestions/reset-usage")
+def reset_suggestion_usage() -> dict:
+    """Reset ranking counters without deleting saved values or mappings."""
+    with connection() as db:
+        saved_values = db.execute("UPDATE reusable_stream_values SET use_count=0").rowcount
+        language_region = db.execute("UPDATE language_region_selection_usage SET use_count=0").rowcount
+        learned = db.execute(
+            "UPDATE track_name_correction_history SET use_count=0,last_used='1970-01-01 00:00:00'"
+        ).rowcount
+    logger.info(
+        "change=suggestion_usage_reset saved_values=%d language_region=%d learned=%d",
+        saved_values,
+        language_region,
+        learned,
+    )
+    return {
+        "saved_values_reset": saved_values,
+        "language_region_reset": language_region,
+        "learned_suggestions_reset": learned,
+        "suggestions": suggestions(),
+    }
 
 
 @app.post("/api/v59/track-name-suggestions")

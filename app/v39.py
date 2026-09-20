@@ -8,7 +8,6 @@ from pydantic import BaseModel
 import app.v38 as index
 from app.v11 import connection
 
-
 app = index.app
 
 
