@@ -62,6 +62,17 @@ def initialize_plex() -> None:
             CREATE INDEX IF NOT EXISTS plex_media_kind ON plex_media(kind);
             CREATE INDEX IF NOT EXISTS plex_media_show ON plex_media(show_title, season_number, episode_number);
             CREATE INDEX IF NOT EXISTS plex_media_tv_summary ON plex_media(kind, library_key, show_title, library_name);
+            CREATE TABLE IF NOT EXISTS plex_internal_change_scope (
+                path TEXT PRIMARY KEY,
+                expected_size INTEGER NOT NULL DEFAULT 0,
+                expected_modified INTEGER NOT NULL DEFAULT 0,
+                scope_json TEXT NOT NULL,
+                reason TEXT NOT NULL DEFAULT '',
+                created_at INTEGER NOT NULL DEFAULT 0,
+                expires_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS plex_internal_change_scope_expiry
+                ON plex_internal_change_scope(expires_at);
         """)
         if not column_exists(db, "plex_config", "auth_method"):
             db.execute("ALTER TABLE plex_config ADD COLUMN auth_method TEXT NOT NULL DEFAULT 'manual'")

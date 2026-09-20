@@ -56,7 +56,11 @@ services:
       DATABASE_URL: "${DATABASE_URL:-postgresql://videostreamedit:change-this-local-password@postgres:5432/videostreamedit}"
       # Preview extraction is on-demand. Keep concurrency at 1 unless benchmarked safely.
       PREVIEW_MAX_CONCURRENT: "${PREVIEW_MAX_CONCURRENT:-1}"
-      PREVIEW_MIN_FREE_GB: "${PREVIEW_MIN_FREE_GB:-1}"
+      # Never let staging/cache work consume the host reserve. A snapshot is
+      # refused before copying when free space would fall below these limits.
+      WORKFLOW_MIN_FREE_GB: "${WORKFLOW_MIN_FREE_GB:-5}"
+      WORKFLOW_RESERVED_GB: "${WORKFLOW_RESERVED_GB:-2}"
+      PREVIEW_MIN_FREE_GB: "${PREVIEW_MIN_FREE_GB:-5}"
 
     volumes:
       - /media/:/media

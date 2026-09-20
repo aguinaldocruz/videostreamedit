@@ -41,6 +41,7 @@ from app.postgres_store import (
 )
 from app.postgres_store import (
     cleanup_succeeded_workflow_artifacts as cleanup_succeeded_workflow_artifacts_startup,
+    cleanup_orphaned_workflow_artifacts as cleanup_orphaned_workflow_artifacts_startup,
 )
 from app.v5 import external_subtitles
 from app.v7 import ReorderEditRequest
@@ -380,6 +381,8 @@ def process_media_edit(task_id: int, payload: dict) -> dict:
     # the catalog identity without changing stream content.
     from app.v80 import detection_scope_for_operation, request_media_indexes
     if payload.get("html_cleanups"):
+        from app.v68 import register_internal_change_scope
+        register_internal_change_scope(final_path, detection_scope_for_operation("subtitle_content"), "Queued HTML cleanup completed")
         request_media_indexes(
             final_path,
             ["subtitles"],
@@ -648,7 +651,10 @@ def run_queue(lane: str = "main") -> None:
                 if not acquire_luw_lock(luw_id, stage_path):
                     transition_luw(luw_id, "waiting", "lock", "Waiting for media LUW lock")
                     with connection() as db:
-                        db.execute("UPDATE task_queue SET status='pending',progress_message='Waiting for media LUW lock',started_at=NULL,updated_at=? WHERE id=?", (utc_now(), task_id))
+                        db.execute("UPDATE task_queue SET status='pending',progress_message='Waiting for media LUW lock',attempts=CASE WHEN attempts>0 THEN attempts-1 ELSE 0 END,started_at=NULL,updated_at=? WHERE id=?", (utc_now(), task_id))
+                    # A sibling task may own the media LUW. Back off instead
+                    # of spinning and inflating attempts while waiting for it.
+                    time.sleep(0.5)
                     continue
                 transition_luw(luw_id, "applying", "apply", "Applying media edit")
             if not begin_task_stage(task_payload.get("_queue_group"), task_type, stage_path, task_id):
@@ -784,6 +790,9 @@ def initialize_task_queue() -> None:
             if affected:
                 db.execute("INSERT OR IGNORE INTO media_change_request(task_id,path,requested_at) VALUES(?,?,?)", (row["id"], affected, row["created_at"]))
     try:
+        removed_orphans = cleanup_orphaned_workflow_artifacts_startup()
+        if removed_orphans:
+            logger.info("workflow event=startup_orphan_staging_cleaned files=%d", removed_orphans)
         removed_snapshots = cleanup_succeeded_workflow_artifacts_startup()
         if removed_snapshots:
             logger.info("workflow event=startup_staging_cleaned files=%d", removed_snapshots)

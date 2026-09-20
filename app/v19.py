@@ -324,6 +324,55 @@ def change_requested_paths() -> set[str]:
     return set(change_requests_by_path())
 
 
+def report_blocked_paths() -> set[str]:
+    """Return media temporarily hidden from reports while work is active.
+
+    Report rows must disappear as soon as a media edit, preflight, index, or
+    dependent task is queued/running. Once all work finishes, this set no
+    longer contains the path and the report naturally re-evaluates its current
+    indexed state. Failed tasks are intentionally not blocked so the finding
+    can be reviewed or retried.
+    """
+    blocked: set[str] = set()
+
+    def collect(value: object) -> None:
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if key in {"path", "media_path", "source", "original_path", "file"} and isinstance(item, str) and item:
+                    blocked.add(str(Path(item)))
+                else:
+                    collect(item)
+        elif isinstance(value, list):
+            for item in value:
+                collect(item)
+
+    with connection() as db:
+        rows = db.execute(
+            "SELECT marker.path FROM media_change_request marker JOIN task_queue task ON task.id=marker.task_id "
+            "WHERE task.status IN ('pending','running')"
+        ).fetchall()
+        blocked.update(str(row["path"]) for row in rows if row["path"])
+        # A preflight can be pending before its child task/marker exists.
+        for row in db.execute("SELECT media_path,payload_json FROM preflight_requests WHERE status IN ('pending','running')").fetchall():
+            if row["media_path"]:
+                blocked.add(str(row["media_path"]))
+            try:
+                collect(json.loads(row["payload_json"] or "{}"))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                pass
+        for row in db.execute("SELECT path FROM index_task_queue WHERE status IN ('pending','running')").fetchall():
+            if row["path"]:
+                blocked.add(str(row["path"]))
+        # Cover queue rows created by older callers that did not insert a
+        # media_change_request marker yet.
+        for row in db.execute("SELECT payload_json FROM task_queue WHERE status IN ('pending','running')").fetchall():
+            try:
+                collect(json.loads(row["payload_json"] or "{}"))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                pass
+    return blocked
+
+
 def audio_detection_by_path() -> dict[str, dict]:
     with connection() as db:
         try:
@@ -500,6 +549,7 @@ IMAGE_SUBTITLE_CODECS = (
 def image_subtitle_report(kind: str) -> dict:
     if kind not in {"tv", "movies"}:
         raise HTTPException(400, "Kind must be tv or movies")
+    blocked_paths = report_blocked_paths()
     placeholders = ",".join("?" for _ in IMAGE_SUBTITLE_CODECS)
     with connection() as db:
         rows = db.execute(
@@ -508,6 +558,7 @@ def image_subtitle_report(kind: str) -> dict:
             "ORDER BY path,type_index,external_path",
             IMAGE_SUBTITLE_CODECS,
         ).fetchall()
+    rows = [row for row in rows if str(row["path"]) not in blocked_paths]
     active_paths = set()
     with connection() as db:
         active = db.execute("SELECT payload_json FROM preflight_requests WHERE operation_type=? AND status IN ('pending','running')", ("image_subtitle_convert_bulk",)).fetchall()
@@ -564,6 +615,7 @@ def image_subtitle_report(kind: str) -> dict:
 def html_subtitle_report(kind: str) -> dict:
     if kind not in {"tv", "movies"}:
         raise HTTPException(400, "Kind must be tv or movies")
+    blocked_paths = report_blocked_paths()
     with connection() as db:
         # HTML cleanup is valid only for text subtitle codecs.  Older index
         # rows (or a stale codec inspection) may contain markup metadata for a
@@ -585,6 +637,7 @@ def html_subtitle_report(kind: str) -> dict:
             "ORDER BY path,type_index,external_path",
             ("%HTML tags%", *text_codecs),
         ).fetchall()
+    rows = [row for row in rows if str(row["path"]) not in blocked_paths]
     refs_by_path = {}
     for row in rows:
         refs_by_path.setdefault(str(row["path"]), []).append({"path": str(row["path"]), "source": row["source"], "type_index": int(row["type_index"]), "external_path": row["external_path"] or "", "codec": row["codec"] or ""})
@@ -610,6 +663,7 @@ def html_subtitle_report(kind: str) -> dict:
 def damaged_subtitle_report(kind: str) -> dict:
     if kind not in {"tv", "movies"}:
         raise HTTPException(400, "Kind must be tv or movies")
+    blocked_paths = report_blocked_paths()
     text_codecs = ("subrip", "srt", "ass", "ssa", "webvtt", "mov_text", "text")
     placeholders = ",".join("?" for _ in text_codecs)
     with connection() as db:
@@ -621,6 +675,7 @@ def damaged_subtitle_report(kind: str) -> dict:
             "ORDER BY path,type_index,external_path",
             text_codecs,
         ).fetchall()
+    rows = [row for row in rows if str(row["path"]) not in blocked_paths]
     refs_by_path = {}
     for row in rows:
         refs_by_path.setdefault(str(row["path"]), []).append({
@@ -733,6 +788,7 @@ def queue_report_subtitle_action(request: ReportSubtitleActionRequest) -> dict:
 def portuguese_language_report(kind: str) -> dict:
     if kind not in {"tv", "movies"}:
         raise HTTPException(400, "Kind must be tv or movies")
+    blocked_paths = report_blocked_paths()
     with connection() as db:
         rows = db.execute(
             "SELECT d.path,d.source,d.type_index,d.external_path,d.metadata_language,d.detected_language,d.confidence,d.metadata_region,d.evidence,d.sdh_label,d.sdh_confidence,d.sdh_evidence,d.evidence_sample,d.analysis_status,d.analysis_reason,d.cue_count,d.text_chars,d.text_coverage,d.markup_count,d.damage "
@@ -742,6 +798,7 @@ def portuguese_language_report(kind: str) -> dict:
             "AND d.path NOT IN (SELECT path FROM index_task_queue WHERE status IN ('pending','running')) ORDER BY d.path",
             (SUBTITLE_DETECTOR_VERSION, kind, kind),
         ).fetchall()
+    rows = [row for row in rows if str(row["path"]) not in blocked_paths]
     by_path = {}
     for row in rows:
         by_path.setdefault(str(row["path"]), []).append({"source": row["source"], "type_index": int(row["type_index"]), "external_path": row["external_path"], "metadata_language": row["metadata_language"], "metadata_region": row["metadata_region"], "detected_language": row["detected_language"], "confidence": round(float(row["confidence"]) * 100, 1), "evidence": row["evidence"], "evidence_sample": row["evidence_sample"] or "", "analysis_status": row["analysis_status"] or "mismatch", "analysis_reason": row["analysis_reason"] or "", "cue_count": int(row["cue_count"] or 0), "text_chars": int(row["text_chars"] or 0), "text_coverage": round(float(row["text_coverage"] or 0) * 100, 1), "markup_count": int(row["markup_count"] or 0), "damage": row["damage"] or "", "sdh_label": row["sdh_label"] or "", "sdh_confidence": round(float(row["sdh_confidence"] or 0) * 100, 1), "sdh_evidence": row["sdh_evidence"] or ""})
@@ -779,6 +836,7 @@ def subtitle_no_confidence_report(kind: str, status: str | None = None, reason: 
     """List current low-confidence subtitle findings with optional filters."""
     if kind not in {"tv", "movies"}:
         raise HTTPException(400, "Kind must be tv or movies")
+    blocked_paths = report_blocked_paths()
     allowed_statuses = {"no_confidence", "unreadable"}
     if status and status not in allowed_statuses:
         raise HTTPException(400, "Unsupported subtitle analysis status")
@@ -798,6 +856,7 @@ def subtitle_no_confidence_report(kind: str, status: str | None = None, reason: 
             "FROM portuguese_language_detection d JOIN plex_media p ON p.path=d.path WHERE " + " AND ".join(clauses) + " ORDER BY p.title COLLATE NOCASE,d.path,d.type_index",
             params,
         ).fetchall()
+    rows = [row for row in rows if str(row["path"]) not in blocked_paths]
     items = []
     for row in rows:
         items.append({"path": str(row["path"]), "title": str(row["title"] or Path(str(row["path"])).stem), "show_title": str(row["show_title"] or ""), "source": row["source"], "type_index": int(row["type_index"]), "external_path": row["external_path"] or "", "metadata_language": row["metadata_language"] or "", "metadata_region": row["metadata_region"] or "", "status": row["analysis_status"], "reason": row["analysis_reason"] or "", "confidence": round(float(row["confidence"] or 0) * 100, 1), "cue_count": int(row["cue_count"] or 0), "text_chars": int(row["text_chars"] or 0), "text_coverage": round(float(row["text_coverage"] or 0) * 100, 1), "markup_count": int(row["markup_count"] or 0), "damage": row["damage"] or "", "evidence_sample": row["evidence_sample"] or ""})
@@ -947,9 +1006,11 @@ def suppress_duplicate_language_report(request: DuplicateLanguageSuppressRequest
 @app.get("/api/v19/reports/duplicate-languages")
 def duplicate_language_report(kind: str, stream_type: str) -> dict:
     if kind not in {"tv", "movies"} or stream_type not in {"audio", "subtitle"}: raise HTTPException(400, "Invalid report selection")
+    blocked_paths = report_blocked_paths()
     allowed = set(_duplicate_language_values(stream_type))
     with connection() as db:
         rows = db.execute("SELECT path,source,type_index,external_path,codec,language,region,track_name FROM media_stream_index WHERE stream_type=? AND path NOT IN (SELECT path FROM index_task_queue WHERE status IN ('pending','running')) ORDER BY path,type_index", (stream_type,)).fetchall()
+        rows = [row for row in rows if str(row["path"]) not in blocked_paths]
         suppressed = {(str(row["path"]), canonical_language(str(row["language"])), str(row["fingerprint"])) for row in db.execute("SELECT path,language,fingerprint FROM duplicate_language_report_suppressions WHERE stream_type=?", (stream_type,)).fetchall()}
     by_path = {}
     for row in rows:
@@ -983,10 +1044,12 @@ def duplicate_language_report(kind: str, stream_type: str) -> dict:
 def forced_stream_report(kind: str) -> dict:
     if kind not in {"tv", "movies"}:
         raise HTTPException(400, "Kind must be tv or movies")
+    blocked_paths = report_blocked_paths()
     with connection() as db:
         setting = db.execute("SELECT value FROM language_detection_settings WHERE key='forced_report_excluded_track_names'").fetchone()
         rows = db.execute("""SELECT path,stream_type,type_index,external_path,codec,language,region,track_name
             FROM media_stream_index WHERE is_forced=1 AND path NOT IN (SELECT path FROM index_task_queue WHERE status IN ('pending','running')) ORDER BY path,type_index""").fetchall()
+    rows = [row for row in rows if str(row["path"]) not in blocked_paths]
     try:
         excluded = {str(value).strip().casefold() for value in (json.loads(setting["value"]) if setting else []) if str(value).strip()}
     except (TypeError, ValueError, json.JSONDecodeError):
@@ -1058,7 +1121,9 @@ def _uncommon_language_rows() -> tuple[dict[str, list[dict]], set[str], set[str]
 def uncommon_language_report(kind: str) -> dict:
     if kind not in {"tv", "movies"}:
         raise HTTPException(400, "Kind must be tv or movies")
+    blocked_paths = report_blocked_paths()
     by_path, _bases, configured = _uncommon_language_rows()
+    by_path = {path: rows for path, rows in by_path.items() if path not in blocked_paths}
     def qualifies(rows: list[dict]) -> bool:
         audio = {str(row["language"]).casefold() for row in rows if row["stream_type"] == "audio"}
         subtitle = {str(row["language"]).casefold() for row in rows if row["stream_type"] == "subtitle"}

@@ -1,13 +1,14 @@
-"""PostgreSQL bootstrap and durable-configuration migration helpers.
+"""PostgreSQL bootstrap and workflow persistence helpers.
 
-This module is intentionally isolated from the legacy SQLite connection until
-the application schema cut-over is complete. It provides the new database
-contract without mutating the existing database during development.
+The application now uses PostgreSQL directly. The old transitional app_settings
+table and SQLite-migration wording were removed so schema bootstrap only creates
+tables that are part of the active workflow model.
 """
 
 from __future__ import annotations
 
 import os
+import logging
 from collections.abc import Iterator
 from contextlib import contextmanager
 
@@ -29,11 +30,6 @@ def initialize_schema() -> None:
     """Create the new workflow-oriented PostgreSQL schema."""
     with connection() as db:
         db.execute("""
-            CREATE TABLE IF NOT EXISTS app_settings (
-                key TEXT PRIMARY KEY,
-                value JSONB NOT NULL,
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-            );
             CREATE TABLE IF NOT EXISTS workflow_groups (
                 group_id UUID PRIMARY KEY,
                 kind TEXT NOT NULL,
@@ -244,10 +240,38 @@ def begin_task_stage(group_id: str | None, task_type: str, path: str, task_id: i
                FROM task_queue task
                WHERE stage.group_id=%s
                  AND stage.status='pending'
+                 AND stage.task_type NOT LIKE 'index:%%'
                  AND task.id::text=stage.payload->>'task_id'
                  AND task.group_id=%s
                  AND task.status IN ('succeeded','failed','cancelled')""",
             (workflow_id, group_id),
+        )
+        # Index queues are durable work queues in their own right and do not
+        # have a corresponding row in the generic task_queue. Treating them
+        # as generic tasks makes every index stage look orphaned, so workers
+        # repeatedly requeue the item without ever starting it.
+        db.execute(
+            """UPDATE workflow_stages stage
+               SET status=CASE task.status
+                              WHEN 'succeeded' THEN 'succeeded'
+                              WHEN 'cancelled' THEN 'cancelled'
+                              WHEN 'failed' THEN 'failed'
+                              ELSE stage.status
+                          END,
+                   error=CASE WHEN task.status IN ('failed','cancelled')
+                              THEN COALESCE(task.error, 'Index queue task was not completed')
+                              ELSE stage.error END,
+                   finished_at=CASE WHEN task.status IN ('succeeded','failed','cancelled')
+                                    THEN COALESCE(stage.finished_at, now())
+                                    ELSE stage.finished_at END,
+                   updated_at=now()
+               FROM index_task_queue task
+               WHERE stage.group_id=%s
+                 AND stage.task_type LIKE 'index:%%'
+                 AND stage.status='pending'
+                 AND task.id::text=stage.payload->>'task_id'
+                 AND task.status IN ('succeeded','failed','cancelled')""",
+            (workflow_id,),
         )
         db.execute(
             """UPDATE workflow_stages stage
@@ -256,11 +280,14 @@ def begin_task_stage(group_id: str | None, task_type: str, path: str, task_id: i
                    finished_at=COALESCE(stage.finished_at, now()), updated_at=now()
                WHERE stage.group_id=%s AND stage.status='pending'
                  AND stage.payload->>'task_id' IS NOT NULL
-                 AND NOT EXISTS (
+                 AND ((stage.task_type LIKE 'index:%%' AND NOT EXISTS (
+                     SELECT 1 FROM index_task_queue task
+                      WHERE task.id::text=stage.payload->>'task_id'
+                 )) OR (stage.task_type NOT LIKE 'index:%%' AND NOT EXISTS (
                      SELECT 1 FROM task_queue task
                       WHERE task.id::text=stage.payload->>'task_id'
                         AND task.group_id=%s
-                 )""",
+                 )))""",
             (workflow_id, group_id),
         )
         stage = db.execute(
@@ -337,7 +364,7 @@ def reset_task_stage_for_retry(group_id: str | None, task_id: int | None = None)
         db.execute(
             """UPDATE workflow_stages
                SET status='pending', error=NULL, started_at=NULL, finished_at=NULL, updated_at=now()
-             WHERE group_id=%s AND payload->>'task_id'=%s AND status IN ('failed','succeeded')""",
+             WHERE group_id=%s AND payload->>'task_id'=%s AND status IN ('failed','succeeded','cancelled')""",
             (workflow_id, str(task_id)),
         )
         db.execute(
@@ -364,6 +391,12 @@ import hashlib
 import shutil
 from pathlib import Path
 
+logger = logging.getLogger("uvicorn.error")
+
+
+class WorkflowStorageError(RuntimeError):
+    """A deterministic safety stop caused by insufficient staging storage."""
+
 MUTATING_TASK_TYPES = frozenset({
     "media_edit", "movie_import", "filtered_stream_edit", "filtered_stream_edit_now",
     "tv_filtered_stream_edit", "tv_filtered_stream_edit_now", "subtitle_html_cleanup",
@@ -375,6 +408,34 @@ def _stage_root() -> Path:
     root = Path(os.environ.get("WORKFLOW_STAGE_ROOT", "/data/workflow-staging"))
     root.mkdir(parents=True, exist_ok=True)
     return root
+
+
+def workflow_storage_status() -> dict:
+    """Return staging disk health without scanning or mutating media."""
+    root = Path(os.environ.get("WORKFLOW_STAGE_ROOT", "/data/workflow-staging"))
+    probe = root if root.exists() else root.parent
+    usage = shutil.disk_usage(probe)
+    minimum = int(float(os.environ.get("WORKFLOW_MIN_FREE_GB", "5")) * 1024**3)
+    reserve = int(float(os.environ.get("WORKFLOW_RESERVED_GB", "2")) * 1024**3)
+    free = int(usage.free)
+    return {"path": str(root), "total_bytes": int(usage.total), "used_bytes": int(usage.used),
+            "free_bytes": free, "free_gb": round(free / 1024**3, 2),
+            "minimum_free_bytes": minimum, "reserved_bytes": reserve,
+            "status": "blocked" if free < reserve else ("warning" if free < minimum else "healthy")}
+
+
+def ensure_workflow_storage(required_bytes: int = 0) -> None:
+    """Refuse a snapshot before it can exhaust the host filesystem."""
+    status = workflow_storage_status()
+    required = max(0, int(required_bytes))
+    if status["free_bytes"] < status["reserved_bytes"] + required or status["free_bytes"] < status["minimum_free_bytes"]:
+        raise WorkflowStorageError(
+            "Workflow staging paused: insufficient disk space "
+            f"({status['free_gb']:.2f} GiB free; reserve "
+            f"{status['reserved_bytes'] / 1024**3:.2f} GiB; "
+            f"snapshot requires {required / 1024**3:.2f} GiB). "
+            "Clean completed staging artifacts or free disk space, then retry."
+        )
 
 
 def _file_digest(path: Path) -> str:
@@ -392,6 +453,7 @@ def prepare_task_artifact(group_id: str | None, task_id: int, task_type: str, pa
     source = Path(path)
     if not source.is_file():
         return
+    ensure_workflow_storage(source.stat().st_size)
     workflow_id = _workflow_id(group_id)
     with connection() as db:
         stage = db.execute(
@@ -400,12 +462,16 @@ def prepare_task_artifact(group_id: str | None, task_id: int, task_type: str, pa
         ).fetchone()
         if not stage:
             return
-        existing = db.execute("SELECT artifact_id FROM workflow_artifacts WHERE group_id=%s AND stage_id=%s AND original_path=%s LIMIT 1", (workflow_id, stage["stage_id"], str(source))).fetchone()
+        # One rollback snapshot is sufficient for the entire media-scoped
+        # workflow. Bulk requests may create many stages for one episode or
+        # movie; never copy the full media once per stream/stage.
+        existing = db.execute("SELECT artifact_id FROM workflow_artifacts WHERE group_id=%s AND original_path=%s LIMIT 1", (workflow_id, str(source))).fetchone()
         if existing:
             return
     destination_dir = _stage_root() / str(workflow_id)
     destination_dir.mkdir(parents=True, exist_ok=True)
     destination = destination_dir / f"{task_id}-{source.name}"
+    ensure_workflow_storage(source.stat().st_size)
     shutil.copy2(source, destination)
     checksum = _file_digest(destination)
     with connection() as db:
@@ -462,6 +528,38 @@ def cleanup_succeeded_workflow_artifacts() -> int:
     with connection() as db:
         groups = db.execute("SELECT group_id FROM workflow_groups WHERE status='succeeded' AND EXISTS (SELECT 1 FROM workflow_artifacts WHERE workflow_artifacts.group_id=workflow_groups.group_id)").fetchall()
     return sum(cleanup_succeeded_workflow_group_artifacts(str(row["group_id"])) for row in groups)
+
+
+def cleanup_orphaned_workflow_artifacts() -> int:
+    """Remove unreferenced files left in the transient workflow staging root.
+
+    Only files with no corresponding ``workflow_artifacts`` row are removed;
+    active rollback snapshots remain untouched. This makes restart recovery
+    bounded even after a power loss or a deleted/cancelled workflow.
+    """
+    if not DATABASE_URL:
+        return 0
+    root = _stage_root()
+    with connection() as db:
+        rows = db.execute("SELECT artifact_path FROM workflow_artifacts").fetchall()
+    referenced = {str(Path(str(row["artifact_path"])).resolve()) for row in rows if row.get("artifact_path")}
+    removed = 0
+    for candidate in root.rglob("*"):
+        if not candidate.is_file() or str(candidate.resolve()) in referenced:
+            continue
+        try:
+            candidate.unlink()
+            removed += 1
+        except OSError:
+            continue
+    for directory in sorted((p for p in root.rglob("*") if p.is_dir()), key=lambda p: len(p.parts), reverse=True):
+        try:
+            directory.rmdir()
+        except OSError:
+            pass
+    if removed:
+        logger.info("workflow event=orphan_staging_cleaned files=%d", removed)
+    return removed
 
 
 def rollback_workflow(group_id: str) -> dict:
@@ -624,6 +722,15 @@ def acquire_luw_lock(luw_id: str, resource_key: str, lease_seconds: int = 1800) 
         return False
     uid = _luw_uuid(luw_id)
     with connection() as db:
+        # A previous attempt may have died after transitioning its LUW to a
+        # terminal state but before releasing its lease. Reclaim only leases
+        # whose owner is definitively terminal; live operations remain locked.
+        db.execute(
+            """DELETE FROM workflow_luw_locks lock
+               USING workflow_luws owner
+               WHERE lock.luw_id=owner.luw_id
+                 AND owner.status IN ('committed','failed','cancelled','rolled_back','obsolete')"""
+        )
         row = db.execute(
             """INSERT INTO workflow_luw_locks(resource_key,luw_id,lease_until)
                VALUES (%s,%s,now() + (%s * interval '1 second'))
@@ -793,6 +900,21 @@ def commit_luw(luw_id: str, output_signature: dict | None = None) -> bool:
     if row:
         mark_read_models_stale(str(row["resource_key"]), str(row["operation_type"]), output_signature)
     return True
+
+
+def cleanup_terminal_luw_locks() -> int:
+    """Remove leases left by LUWs that already reached a terminal state."""
+    if not DATABASE_URL:
+        return 0
+    with connection() as db:
+        row = db.execute(
+            """DELETE FROM workflow_luw_locks lock
+               USING workflow_luws luw
+               WHERE lock.luw_id=luw.luw_id
+                 AND luw.status IN ('committed','failed','cancelled','rolled_back','obsolete')
+               RETURNING lock.resource_key"""
+        ).fetchall()
+    return len(row)
 
 
 def recover_luws() -> int:

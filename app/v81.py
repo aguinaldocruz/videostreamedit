@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import logging
+import os
 import shutil
 import threading
+import time
 
 from fastapi import Query
 
@@ -16,6 +18,7 @@ from app.v2 import probe
 from app.v11 import connection
 from app.v28 import authorized_import_file
 from app.v80 import app
+from app.postgres_store import workflow_storage_status
 
 logger = logging.getLogger("uvicorn.error")
 monitor_thread: threading.Thread | None = None
@@ -43,16 +46,40 @@ def performance_snapshot() -> dict:
         risks.append(f"{generic_failed} media-operation jobs require attention")
     if limit and cache_bytes >= limit * 0.9:
         risks.append("Preview cache is above 90% of its limit")
-    return {"catalog": catalog, "unified_indexed": unified_indexed, "core_pending": core_pending, "index_failed": failed, "task_failed": generic_failed, "cache_bytes": cache_bytes, "cache_limit": limit, "journal_mode": journal_mode, "risks": risks}
+    storage = workflow_storage_status()
+    if storage["status"] == "blocked":
+        risks.append(f"Workflow staging blocked: only {storage['free_gb']:.2f} GiB free")
+    elif storage["status"] == "warning":
+        risks.append(f"Workflow staging disk reserve warning: {storage['free_gb']:.2f} GiB free")
+    return {"catalog": catalog, "unified_indexed": unified_indexed, "core_pending": core_pending, "index_failed": failed, "task_failed": generic_failed, "cache_bytes": cache_bytes, "cache_limit": limit, "journal_mode": journal_mode, "storage": storage, "risks": risks}
 
 
 def monitor_performance() -> None:
     global last_risks
     logger.info("performance_monitor event=worker_started")
+    health_interval = max(30, int(os.getenv("INDEX_WORKFLOW_HEALTH_INTERVAL_SECONDS", "60")))
+    cache_interval = max(60, int(os.getenv("PREVIEW_CACHE_MAINTENANCE_INTERVAL_SECONDS", "600")))
+    last_cache_maintenance = 0.0
     while True:
         try:
             snapshot = performance_snapshot()
-            preview_cache.enforce_lru()
+            # Periodically repair index workflow metadata while the service is
+            # running. This complements startup reconciliation and prevents a
+            # stale stage introduced by a failed worker/migration from
+            # blocking a queue until the next container restart.
+            repaired = index_queues.reconcile_index_workflow_stages()
+            if any(repaired.values()):
+                for condition in index_queues.conditions.values():
+                    with condition:
+                        condition.notify_all()
+                logger.warning(
+                    "index_queue event=runtime_workflow_repair reopened=%d terminal=%d orphaned=%d",
+                    repaired["reopened"], repaired["terminal"], repaired["orphaned"],
+                )
+            now_monotonic = time.monotonic()
+            if now_monotonic - last_cache_maintenance >= cache_interval:
+                preview_cache.enforce_lru()
+                last_cache_maintenance = now_monotonic
             risks = tuple(snapshot["risks"])
             if risks != last_risks:
                 if risks:
@@ -62,7 +89,7 @@ def monitor_performance() -> None:
                 last_risks = risks
         except Exception as exc:
             logger.warning("performance_monitor event=check_failed error=%s", str(exc).replace("\n", " ")[:500])
-        threading.Event().wait(600)
+        threading.Event().wait(health_interval)
 
 
 def initialize_performance_release() -> None:

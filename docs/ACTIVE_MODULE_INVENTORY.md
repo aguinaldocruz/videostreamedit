@@ -2,8 +2,8 @@
 
 Generated 2026-09-18 from the `app.v86` import graph. The inactive v3/v4/v6 compatibility modules and exclusive HTML/JavaScript assets were removed after validation.
 
-- Versioned modules found: 57
-- Modules reachable through static imports from `v86`: 57
+- Versioned modules found: 56
+- Modules reachable through static imports from `v86`: 56
 - Modules not reached by the static graph: 0
 
 ## Not reached by static imports

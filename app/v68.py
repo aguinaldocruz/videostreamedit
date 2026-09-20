@@ -173,6 +173,35 @@ def file_changed_records(records: list[tuple], previous: dict[str, tuple[int, in
     ]
 
 
+def register_internal_change_scope(path: str, scope: dict | None, reason: str = "") -> None:
+    """Carry an intentional local-write scope through the next Plex sync."""
+    value = str(path or "")
+    if not value:
+        return
+    try:
+        stat = Path(value).stat()
+    except OSError:
+        return
+    now = int(time.time())
+    with plex.connection() as db:
+        db.execute("INSERT OR REPLACE INTO plex_internal_change_scope(path,expected_size,expected_modified,scope_json,reason,created_at,expires_at) VALUES(?,?,?,?,?,?,?)", (value, int(stat.st_size), int(stat.st_mtime), json.dumps(scope or {}, ensure_ascii=False, separators=(",", ":")), str(reason or ""), now, now + 6 * 60 * 60))
+
+def consume_internal_change_scope(path: str, size: int, modified: int) -> tuple[dict, str] | None:
+    """Consume a matching intentional-write marker during Plex sync."""
+    value = str(path or "")
+    with plex.connection() as db:
+        row = db.execute("SELECT expected_size,expected_modified,scope_json,reason,expires_at FROM plex_internal_change_scope WHERE path=?", (value,)).fetchone()
+        if not row:
+            return None
+        db.execute("DELETE FROM plex_internal_change_scope WHERE path=?", (value,))
+    if int(row[4] or 0) < int(time.time()) or int(row[0] or -1) != int(size or -1) or int(row[1] or -1) != int(modified or -1):
+        return None
+    try:
+        scope = json.loads(row[2] or "{}")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        scope = {}
+    return (scope if isinstance(scope, dict) else {}, str(row[3] or ""))
+
 def structurally_changed_records(records: list[tuple], previous: dict[str, tuple[int, int]]) -> list[tuple]:
     """Return changes that are strong evidence of a replacement/new media.
 
@@ -312,7 +341,27 @@ def process_plex_sync(task_id: int, payload: dict) -> dict:
             records, aliases = rows_for_items(library, items)
             previous = existing_file_fingerprints(library["library_key"])
             changed_records = file_changed_records(records, previous)
-            structural_records = structurally_changed_records(records, previous)
+            # A project-authored write is already indexed and must not be
+            # treated as an external Plex update. Consume its marker before
+            # reviewed-state invalidation or Plex-change reporting. A marker
+            # only matches the exact size/mtime written by the project; a
+            # mismatch is deliberately treated as an external change.
+            internal_scopes: dict[str, tuple[dict, str]] = {}
+            for record in changed_records:
+                changed_path = str(record[0])
+                marker = consume_internal_change_scope(changed_path, int(record[9] or 0), int(record[10] or 0))
+                if marker is not None:
+                    internal_scopes[changed_path] = marker
+            if internal_scopes:
+                changed_records = [record for record in changed_records if str(record[0]) not in internal_scopes]
+                logger.info(
+                    "plex_sync event=internal_project_changes_ignored files=%d",
+                    len(internal_scopes),
+                )
+            structural_records = [
+                record for record in structurally_changed_records(records, previous)
+                if str(record[0]) not in internal_scopes
+            ]
             clear_reviewed_for_changed_records(structural_records)
             clear_reviewed_for_removed_media(library["library_key"], catalog_paths(all_items))
             persist_library(library, records, aliases, started, rebuild, catalog_paths(all_items))
@@ -346,6 +395,7 @@ def process_subtitle_html(task_id: int, payload: dict) -> dict:
     # HTML/ASS markup cleanup changes presentation only.  Preserve existing
     # subtitle language detection; subtitle indexing still refreshes HTML,
     # damage and preview metadata.
+    register_internal_change_scope(result["path"], {"subtitle_indices": "all"}, "Subtitle HTML removed")
     request_media_indexes(result["path"], ["subtitles", "previews"], "Subtitle HTML removed")
     tasks.update_progress(task_id, 2, 2, "Subtitle cleanup completed")
     return result
@@ -353,7 +403,10 @@ def process_subtitle_html(task_id: int, payload: dict) -> dict:
 
 def preflight_html_cleanup(payload: dict, fingerprint: dict) -> dict:
     """Validate HTML cleanup without creating execution work."""
-    request = SubtitleCleanup.model_validate(payload)
+    request_payload = dict(payload)
+    request_payload.pop("_preflight_fingerprint", None)
+    request_payload.pop("_preflight_result", None)
+    request = SubtitleCleanup.model_validate(request_payload)
     if not fingerprint.get("exists"):
         return {"decision": "invalid", "reason": "Media file is not accessible"}
     if request.external_path:
@@ -384,14 +437,23 @@ def preflight_html_cleanup(payload: dict, fingerprint: dict) -> dict:
 
 
 def approve_html_cleanup(payload: dict, result: dict) -> dict:
+    # Dispatcher-only fingerprints/results are validation metadata, not part of
+    # SubtitleCleanup's strict request model. Strip them before creating the
+    # executable child task (bulk and single-media paths).
     items = payload.get("_bulk_items")
     if items is not None:
         task_ids = []
         for item in items:
-            child = tasks.enqueue("subtitle_html_cleanup", item, "Remove subtitle HTML tags", deduplicate=True)
+            request = dict(item)
+            request.pop("_preflight_fingerprint", None)
+            request.pop("_preflight_result", None)
+            child = tasks.enqueue("subtitle_html_cleanup", request, "Remove subtitle HTML tags", deduplicate=True)
             task_ids.append(child["id"])
         return {"task_ids": task_ids, "queued": len(task_ids), "task_type": "subtitle_html_cleanup"}
-    child = tasks.enqueue("subtitle_html_cleanup", payload, "Remove subtitle HTML tags", deduplicate=True)
+    request = dict(payload)
+    request.pop("_preflight_fingerprint", None)
+    request.pop("_preflight_result", None)
+    child = tasks.enqueue("subtitle_html_cleanup", request, "Remove subtitle HTML tags", deduplicate=True)
     return {"task_id": child["id"], "task_type": "subtitle_html_cleanup"}
 
 

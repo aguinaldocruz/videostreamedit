@@ -17,6 +17,7 @@ from pydantic import BaseModel, Field
 import app.v54 as legacy
 from app.postgres_store import (
     begin_task_stage,
+    workflow_storage_status,
     fail_task_stage,
     finish_task_stage,
     mark_read_models_fresh,
@@ -665,6 +666,14 @@ def _queue_index_dependents(path: str, completed_job: str, reason: str = "Index 
 def request_media_indexes(path: str, names: list[str], reason: str, *, defer_detection: bool = False, detection_scope: dict | None = None) -> int:
     requested = validate_jobs(names)
     scope = detection_scope or {}
+    # Preserve the detector scope of every project-originated media write
+    # for the next Plex sync; do not re-register a marker while consuming one.
+    if scope and not str(reason).lower().startswith("plex catalog"):
+        try:
+            from app.v68 import register_internal_change_scope
+            register_internal_change_scope(path, scope, reason)
+        except Exception as exc:
+            logger.debug("plex_sync internal scope registration skipped: %s", exc)
     if scope:
         invalidate_language_detection(path, scope)
     if "subtitles" in requested:
@@ -910,6 +919,69 @@ def worker(job: str) -> None:
             logger.warning("index_queue=%s event=item_%s id=%d attempt=%d error=%s file=%s", job, "retry" if retry else "failed", row["id"], row["attempts"], message.replace("\n", " ")[-500:], path.replace("\n", "\\n"))
 
 
+
+def reconcile_index_workflow_stages() -> dict[str, int]:
+    """Repair durable index stages before workers start.
+
+    Index work lives in ``index_task_queue`` rather than the generic
+    ``task_queue``.  A restart or an older workflow reconciliation pass can
+    leave its stage cancelled/pending even though the queue item is runnable.
+    Repair only index stages and leave user-task workflow state untouched.
+    """
+    if os.getenv("DATABASE_BACKEND", "sqlite").lower() != "postgres":
+        return {"reopened": 0, "terminal": 0, "orphaned": 0}
+    repaired = {"reopened": 0, "terminal": 0, "orphaned": 0}
+    with connection() as db:
+        # A queue item that is pending/running is authoritative.  Reopen its
+        # stage, including stages cancelled by the old generic-task check.
+        repaired["reopened"] = db.execute(
+            """UPDATE workflow_stages s
+               SET status='pending', error=NULL, started_at=NULL,
+                   finished_at=NULL, updated_at=now()
+             WHERE s.task_type LIKE 'index:%%'
+               AND s.status IN ('cancelled','blocked')
+               AND EXISTS (
+                   SELECT 1 FROM index_task_queue q
+                    WHERE q.id::text=s.payload->>'task_id'
+                      AND q.status IN ('pending','running')
+               )"""
+        ).rowcount
+        # Bring stages into line with terminal queue rows so a completed item
+        # cannot be selected again after a restart.
+        repaired["terminal"] = db.execute(
+            """UPDATE workflow_stages s
+               SET status=q.status,
+                   error=CASE WHEN q.status='failed' THEN q.error ELSE NULL END,
+                   finished_at=COALESCE(s.finished_at, now()), updated_at=now()
+             FROM index_task_queue q
+            WHERE s.task_type LIKE 'index:%%'
+              AND s.status IN ('pending','running')
+              AND q.id::text=s.payload->>'task_id'
+              AND q.status IN ('succeeded','failed','cancelled')"""
+        ).rowcount
+        # Mark genuinely orphaned stages for visibility.  They are never
+        # allowed to block a later stage, but remain auditable in the workflow
+        # history instead of being silently deleted.
+        repaired["orphaned"] = db.execute(
+            """UPDATE workflow_stages s
+               SET status='cancelled',
+                   error=COALESCE(s.error, 'Orphaned index stage repaired at startup'),
+                   finished_at=COALESCE(s.finished_at, now()), updated_at=now()
+             WHERE s.task_type LIKE 'index:%%'
+               AND s.status IN ('pending','running','blocked')
+               AND s.payload->>'task_id' IS NOT NULL
+               AND NOT EXISTS (
+                   SELECT 1 FROM index_task_queue q
+                    WHERE q.id::text=s.payload->>'task_id'
+               )"""
+        ).rowcount
+    if any(repaired.values()):
+        logger.warning(
+            "index_queue event=workflow_stage_reconciled reopened=%d terminal=%d orphaned=%d",
+            repaired["reopened"], repaired["terminal"], repaired["orphaned"],
+        )
+    return repaired
+
 def inherit_existing_index_expedites() -> int:
     """Apply active media/workflow boosts to index rows queued before the boost."""
     changed = 0
@@ -946,6 +1018,7 @@ def initialize_index_queues() -> None:
                             AND s.payload->>'task_id' IN
                               (SELECT id::text FROM index_task_queue WHERE status <> 'running')""")
         old = db.execute("SELECT id,payload_json FROM task_queue WHERE task_type='media_reindex' AND status IN ('pending','running','failed')").fetchall()
+    reconcile_index_workflow_stages()
     deduplicate_active_index_paths()
     ensure_active_unique_index()
     inherit_existing_index_expedites()
@@ -1005,6 +1078,71 @@ def add_index_request(request: IndexRequest) -> dict:
 @app.get("/api/v80/setup/index/{job}/status")
 def index_queue_status(job: str) -> dict:
     validate_jobs([job]); return queue_state(job)
+
+
+@app.get("/api/v80/setup/index/health")
+def index_workflow_health() -> dict:
+    """Return a read-only operator view of index/workflow consistency."""
+    queue = {job: {"pending": 0, "running": 0, "failed": 0, "succeeded": 0, "cancelled": 0} for job in JOBS}
+    stages: dict[str, dict[str, int]] = {}
+    try:
+        with connection() as db:
+            for row in db.execute("SELECT job,status,count(*) AS n FROM index_task_queue GROUP BY job,status").fetchall():
+                job = str(row["job"])
+                if job in queue:
+                    queue[job][str(row["status"])] = int(row["n"])
+            stage_rows = db.execute(
+                "SELECT task_type,status,count(*) AS n FROM workflow_stages WHERE task_type LIKE 'index:%' GROUP BY task_type,status"
+            ).fetchall()
+            for row in stage_rows:
+                stages.setdefault(str(row["task_type"]), {})[str(row["status"])] = int(row["n"])
+            # Compare stage task ids with their owning index queue. This is
+            # intentionally read-only; the runtime monitor performs repairs.
+            queue_status = {int(row["id"]): str(row["status"]) for row in db.execute("SELECT id,status FROM index_task_queue").fetchall()}
+            queue_ids = set(queue_status)
+            orphaned = recoverable = terminal_mismatch = 0
+            for row in db.execute(
+                "SELECT task_type,status,payload FROM workflow_stages WHERE task_type LIKE 'index:%' AND status IN ('pending','running','blocked')"
+            ).fetchall():
+                payload = row["payload"]
+                if isinstance(payload, str):
+                    try:
+                        payload = json.loads(payload)
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        payload = {}
+                try:
+                    task_id = int((payload or {}).get("task_id"))
+                except (TypeError, ValueError):
+                    task_id = None
+                if task_id is None or task_id not in queue_ids:
+                    orphaned += 1
+                    continue
+                qstatus = queue_status.get(task_id, "missing")
+                sstatus = str(row["status"])
+                if qstatus in {"pending", "running"} and sstatus in {"cancelled", "blocked"}:
+                    recoverable += 1
+                if qstatus in {"succeeded", "failed", "cancelled"} and sstatus in {"pending", "running"}:
+                    terminal_mismatch += 1
+            locks = int(db.execute("SELECT count(*) FROM workflow_locks").fetchone()[0])
+    except Exception as exc:
+        logger.warning("index_queue event=health_check_failed error=%s", str(exc).replace("\n", " ")[-500:])
+        return {"status": "unavailable", "error": str(exc), "queue": queue, "stages": stages}
+    issues = orphaned + recoverable + terminal_mismatch + sum(values["failed"] for values in queue.values())
+    storage = workflow_storage_status()
+    if storage["status"] != "healthy":
+        issues += 1
+    return {
+        "status": "healthy" if issues == 0 else "attention",
+        "storage": storage,
+        "queue": queue,
+        "stages": stages,
+        "workflow_locks": locks,
+        "orphaned_stages": orphaned,
+        "recoverable_stages": recoverable,
+        "terminal_mismatches": terminal_mismatch,
+        "failed_queue_items": sum(values["failed"] for values in queue.values()),
+        "checked_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+    }
 
 
 @app.post("/api/v80/setup/index/subtitles/recheck-detection")

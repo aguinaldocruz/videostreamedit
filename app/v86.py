@@ -13,6 +13,7 @@ from app.postgres_store import (
     read_model_state,
     read_model_summary,
     recover_luws,
+    cleanup_terminal_luw_locks,
     rollback_workflow,
     workflow_details,
     workflow_read_model,
@@ -319,6 +320,9 @@ def initialize_postgres_workflow() -> None:
     for attempt in range(5):
         try:
             initialize_postgres_workflow_schema()
+            cleaned_locks = cleanup_terminal_luw_locks()
+            if cleaned_locks:
+                logger.warning("luw event=terminal_locks_cleaned count=%d", cleaned_locks)
             recovered = recover_luws()
             if recovered:
                 logger.warning("luw event=recovered_after_restart count=%d", recovered)
