@@ -16,6 +16,10 @@ if [ "$(id -u)" = "0" ]; then
     # /config/data contains PostgreSQL files owned by the database container.
     # Never recursively chown that subtree from the application container.
     find /config -mindepth 1 -maxdepth 1 ! -name data -exec chown -R videostreamedit:videostreamedit {} + || true
+    mkdir -p /config /data /backup
+    # Fresh named volumes start root-owned. Change only the mount roots, never
+    # recursively take ownership of a local PostgreSQL cluster under /data.
+    chown videostreamedit:videostreamedit /config /data /backup
     exec gosu videostreamedit "$@"
 fi
 

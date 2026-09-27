@@ -1,34 +1,18 @@
 name: videostreamedit
 
 services:
-# Default: PostgreSQL runs as the separate `postgres` service below.
+# PostgreSQL is external to this deployment. Configure or migrate it from
+# Setup → Tasks → Migrate; no database credentials are stored in Compose.
 #
 # Optional single-container mode (small/test hosts only):
+#   docker compose build videostreamedit
 #   docker compose --profile single-container build videostreamedit-all-in-one
 #   docker compose --profile single-container up -d videostreamedit-all-in-one
-# Stop the default `postgres` and `videostreamedit` services first; both modes
-# must never share the same /data/postgres directory at the same time. The
+# Stop `videostreamedit` first; both application modes must never run against
+# the same persistent data simultaneously. The
 # profile uses Dockerfile.all-in-one, supervises PostgreSQL and uvicorn in one
 # container, and keeps the database under /data/postgres. The separated mode
 # remains recommended for backups, upgrades, resource limits, and recovery.
-
-  postgres:
-    image: postgres:16-alpine
-    container_name: videostreamedit-postgres
-    restart: unless-stopped
-    environment:
-      POSTGRES_DB: videostreamedit
-      POSTGRES_USER: videostreamedit
-      POSTGRES_PASSWORD: change-this-local-password
-      TZ: "America/Sao_Paulo"
-    command: ["postgres", "-c", "timezone=America/Sao_Paulo", "-c", "log_timezone=America/Sao_Paulo"]
-    volumes:
-      - /home/docker/videostreamedit/data/postgres:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U videostreamedit -d videostreamedit"]
-      interval: 10s
-      timeout: 5s
-      retries: 10
 
   videostreamedit:
     # Replace this with a published image later, for example:
@@ -40,10 +24,6 @@ services:
     restart: unless-stopped
     init: true
     stop_grace_period: 90s
-    depends_on:
-      postgres:
-        condition: service_healthy
-
     ports:
       - "8383:8080"
 
@@ -51,21 +31,25 @@ services:
       PUID: "1000"
       PGID: "1000"
       LANGUAGE_ID_URL: "http://language-id:9000"
-      # Internal PostgreSQL is the default. For external PostgreSQL, set DATABASE_URL to its URL and disable the postgres service/depends_on.
+      # The encrypted connection under /config is authoritative. This value
+      # only selects the normal PostgreSQL adapter after startup.
       DATABASE_BACKEND: "postgres"
-      DATABASE_URL: "${DATABASE_URL:-postgresql://videostreamedit:change-this-local-password@postgres:5432/videostreamedit}"
       # Preview extraction is on-demand. Keep concurrency at 1 unless benchmarked safely.
-      PREVIEW_MAX_CONCURRENT: "${PREVIEW_MAX_CONCURRENT:-1}"
       # Never let staging/cache work consume the host reserve. A snapshot is
       # refused before copying when free space would fall below these limits.
       WORKFLOW_MIN_FREE_GB: "${WORKFLOW_MIN_FREE_GB:-5}"
       WORKFLOW_RESERVED_GB: "${WORKFLOW_RESERVED_GB:-2}"
-      PREVIEW_MIN_FREE_GB: "${PREVIEW_MIN_FREE_GB:-5}"
+      # Bounded parallelism for independent bulk stream edits. Per-media LUW
+      # locks and signatures remain enabled; lower to 1 on slow storage.
+      BULK_EDIT_WORKERS: "${BULK_EDIT_WORKERS:-3}"
 
     volumes:
       - /media/:/media
       - /home/docker/videostreamedit:/config
       - /home/docker/videostreamedit/data:/data
+      # Portable database/config backups. This is intentionally separate from
+      # /data so staged workflow files are never included in a backup archive.
+      - /home/docker/videostreamedit/backup:/backup
 
     security_opt:
       - no-new-privileges:true
@@ -96,8 +80,8 @@ services:
     security_opt:
       - no-new-privileges:true
 
-  # Optional alternative to the two services above. Do not run it alongside
-  # `postgres`/`videostreamedit` using the same persistent data directory.
+  # Optional application/database alternative. The language-id service is
+  # still separate. Do not run alongside the default application.
   videostreamedit-all-in-one:
     profiles: ["single-container"]
     build:
@@ -107,7 +91,8 @@ services:
     container_name: videostreamedit-all-in-one
     restart: unless-stopped
     init: true
-    stop_grace_period: 90s
+    # Allow application drain (90s) followed by a clean database checkpoint.
+    stop_grace_period: 125s
     ports:
       - "8383:8080"
     environment:
@@ -115,11 +100,15 @@ services:
       PGID: "1000"
       LANGUAGE_ID_URL: "http://language-id:9000"
       DATABASE_BACKEND: "postgres"
-      # Set DATABASE_URL to an external PostgreSQL instance if desired.
+      # Existing encrypted external configuration is respected: in that case
+      # no local PostgreSQL process is started. Fresh local databases use
+      # generated credentials saved encrypted under /config, not Compose.
+      # Old clusters require an explicit backup/restore, never automatic upgrade.
     volumes:
       - /media/:/media
       - /home/docker/videostreamedit:/config
       - /home/docker/videostreamedit/data:/data
+      - /home/docker/videostreamedit/backup:/backup
     depends_on:
       language-id:
         condition: service_started

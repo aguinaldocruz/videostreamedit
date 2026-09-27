@@ -10,3 +10,6 @@
 .episode-pane table thead th:last-child{white-space:nowrap;text-align:right;vertical-align:middle}
 .episode-pane table thead th:last-child>.season-stream-toggle,.episode-pane table thead th:last-child>.refresh,.episode-pane table thead th:last-child>.season-tools{display:inline-flex;vertical-align:middle;align-items:center}
 .episode-pane table thead th:last-child>.season-stream-toggle,.episode-pane table thead th:last-child>.refresh{margin-left:.35rem}
+.tv-show-edit-mode{margin:.2rem .45rem;padding:.25rem .6rem;font-size:.75rem;white-space:nowrap}
+.tv-show-edit-discard{margin:.2rem .35rem;padding:.25rem .6rem;font-size:.75rem;white-space:nowrap}
+.tv-edit-session-status{display:inline-block;margin:.2rem .35rem;color:var(--muted);font-size:.72rem;white-space:nowrap}.tv-edit-session-status.active{color:var(--accent,#8ec5ff)}

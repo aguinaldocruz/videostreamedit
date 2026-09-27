@@ -13,7 +13,7 @@ function isApplicationRequest(resource, options = {}) {
     // These endpoints only load/filter cached values. Their screens already
     // show a local loading state; they must not block the whole page with the
     // processing overlay while a large season is being expanded.
-    if (path === '/api/v79/tv/show-status' || path === '/api/v79/tv/season-stream-values' || path === '/api/v82/movies/stream-values'
+    if (path === '/api/v79/tv/show-status' || path === '/api/v79/tv/season-stream-values' || path === '/api/v82/movies/stream-values' || path === '/api/v82/movies/index-work'
         || path === '/api/v8/saved-values' || path === '/api/v8/value-uses' || path === '/api/v86/language-region-use') return false;
     return path.startsWith('/api/');
   } catch (_) { return value.startsWith('/api/'); }
@@ -53,7 +53,7 @@ function revealGlobalBusy() {
   applyGlobalBusyProgress();
 }
 
-function beginGlobalBusy(context = '') {
+function beginGlobalBusy(context = '', immediate = false) {
   clearTimeout(globalBusyReleaseTimer);
   globalBusyRequests++;
   if (context) globalBusyContext = context;
@@ -61,7 +61,8 @@ function beginGlobalBusy(context = '') {
   // use the same progress overlay and animated ring as bulk processing.
   if (globalBusyRequests === 1 && !document.getElementById('global-busy-overlay')) {
     clearTimeout(globalBusyRevealTimer);
-    globalBusyRevealTimer = setTimeout(() => { globalBusyRevealTimer = null; revealGlobalBusy(); }, 350);
+    if (immediate) { globalBusyRevealTimer = null; revealGlobalBusy(); }
+    else globalBusyRevealTimer = setTimeout(() => { globalBusyRevealTimer = null; revealGlobalBusy(); }, 350);
   }
   if (document.getElementById('global-busy-overlay')) {
     document.body.classList.add('app-busy');
@@ -103,6 +104,9 @@ function applyGlobalBusyProgress() {
   const detail = document.querySelector('#global-busy-overlay [data-busy-context]');
   if (detail) detail.textContent = progress.detail || progress.message || 'Processing…';
 }
+
+window.beginGlobalBusyImmediate = function(context = '') { beginGlobalBusy(context, true); };
+window.endGlobalBusyOperation = endGlobalBusy;
 
 window.setGlobalBusyProgress = function(step, total, message, detail = '') {
   globalBusyProgress = {step: Number(step) || 0, total: Number(total) || 0, message: String(message || 'Processing…'), detail: String(detail || '')};

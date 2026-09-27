@@ -1,16 +1,14 @@
 (function () {
   const languageNames = typeof Intl.DisplayNames === 'function' ? new Intl.DisplayNames(['en'], {type: 'language'}) : null;
   const regionNames = typeof Intl.DisplayNames === 'function' ? new Intl.DisplayNames(['en'], {type: 'region'}) : null;
-  const common = ['und|','pt|PT','pt|BR','en|','en|US','en|GB','es|','es|ES','es|MX','fr|','fr|FR','fr|CA','de|','it|','ja|','ko|','zh|CN','zh|TW','ar|','nl|','pl|','ru|','tr|','sv|','no|','da|','fi|','el|','he|','hi|'];
+  const common = ['und|','pt|','pt|PT','pt|BR','en|','en|US','en|GB','es|','es|ES','es|MX','fr|','fr|FR','fr|CA','de|','it|','ja|','ko|','zh|CN','zh|TW','ar|','nl|','pl|','ru|','tr|','sv|','no|','da|','fi|','el|','he|','hi|'];
 
   function normalized(language, region) {
     let lang = String(language || '').trim().toLowerCase().replace('_', '-');
     let area = String(region || '').trim().toUpperCase();
-    // Plex treats regionless Portuguese as European Portuguese. Canonicalize
-    // all equivalent spellings so the selector cannot show duplicate labels.
+    // Keep regionless Portuguese distinct from its regional variants.
     if (lang === 'pt-br') { lang = 'pt'; area = 'BR'; }
     else if (lang === 'pt-pt') { lang = 'pt'; area = 'PT'; }
-    else if (lang === 'pt' && !area) area = 'PT';
     return `${lang}|${area}`;
   }
 
@@ -24,7 +22,8 @@
     if (!language && !region) return '<empty>';
     if (language === 'und') return region ? `Undetermined — ${region}` : 'Undetermined';
     if (language === 'pt' && region === 'BR') return 'Portuguese — Brazilian';
-    if (language === 'pt' && (region === 'PT' || !region)) return 'Portuguese — Portugal';
+    if (language === 'pt' && region === 'PT') return 'Portuguese — Portugal';
+    if (language === 'pt' && !region) return 'Portuguese';
     let languageName;
     try { languageName = languageNames?.of(language); } catch (_) {}
     languageName = languageName && languageName !== language ? languageName : language.toUpperCase();
@@ -70,7 +69,7 @@
     if (typeof suppressSavedComboboxInput !== 'undefined') suppressSavedComboboxInput = wasSuppressed;
   }
 
-  function makeSelector(values, selected, unchanged, multiple = false, compact = false) {
+  function makeSelector(values, selected, unchanged, multiple = false, compact = false, includeConfigured = true) {
     const select = document.createElement('select');
     select.className = 'language-region-select';
     if (multiple) { select.multiple = true; select.setAttribute('aria-label', 'Language and region filters (multiple selection)'); select.title = 'Hold Ctrl or Command to select multiple values'; }
@@ -88,8 +87,10 @@
     const selectedValues = Array.isArray(selected)
       ? selected.filter(value => !isSentinel(value) && !values.includes(value))
       : (selected && !isSentinel(selected) && !values.includes(selected) ? [selected] : []);
-    const ordered = [...new Set(values.filter(value => !isSentinel(value)).concat(selectedValues))]
-      .sort((left, right) => usageFor(right) - usageFor(left) || labelFor(left).localeCompare(labelFor(right)));
+    const configured = (typeof v8Saved !== 'undefined' && Array.isArray(v8Saved.language_region_order)) ? v8Saved.language_region_order : [];
+    const ranks = new Map(configured.map((value,index) => [value,index]));
+    const ordered = [...new Set(values.filter(value => !isSentinel(value)).concat(includeConfigured ? configured.filter(value => value.includes('|')) : []).concat(selectedValues))]
+      .sort((left, right) => (ranks.has(left) ? ranks.get(left) : 100000) - (ranks.has(right) ? ranks.get(right) : 100000) || labelFor(left).localeCompare(labelFor(right)));
     const visible = compact && ordered.length > 4 ? ordered.slice(0, 4) : ordered;
     if (compact && ordered.length > 4 && !Array.isArray(selected) && selected && !visible.includes(selected)) {
       visible[visible.length - 1] = selected;
@@ -141,6 +142,12 @@
       language.classList.add('language-region-internal');
       region.classList.add('language-region-internal');
       rebuild();
+      row.syncLanguageRegionSelector = () => {
+        const projected = normalized(language.value, region.value);
+        if (select?.value === projected) return;
+        selectedValue = projected;
+        rebuild();
+      };
     });
     const head = root.querySelector('.stream-grid.v7.head');
     if (head && !head.dataset.languageRegionReady) {
@@ -189,6 +196,15 @@
     rebuild();
   }
 
+  // TV-show drafts project their values into the underlying inputs after the
+  // editor is rendered. Keep the visible selector aligned with those inputs;
+  // rebuilding it here does not record a usage or mark the row as a user edit.
+  window.syncStreamLanguageRegionSelectors = (root = document.querySelector('#stream-content')) => {
+    if (!root) return;
+    enhanceStreamRows(root);
+    root.querySelectorAll('.stream-row').forEach(row => row.syncLanguageRegionSelector?.());
+  };
+
   function enhanceFilter(container, records) {
     const filters = container?.querySelector('.season-stream-filters,.movie-header-stream-filters');
     if (!filters || filters.dataset.languageRegionReady) return;
@@ -208,11 +224,12 @@
       const track = trackControl?.value || '__all__';
       const previous = select?.value || '__all__';
       const pairs = [...new Set((records || [])
+        .filter(item => !item._draftRemoved)
         .filter(item => stream === '__all__' || String(item.stream_type).toLowerCase() === String(stream).toLowerCase())
         .filter(item => track === '__all__' || (track === '__empty__' ? !item.track_name : item.track_name === track))
         .map(item => normalized(item.language, item.region)))];
       const initial = filters.parentElement?.dataset.initialSingleton === 'true' && pairs.length === 1 ? pairs[0] : (pairs.includes(previous) ? previous : '__all__');
-      const next = makeSelector(['__all__', ...pairs], initial, false);
+      const next = makeSelector(['__all__', ...pairs], initial, false, false, false, false);
       select?.replaceWith(next);
       select = next;
       if (filters.parentElement?.dataset.initialSingleton === 'true') delete filters.parentElement.dataset.initialSingleton;
@@ -230,11 +247,12 @@
         }
         select.dataset.selectedValues = selected.join('\u001f');
         selected.filter(value => !value.startsWith('__')).forEach(recordSelection);
-        const cascadeContainer = streamControl?.closest('.season-stream-filter-row,.movie-header-stream-filter-row')?.querySelector('.season-stream-filter-content,.movie-header-stream-filter-content');
+        const cascadeContainer = filters.parentElement;
         if (cascadeContainer) cascadeContainer.dataset.pairCascade = 'true';
         streamControl?.dispatchEvent(new Event('change', {bubbles: true}));
       };
     }
+    filters.refreshLanguageRegionPairs = rebuildPairs;
     wrapper.append(document.createElement('select'));
     select = wrapper.lastElementChild;
     language.closest('label').before(wrapper);
@@ -242,6 +260,12 @@
     streamControl?.addEventListener('change', rebuildPairs);
     trackControl?.addEventListener('change', rebuildPairs);
   }
+
+  window.refreshTvLanguageRegionFilter = () => {
+    const container = document.querySelector('#season-stream-filter-content');
+    enhanceFilter(container, window.currentTvStreamRecords || []);
+    container?.querySelector('.season-stream-filters')?.refreshLanguageRegionPairs?.();
+  };
 
   function relabelLegacyMovieFilter() {
     const select = document.querySelector('#movie-stream-language');

@@ -14,7 +14,7 @@ import app.v7 as v7_module
 import app.v13 as v13_module
 from app.v5 import external_subtitles
 from app.v7 import ReorderEditRequest, reorder_edit
-from app.v11 import connection, plex_authorized_file
+from app.v11 import connection, plex_authorized_file, column_exists
 from app.v25 import app
 
 logger = logging.getLogger("videostreamedit")
@@ -46,8 +46,7 @@ class ImportCleanupRequest(BaseModel):
 def initialize_movie_import() -> None:
     with connection() as db:
         db.execute("CREATE TABLE IF NOT EXISTS import_config (id INTEGER PRIMARY KEY CHECK(id=1), input_folder TEXT NOT NULL DEFAULT '')")
-        columns = {row["name"] for row in db.execute("PRAGMA table_info(import_config)")}
-        if "last_input_folder" not in columns:
+        if not column_exists(db, 'import_config', 'last_input_folder'):
             db.execute("ALTER TABLE import_config ADD COLUMN last_input_folder TEXT NOT NULL DEFAULT ''")
 
 

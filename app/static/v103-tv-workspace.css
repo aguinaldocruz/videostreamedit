@@ -1,0 +1,62 @@
+#tv.tv-workspace .tv-layout{grid-template-columns:minmax(285px,315px) minmax(0,1fr);gap:.8rem;overflow:visible}
+#tv.tv-workspace .show-pane,#tv.tv-workspace .episode-pane{min-width:0;min-height:0;overflow:auto;scrollbar-width:thin}
+#tv.tv-workspace .episode-pane{overflow-x:hidden}
+#tv.tv-workspace .show-heading .list-filters{overflow-x:auto!important;overflow-y:hidden!important;padding-bottom:.35rem;scrollbar-width:thin}
+#tv.tv-workspace .show-card{white-space:normal;overflow-wrap:anywhere}
+#tv.tv-workspace .show-card strong,#tv.tv-workspace .show-card small{white-space:normal;overflow-wrap:anywhere}
+#tv.tv-workspace .tv-show-count{display:block;margin:.2rem 0 .35rem;color:var(--vse-muted,#9aa6b2);font-size:.7rem}
+#tv.tv-workspace .episode-heading{height:auto!important;min-height:4rem!important;display:grid!important;grid-template-columns:auto minmax(0,1fr) auto;align-items:center;gap:.7rem;padding:.6rem .8rem}
+#tv.tv-workspace .episode-heading>#tv-show-navigation-left{grid-column:1;grid-row:1}
+#tv.tv-workspace .episode-heading>.tv-show-title-block{grid-column:2;grid-row:1;min-width:0;display:flex!important;flex-direction:column;align-items:center;justify-content:center;gap:.15rem;overflow:visible!important}
+#tv.tv-workspace .episode-heading>#tv-show-navigation-right{grid-column:3;grid-row:1}
+#tv.tv-workspace .episode-heading>.page-tools{display:none!important}
+#tv.tv-workspace .episode-heading .tv-show-title-block h3,#tv.tv-workspace .episode-heading #show-title{display:block!important;max-width:100%!important;margin:0;overflow:visible!important;text-overflow:clip!important;white-space:normal!important;overflow-wrap:anywhere;text-align:center;line-height:1.3}
+#tv.tv-workspace .episode-heading .tv-show-title-block #episode-scope{display:flex!important;flex-wrap:wrap;justify-content:center;min-width:0;white-space:normal}
+#tv.tv-workspace .episode-heading .episode-scope-text{overflow:visible;text-overflow:clip;white-space:normal}
+#tv.tv-workspace .tv-show-action-bar,#tv.tv-workspace .tv-episode-toolbar,#tv.tv-workspace .tv-episode-summary{display:flex;align-items:center;flex-wrap:wrap;gap:.55rem;padding:.5rem .8rem;border-left:1px solid var(--vse-border,#303947);border-right:1px solid var(--vse-border,#303947);background:var(--vse-surface-raised,#202833)}
+#tv.tv-workspace .tv-show-action-bar{border-top:1px solid var(--vse-border,#303947);background:var(--vse-surface,#151b22)}
+#tv.tv-workspace .tv-show-action-bar.draft-active{border-left:3px solid var(--vse-accent,#62b0ff);background:color-mix(in srgb,var(--vse-accent,#62b0ff) 8%,var(--vse-surface,#151b22))}
+#tv.tv-workspace .tv-show-action-bar.draft-committing{border-left-color:#e3b66a}
+#tv.tv-workspace .tv-action-caption{font-size:.7rem;font-weight:800;letter-spacing:.04em;text-transform:uppercase;color:var(--vse-muted,#9aa6b2)}
+#tv.tv-workspace .tv-draft-help{flex:1 1 17rem;min-width:0;font-size:.73rem;color:var(--vse-muted,#9aa6b2);overflow-wrap:anywhere}
+#tv.tv-workspace .tv-show-action-bar button{white-space:nowrap;min-height:2rem}
+#tv.tv-workspace .tv-show-action-bar [hidden]{display:none!important}
+#tv.tv-workspace .tv-episode-toolbar{justify-content:space-between;border-top:1px solid var(--vse-border,#303947)}
+#tv.tv-workspace .tv-toolbar-primary,#tv.tv-workspace .tv-toolbar-actions{display:flex;align-items:center;flex-wrap:wrap;gap:.45rem;min-width:0}
+#tv.tv-workspace .tv-toolbar-primary{flex:1 1 27rem}
+#tv.tv-workspace .tv-toolbar-label{font-weight:700;font-size:.8rem;margin-right:.2rem}
+#tv.tv-workspace #episode-search{display:block!important;position:static!important;width:min(19rem,100%);max-width:100%;height:2.1rem}
+#tv.tv-workspace .season-tools{display:inline-flex;align-items:center;min-height:2.1rem}
+#tv.tv-workspace .season-tools select{max-width:12rem;min-height:2.1rem}
+#tv.tv-workspace .tv-discrepancy-control{display:inline-flex;align-items:center;gap:.35rem;color:var(--vse-muted,#9aa6b2);font-size:.75rem;white-space:nowrap;cursor:pointer}
+#tv.tv-workspace .tv-discrepancy-control .episode-detection-filter-dot{flex:none}
+#tv.tv-workspace .tv-toolbar-actions button{width:auto!important;min-width:0!important;min-height:2.1rem;padding:.35rem .65rem;line-height:1.2;white-space:nowrap}
+#tv.tv-workspace .tv-episode-summary{background:var(--vse-surface,#151b22);font-size:.74rem;color:var(--vse-muted,#9aa6b2)}
+#tv.tv-workspace .tv-active-filters{display:flex;flex:1 1 12rem;flex-wrap:wrap;gap:.3rem;min-width:0}
+#tv.tv-workspace .tv-filter-chip{max-width:100%;padding:.17rem .45rem;border:1px solid var(--vse-border,#303947);border-radius:999px;background:var(--vse-surface-raised,#202833);color:var(--vse-text,#e7edf5);overflow-wrap:anywhere}
+#tv.tv-workspace [data-tv-clear-filters]{padding:.25rem .5rem;font-size:.72rem}
+#tv.tv-workspace [data-tv-clear-filters][hidden]{display:none!important}
+#tv.tv-workspace .tv-stream-filter-panel,#tv.tv-workspace .tv-stream-edit-panel{padding:.7rem .8rem;border:1px solid var(--vse-border,#303947);border-bottom:0;background:var(--vse-surface-subtle,#12171d);overflow-x:auto;scrollbar-width:thin}
+#tv.tv-workspace .tv-stream-edit-panel{background:color-mix(in srgb,var(--vse-accent,#62b0ff) 5%,var(--vse-surface-subtle,#12171d))}
+#tv.tv-workspace .tv-episode-table-scroll{max-width:100%;overflow-x:auto;scrollbar-width:thin}
+#tv.tv-workspace .season-stream-filter-row,#tv.tv-workspace .season-stream-edit-row{display:none!important}
+#tv.tv-workspace .season-stream-filters{display:flex!important;flex-wrap:wrap;align-items:end;gap:.6rem;min-width:0}
+#tv.tv-workspace .season-stream-filters>label:not(.filter-not-have){flex:1 1 10rem;min-width:9rem;max-width:19rem}
+#tv.tv-workspace .season-stream-filters>label.filter-not-have{flex:none}
+#tv.tv-workspace .season-stream-filters button{width:auto!important;min-width:fit-content;padding:.35rem .6rem;white-space:nowrap}
+#tv.tv-workspace .season-stream-filters [data-filter-summary]{white-space:normal;overflow-wrap:anywhere}
+#tv.tv-workspace .season-stream-editor{display:flex!important;flex-wrap:wrap!important;align-items:end!important;gap:.6rem!important;overflow:visible!important;white-space:normal!important}
+#tv.tv-workspace .season-stream-editor .bulk-fields{display:flex!important;flex:1 1 28rem!important;width:auto!important;min-width:0;flex-wrap:wrap!important;gap:.55rem}
+#tv.tv-workspace .season-stream-editor .bulk-fields>label:not(.language-region-internal){flex:1 1 10rem!important;width:auto!important;min-width:9rem!important;max-width:none!important;overflow:visible!important}
+#tv.tv-workspace .season-stream-editor .bulk-fields>label:nth-child(3){flex:1.3 1 13rem!important;min-width:12rem!important}
+#tv.tv-workspace .season-stream-editor .bulk-actions{display:flex!important;flex:1 1 auto!important;flex-wrap:wrap!important;align-items:end!important;gap:.4rem!important;margin:0!important;min-width:0}
+#tv.tv-workspace .season-stream-editor .bulk-actions>*{white-space:normal!important}
+#tv.tv-workspace .episode-pane table{min-width:44rem}
+#tv.tv-workspace .episode-pane table thead th:last-child{text-align:right;min-width:8rem}
+#tv.tv-workspace .episode-pane tbody td:first-child{min-width:15rem;overflow-wrap:anywhere}
+#tv.tv-workspace .episode-pane tbody td:last-child{text-align:right}
+#tv.tv-workspace .episode-pane tbody td:last-child button{white-space:nowrap}
+#tv.tv-workspace .tv-draft-row{background:color-mix(in srgb,var(--vse-accent,#62b0ff) 8%,transparent)}
+#tv.tv-workspace .tv-selected-row td:first-child{box-shadow:inset 3px 0 var(--vse-accent,#62b0ff)}
+#tv.tv-workspace .tv-draft-marker{display:inline-block;margin-left:.45rem;padding:.12rem .38rem;border:1px solid var(--vse-accent,#62b0ff);border-radius:999px;color:var(--vse-accent,#62b0ff);font-size:.64rem;font-weight:700;vertical-align:middle}
+@media(max-width:760px){#tv.tv-workspace .tv-layout{grid-template-columns:minmax(0,1fr);height:auto;min-height:0}#tv.tv-workspace .show-pane{max-height:36vh}#tv.tv-workspace .episode-pane{max-height:75vh}#tv.tv-workspace .episode-heading{gap:.35rem;padding:.55rem .4rem}#tv.tv-workspace .tv-show-action-bar,#tv.tv-workspace .tv-episode-toolbar,#tv.tv-workspace .tv-episode-summary{padding:.55rem}#tv.tv-workspace .tv-toolbar-primary{flex-basis:100%}#tv.tv-workspace .tv-toolbar-actions{width:100%;justify-content:flex-start}}

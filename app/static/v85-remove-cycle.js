@@ -13,5 +13,13 @@
     };
     updateTitle();
   }
-  const previousOpenEditor=openEditor;openEditor=async function(...args){const result=await previousOpenEditor(...args);installRemoveCycle();return result};
+  const previousOpenEditor=openEditor;openEditor=async function(...args){const result=await previousOpenEditor(...args);
+    // This is the outermost Stream Properties wrapper.  Re-apply the virtual
+    // TV-show journal after every renderer/plugin has finished building rows;
+    // some integrations replace the row DOM after the normal v9 projection.
+    // The projection is idempotent, so this does not duplicate removals.
+    if(window.activeTvDraftForPath?.(args[0])?.session_id&&typeof window.applyTvDraftProjection==='function'){
+      try{await window.applyTvDraftProjection(args[0]);if(typeof captureEditorBaseline==='function')captureEditorBaseline()}catch(_){/* committed media remains usable */}
+    }
+    installRemoveCycle();return result};
 })();

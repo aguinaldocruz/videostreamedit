@@ -3,3 +3,15 @@
 .ocr-staged-row{display:flex;justify-content:space-between;gap:1rem;align-items:center;padding:.65rem .75rem;margin:.45rem 0;border:1px solid var(--border,#334155);border-radius:.45rem;background:var(--panel,#111827)}
 .ocr-staged-row>div:first-child{min-width:0;display:grid;gap:.2rem}.ocr-staged-row strong,.ocr-staged-row small{overflow-wrap:anywhere}.ocr-staged-actions{display:flex;gap:.4rem;flex:0 0 auto;flex-wrap:wrap}
 @media(max-width:800px){.ocr-staged-row{align-items:flex-start;flex-direction:column}.ocr-staged-actions{width:100%}}
+
+.setup-inner-tabs{display:flex;gap:.35rem;flex-wrap:wrap;margin:.4rem 0 .9rem;padding:.25rem;border-bottom:1px solid var(--border,#303943)}
+.setup-inner-tabs button{border:1px solid transparent;background:transparent;color:var(--muted,#9aa6b2);padding:.45rem .7rem;border-radius:.4rem;cursor:pointer}
+.setup-inner-tabs button.active{background:var(--accent,#49a8ff);color:#07131d}
+.saved-property-tab-panels{min-height:4rem}.saved-property-tab-panel{padding:.15rem 0}.saved-property-tabs{margin-top:0}
+.appearance-report-cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:1rem;margin-top:1rem}
+.appearance-report-cards>section{border:1px solid var(--border,#303943);border-radius:.65rem;padding:1rem;background:var(--panel,#111827)}
+.appearance-report-cards h4{margin:.05rem 0 .7rem}.appearance-report-toggles{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:.45rem}
+.appearance-report-toggles label{display:flex;align-items:center;gap:.45rem;padding:.45rem .55rem;border:1px solid var(--border,#303943);border-radius:.4rem}
+.language-order-row{display:grid;grid-template-columns:auto minmax(0,1fr) minmax(5rem,.4fr) auto;align-items:center;gap:.65rem;padding:.5rem .65rem;border:1px solid var(--border,#303943);border-radius:.45rem;margin:.35rem 0}
+.language-order-row small{color:var(--muted,#9aa6b2)}
+@media(max-width:650px){.language-order-row{grid-template-columns:auto 1fr auto}.language-order-row small{grid-column:2}}

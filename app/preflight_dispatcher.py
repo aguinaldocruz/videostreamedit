@@ -21,7 +21,7 @@ from fastapi import HTTPException
 from pydantic import BaseModel, Field
 
 from app.v11 import connection
-from app.v15 import app
+from app.v14 import app
 
 logger = logging.getLogger("uvicorn.error")
 _dispatcher_shutdown = threading.Event()
@@ -115,9 +115,15 @@ def enqueue_preflight(operation_type: str, media_path: str = "", payload: dict[s
     now = _now()
     with connection() as db:
         if deduplicate:
-            existing = db.execute("SELECT * FROM preflight_requests WHERE dedupe_key=? AND status IN ('pending','running') ORDER BY id DESC LIMIT 1", (key,)).fetchone()
+            existing = db.execute("SELECT * FROM preflight_requests WHERE dedupe_key=? ORDER BY id DESC LIMIT 1", (key,)).fetchone()
             if existing:
-                return _row(existing)
+                if existing["status"] in {"pending", "running"}:
+                    return _row(existing)
+                # A completed request must not block a deliberate re-run of
+                # the same operation. Keep the historical row, but give the
+                # new request a unique dedupe key so the database constraint
+                # remains useful for concurrent active submissions.
+                key = hashlib.sha256(f"{key}:{time.time_ns()}".encode("utf-8")).hexdigest()
         cursor = db.execute(
             "INSERT INTO preflight_requests(operation_type,media_path,payload_json,mode,priority,status,dedupe_key,created_at,updated_at) VALUES(?,?,?,?,?,'pending',?,?,?)",
             (operation_type, media_path, json.dumps(payload, ensure_ascii=False, separators=(",", ":")), mode, priority, key, now, now),
@@ -134,7 +140,11 @@ def enqueue_bulk_preflight(operation_type: str, items: list[dict[str, Any]], *, 
     unique: dict[str, dict[str, Any]] = {}
     for item in items:
         path = str(item.get("path") or "").strip()
-        key = (path, str(item.get("source") or "embedded"), int(item.get("type_index", -1)), str(item.get("external_path") or ""))
+        # External subtitle requests intentionally carry a null type_index;
+        # normalize it before deduplication instead of calling int(None).
+        raw_type_index = item.get("type_index", -1)
+        normalized_type_index = -1 if raw_type_index is None or raw_type_index == "" else int(raw_type_index)
+        key = (path, str(item.get("source") or "embedded"), normalized_type_index, str(item.get("external_path") or ""))
         item_copy = dict(item)
         item_copy["_preflight_fingerprint"] = _fingerprint(path)
         unique[json.dumps(key, ensure_ascii=False)] = item_copy
@@ -150,12 +160,68 @@ def _row(row: Any) -> dict[str, Any]:
     return result
 
 
+def _attach_execution_progress(result: dict[str, Any]) -> dict[str, Any]:
+    """Attach live child-task progress to a completed bulk preflight result.
+
+    Bulk approval deliberately creates independent child tasks so media-level
+    locks and queue priorities remain effective.  The parent therefore stores
+    only child ids; this view derives their current state on demand, avoiding a
+    second progress state that could become stale or consume extra storage.
+    """
+    execution = (result.get("result") or {}).get("execution") or {}
+    raw_ids = execution.get("task_ids") or []
+    try:
+        task_ids = [int(value) for value in raw_ids if int(value) > 0]
+    except (TypeError, ValueError):
+        task_ids = []
+    if not task_ids:
+        return result
+
+    counts: dict[str, int] = {}
+    try:
+        with connection() as db:
+            # Keep the IN clause bounded for very large shows.  The dispatcher
+            # is read-only here, and each chunk is small enough for both the
+            # local compatibility layer and PostgreSQL parameter limits.
+            for offset in range(0, len(task_ids), 500):
+                chunk = task_ids[offset:offset + 500]
+                placeholders = ",".join("?" for _ in chunk)
+                rows = db.execute(
+                    f"SELECT status, COUNT(*) AS count FROM task_queue WHERE id IN ({placeholders}) GROUP BY status",
+                    tuple(chunk),
+                ).fetchall()
+                for row in rows:
+                    status = str(row["status"] if hasattr(row, "keys") else row[0])
+                    count = int(row["count"] if hasattr(row, "keys") else row[1])
+                    counts[status] = counts.get(status, 0) + count
+    except Exception as exc:  # Progress is advisory; never break preflight polling.
+        logger.debug("preflight event=execution_progress_unavailable error=%s", exc)
+        return result
+
+    total = len(task_ids)
+    running = counts.get("running", 0)
+    pending = counts.get("pending", 0)
+    terminal = sum(counts.get(status, 0) for status in ("succeeded", "failed", "cancelled"))
+    progress = {
+        "total": total,
+        "succeeded": counts.get("succeeded", 0),
+        "failed": counts.get("failed", 0),
+        "cancelled": counts.get("cancelled", 0),
+        "running": running,
+        "pending": pending,
+        "terminal": terminal,
+        "complete": running == 0 and pending == 0,
+    }
+    result["execution_progress"] = progress
+    return result
+
+
 def get_request(request_id: int) -> dict[str, Any]:
     with connection() as db:
         row = db.execute("SELECT * FROM preflight_requests WHERE id=?", (request_id,)).fetchone()
     if not row:
         raise HTTPException(404, "Preflight request not found")
-    return _row(row)
+    return _attach_execution_progress(_row(row))
 
 
 def _cache_key(operation_type: str, media_path: str, fingerprint: dict[str, Any], payload: dict[str, Any]) -> str:
@@ -342,6 +408,7 @@ def create_preflight(request: PreflightRequest) -> dict[str, Any]:
 
 class PreflightCleanupRequest(BaseModel):
     older_than_days: int = Field(default=30, ge=1, le=3650)
+    all_terminal: bool = False
 
 
 @app.get("/api/v89/preflight/metrics")
@@ -397,11 +464,13 @@ def update_preflight_settings(request: PreflightSettingsUpdate) -> dict[str, Any
 @app.post("/api/v89/preflight/cleanup")
 def cleanup_preflight(request: PreflightCleanupRequest) -> dict[str, Any]:
     cutoff = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - request.older_than_days * 86400))
+    terminal = "status IN ('approved','skipped','failed','cancelled') AND finished_at IS NOT NULL"
+    where = terminal if request.all_terminal else terminal + " AND finished_at < ?"
     with connection() as db:
-        result = db.execute("DELETE FROM preflight_requests WHERE status IN ('approved','skipped','failed','cancelled') AND finished_at IS NOT NULL AND finished_at < ?", (cutoff,))
+        result = db.execute("DELETE FROM preflight_requests WHERE " + where, () if request.all_terminal else (cutoff,))
         deleted = int(result.rowcount or 0)
-    logger.info("preflight event=retention_cleanup deleted=%d older_than_days=%d", deleted, request.older_than_days)
-    return {"deleted": deleted, "older_than_days": request.older_than_days, "cutoff": cutoff}
+    logger.info("preflight event=retention_cleanup deleted=%d all_terminal=%s older_than_days=%d", deleted, request.all_terminal, request.older_than_days)
+    return {"deleted": deleted, "all_terminal": request.all_terminal, "older_than_days": request.older_than_days, "cutoff": None if request.all_terminal else cutoff}
 
 
 @app.get("/api/v89/preflight/{request_id}")
@@ -447,7 +516,16 @@ def preflight_list(status: str | None = None, limit: int = 100) -> dict[str, Any
             rows = db.execute("SELECT * FROM preflight_requests WHERE status=? ORDER BY id DESC LIMIT ?", (status, limit)).fetchall()
         else:
             rows = db.execute("SELECT * FROM preflight_requests ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
-    return {"items": [_row(row) for row in rows]}
+        status_rows = db.execute("SELECT status, COUNT(*) AS count FROM preflight_requests GROUP BY status").fetchall()
+    counts = {str(row["status"] if hasattr(row, "keys") else row[0]): int(row["count"] if hasattr(row, "keys") else row[1]) for row in status_rows}
+    return {
+        "items": [_row(row) for row in rows],
+        "counts": {
+            "running": counts.get("running", 0),
+            "pending": counts.get("pending", 0),
+            "concluded": sum(counts.get(value, 0) for value in ("approved", "skipped", "failed", "cancelled")),
+        },
+    }
 
 
 @app.on_event("startup")

@@ -4,3 +4,13 @@
 #movies .page-title h2{max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 #movies .page-tools{flex:0 0 auto}
 #movie-list .movie-title{display:block;max-width:min(62vw,900px);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#movies .movie-content-header{display:flex;align-items:center;flex-wrap:wrap;gap:.55rem;margin-bottom:.7rem}
+#movies .movie-content-header #movie-search{flex:1 1 18rem;min-width:12rem}
+#movies .movie-content-header .list-filters{display:flex;flex-wrap:wrap;gap:.3rem}
+.movie-list-toolbar-meta{display:flex;align-items:center;gap:.45rem;margin-left:auto;white-space:nowrap;color:var(--muted,#9aa6b2);font-size:.8rem}
+.movie-list-toolbar-meta button{min-height:2rem;padding:.25rem .55rem}
+@media(max-width:760px){.movie-list-toolbar-meta{margin-left:0;width:100%;justify-content:space-between}}
+#movie-list .movie-title{display:flex;align-items:center;gap:.4rem;max-width:100%;min-width:0;overflow:visible}
+#movie-list .movie-primary-title{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#movie-list .movie-title-badges{display:inline-flex;align-items:center;gap:.2rem;flex:0 0 auto}
+#movie-list td:first-child{min-width:0}

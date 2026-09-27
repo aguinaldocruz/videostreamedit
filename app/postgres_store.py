@@ -10,19 +10,20 @@ from __future__ import annotations
 import os
 import logging
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 
 import psycopg
 from psycopg.rows import dict_row
+from app import db_bootstrap
 
-DATABASE_URL = os.environ.get("DATABASE_URL", "")
+DATABASE_URL = db_bootstrap.effective_url()
 
 
 @contextmanager
 def connection() -> Iterator[psycopg.Connection]:
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL is not configured")
-    with psycopg.connect(DATABASE_URL, row_factory=dict_row) as db:
+    with psycopg.connect(DATABASE_URL, row_factory=dict_row, connect_timeout=10) as db:
         yield db
 
 
@@ -114,6 +115,8 @@ def initialize_schema() -> None:
                 ON workflow_luws(status, priority_class, boost_until, created_at);
             CREATE INDEX IF NOT EXISTS workflow_luws_resource
                 ON workflow_luws(resource_key, status);
+            CREATE INDEX IF NOT EXISTS workflow_luws_group
+                ON workflow_luws(group_id);
             CREATE TABLE IF NOT EXISTS workflow_luw_events (
                 event_id BIGSERIAL PRIMARY KEY,
                 luw_id UUID NOT NULL REFERENCES workflow_luws(luw_id) ON DELETE CASCADE,
@@ -189,6 +192,25 @@ def _lock_workflow_mutation(db) -> None:
     producing a deadlock even though media processing itself is independent.
     """
     db.execute("SELECT pg_advisory_xact_lock(hashtext('videostreamedit:workflow-mutation-v2'))")
+
+
+def cancel_pending_task_stage(db, group_id, task_id, task_type):
+    """Cancel the exact stage in the caller's queue transaction; keep artifacts.
+
+    Cancelling execution is not approval to destroy a recoverable original.
+    Caller acquires the workflow mutation lock before locking queue rows.
+    """
+    if not group_id:
+        return
+    db.execute("""UPDATE workflow_stages SET status='cancelled',finished_at=now(),updated_at=now()
+        WHERE group_id=%s::uuid AND payload->>'task_id'=%s AND task_type=%s AND status='pending'""",
+        (str(group_id), str(task_id), task_type))
+    db.execute("""UPDATE workflow_groups g SET status=CASE WHEN EXISTS
+        (SELECT 1 FROM workflow_stages s WHERE s.group_id=g.group_id AND s.status='failed')
+        THEN 'failed' ELSE 'cancelled' END,finished_at=now(),updated_at=now()
+        WHERE g.group_id=%s::uuid AND NOT EXISTS
+        (SELECT 1 FROM workflow_stages s WHERE s.group_id=g.group_id AND s.status IN ('pending','running','blocked'))""",
+        (str(group_id),))
 
 
 def register_task_stage(group_id: str | None, task_type: str, path: str, payload: dict, task_id: int | None = None) -> None:
@@ -305,6 +327,17 @@ def begin_task_stage(group_id: str | None, task_type: str, path: str, task_id: i
         ).fetchone()
         if not stage:
             return False
+        # A worker/process interruption can leave a lease behind even after
+        # its stage reached a terminal state.  Waiting for the 30-minute lease
+        # in that case makes the next queue item spin indefinitely, consuming
+        # attempts without ever doing media work.  Terminal stages no longer
+        # own a media resource, so release those locks before claiming it.
+        db.execute(
+            """DELETE FROM workflow_locks lock
+               USING workflow_stages owner
+               WHERE lock.stage_id=owner.stage_id
+                 AND owner.status IN ('succeeded','failed','cancelled')"""
+        )
         lock = db.execute(
             """INSERT INTO workflow_locks(resource_key, group_id, stage_id, lease_until)
                VALUES (%s, %s, %s, now() + interval '30 minutes')
@@ -354,12 +387,12 @@ def fail_task_stage(group_id: str | None, task_type: str, path: str, error: str,
         db.execute("UPDATE workflow_groups SET status='failed', error=%s, updated_at=now() WHERE group_id=%s", (error[-4000:], workflow_id))
 
 
-def reset_task_stage_for_retry(group_id: str | None, task_id: int | None = None) -> None:
+def reset_task_stage_for_retry(group_id: str | None, task_id: int | None = None, *, db=None) -> None:
     """Reopen the exact failed stage when a queue item is explicitly retried."""
     if not group_id or not DATABASE_URL:
         return
     workflow_id = _workflow_id(group_id)
-    with connection() as db:
+    with (nullcontext(db) if db is not None else connection()) as db:
         _lock_workflow_mutation(db)
         db.execute(
             """UPDATE workflow_stages
@@ -373,6 +406,9 @@ def reset_task_stage_for_retry(group_id: str | None, task_id: int | None = None)
              WHERE group_id=%s AND status IN ('failed','succeeded')""",
             (workflow_id,),
         )
+        db.execute("""UPDATE workflow_luws SET status='planned',error=NULL,finished_at=NULL,updated_at=now()
+            WHERE group_id=%s AND idempotency_key=%s AND status IN ('failed','cancelled','obsolete')""",
+            (workflow_id, f'task:{task_id}'))
 
 
 def task_stage_exists(group_id: str | None, task_type: str, task_id: int | None = None) -> bool:
@@ -448,12 +484,20 @@ def _file_digest(path: Path) -> str:
 
 def prepare_task_artifact(group_id: str | None, task_id: int, task_type: str, path: str, payload: dict) -> None:
     """Snapshot a mutating input before its handler can touch the media file."""
+    if task_type == 'image_subtitle_convert':
+        # OCR already owns a durable original in its user-approval staging
+        # area, created before remux. Do not retain a second full movie here.
+        return
+    if task_type == 'media_edit' and (payload.get('edit') or payload).get('audio_compatibility'):
+        # This path writes a verified sibling container and atomically replaces
+        # the original. Its durable audio-stage commit intent handles recovery;
+        # an extra full-media snapshot would waste an additional movie's space.
+        return
     if not group_id or task_type not in MUTATING_TASK_TYPES or not path or not DATABASE_URL:
         return
     source = Path(path)
     if not source.is_file():
-        return
-    ensure_workflow_storage(source.stat().st_size)
+        raise RuntimeError(f'Media is unavailable before recovery staging: {path}')
     workflow_id = _workflow_id(group_id)
     with connection() as db:
         stage = db.execute(
@@ -465,22 +509,39 @@ def prepare_task_artifact(group_id: str | None, task_id: int, task_type: str, pa
         # One rollback snapshot is sufficient for the entire media-scoped
         # workflow. Bulk requests may create many stages for one episode or
         # movie; never copy the full media once per stream/stage.
-        existing = db.execute("SELECT artifact_id FROM workflow_artifacts WHERE group_id=%s AND original_path=%s LIMIT 1", (workflow_id, str(source))).fetchone()
-        if existing:
+        existing = db.execute("SELECT artifact_id,status,artifact_path,checksum FROM workflow_artifacts WHERE group_id=%s AND original_path=%s LIMIT 1", (workflow_id, str(source))).fetchone()
+        if existing and existing['status'] != 'copying':
+            saved = Path(existing['artifact_path'])
+            if not saved.is_file() or not existing['checksum'] or _file_digest(saved) != existing['checksum']:
+                raise RuntimeError('Existing recovery original is missing or corrupt; edit refused')
             return
     destination_dir = _stage_root() / str(workflow_id)
     destination_dir.mkdir(parents=True, exist_ok=True)
     destination = destination_dir / f"{task_id}-{source.name}"
-    ensure_workflow_storage(source.stat().st_size)
-    shutil.copy2(source, destination)
-    checksum = _file_digest(destination)
     with connection() as db:
-        db.execute(
+        if existing:
+            db.execute('UPDATE workflow_artifacts SET artifact_path=%s WHERE artifact_id=%s', (str(destination), existing['artifact_id']))
+        else:
+            db.execute(
             """INSERT INTO workflow_artifacts(group_id, stage_id, original_path, artifact_path, kind, checksum, status)
-               VALUES (%s,%s,%s,%s,'media-original',%s,'owned')
+               VALUES (%s,%s,%s,%s,'media-original',NULL,'copying')
                ON CONFLICT DO NOTHING""",
-            (workflow_id, stage["stage_id"], str(source), str(destination), checksum),
-        )
+            (workflow_id, stage["stage_id"], str(source), str(destination)))
+    from app.job_safety import output_space, stamp, copy_recovery
+    before = stamp(source)
+    if existing and existing['status'] == 'copying':
+        # This exact owned incomplete copy is not rollback data. Remove it
+        # before admission so retry does not need twice its disk footprint.
+        destination.unlink(missing_ok=True)
+    with output_space(destination_dir, before['size']):
+        copy_recovery(source, destination)
+        with destination.open('rb') as handle:
+            os.fsync(handle.fileno())
+        checksum = _file_digest(destination)
+        if stamp(source) != before:
+            raise RuntimeError('Media changed during recovery copy; edit refused')
+    with connection() as db:
+        db.execute("UPDATE workflow_artifacts SET checksum=%s,status='owned' WHERE group_id=%s AND original_path=%s AND artifact_path=%s", (checksum, workflow_id, str(source), str(destination)))
 
 
 def commit_task_artifacts(group_id: str | None, task_id: int) -> None:
@@ -500,18 +561,29 @@ def cleanup_succeeded_workflow_group_artifacts(group_id: str | None) -> int:
         group = db.execute("SELECT status FROM workflow_groups WHERE group_id=%s", (workflow_id,)).fetchone()
         if not group or group["status"] != "succeeded":
             return 0
+        if db.execute("SELECT 1 FROM task_queue WHERE replace(group_id,'-','')=%s AND status NOT IN ('succeeded','cancelled') LIMIT 1", (workflow_id.hex,)).fetchone():
+            return 0
         artifacts = db.execute("SELECT artifact_id,artifact_path FROM workflow_artifacts WHERE group_id=%s", (workflow_id,)).fetchall()
     removed = 0
+    released = []
     for artifact in artifacts:
         source = Path(str(artifact["artifact_path"]))
         try:
+            if not source.resolve().is_relative_to(_stage_root().resolve()):
+                logger.warning("workflow event=cleanup_path_rejected artifact=%s", artifact['artifact_id'])
+                continue
             if source.is_file():
                 source.unlink()
                 removed += 1
-        except OSError:
+            if source.exists():
+                continue
+            released.append(artifact['artifact_id'])
+        except OSError as exc:
+            logger.warning("workflow event=cleanup_deferred artifact=%s error=%s", artifact['artifact_id'], exc)
             continue
     with connection() as db:
-        db.execute("DELETE FROM workflow_artifacts WHERE group_id=%s", (workflow_id,))
+        for artifact_id in released:
+            db.execute("DELETE FROM workflow_artifacts WHERE group_id=%s AND artifact_id=%s", (workflow_id, artifact_id))
     stage_dir = _stage_root() / str(workflow_id)
     try:
         if stage_dir.is_dir() and not any(stage_dir.iterdir()):
@@ -528,6 +600,84 @@ def cleanup_succeeded_workflow_artifacts() -> int:
     with connection() as db:
         groups = db.execute("SELECT group_id FROM workflow_groups WHERE status='succeeded' AND EXISTS (SELECT 1 FROM workflow_artifacts WHERE workflow_artifacts.group_id=workflow_groups.group_id)").fetchall()
     return sum(cleanup_succeeded_workflow_group_artifacts(str(row["group_id"])) for row in groups)
+
+
+def request_recovery_discard(db, group_id: str | None) -> None:
+    """Durable cleanup intent, committed atomically with deleting job history."""
+    if group_id:
+        db.execute("""UPDATE workflow_groups SET definition=definition ||
+            '{"recovery_discard_requested":true}'::jsonb WHERE group_id=%s""",
+                   (_workflow_id(group_id),))
+
+
+def cleanup_retired_workflow_recovery(group_id: str | None = None) -> int:
+    try:
+        return _cleanup_retired_workflow_recovery(group_id)
+    except Exception:
+        # A cleanup error must not turn a completed edit/deletion into a failed
+        # operation. Ownership and durable intent remain for the next sweep.
+        logger.exception('workflow event=recovery_cleanup_deferred')
+        return 0
+
+
+def _cleanup_retired_workflow_recovery(group_id: str | None = None) -> int:
+    """Release completed or deleted-job recovery, never live/failed-job recovery.
+
+    Deletion failures keep their ownership record so the next sweep can retry.
+    Only transient workflow snapshots are covered, not user approval staging.
+    """
+    if not DATABASE_URL:
+        return 0
+    removed = 0
+    with connection() as db:
+        groups = db.execute("SELECT DISTINCT group_id FROM workflow_artifacts" +
+                            (" WHERE group_id=%s" if group_id else ""),
+                            (_workflow_id(group_id),) if group_id else ()).fetchall()
+    for item in groups:
+        gid = item['group_id']
+        with connection() as db:
+            _lock_workflow_mutation(db)
+            eligible = db.execute("""SELECT g.group_id FROM workflow_groups g
+                WHERE g.group_id=%s
+                AND NOT EXISTS (SELECT 1 FROM task_queue q WHERE replace(q.group_id,'-','')=replace(g.group_id::text,'-','') AND q.status IN ('pending','running','failed'))
+                AND NOT EXISTS (SELECT 1 FROM index_task_queue q WHERE replace(q.group_id,'-','')=replace(g.group_id::text,'-','') AND q.status IN ('pending','running','failed'))
+                AND NOT EXISTS (SELECT 1 FROM workflow_locks l WHERE l.group_id=g.group_id)
+                AND NOT EXISTS (SELECT 1 FROM workflow_luws l WHERE l.group_id=g.group_id AND l.status IN ('locked','applying','verifying'))
+                AND NOT EXISTS (SELECT 1 FROM workflow_stages s WHERE s.group_id=g.group_id AND s.status='running')
+                AND (g.status IN ('succeeded','cancelled') OR
+                    g.definition->>'recovery_discard_requested'='true' OR (
+                    g.status NOT IN ('failed','running')
+                    AND NOT EXISTS (SELECT 1 FROM workflow_stages s WHERE s.group_id=g.group_id AND s.status='failed')
+                    AND
+                    NOT EXISTS (SELECT 1 FROM task_queue q WHERE replace(q.group_id,'-','')=replace(g.group_id::text,'-',''))
+                    AND NOT EXISTS (SELECT 1 FROM index_task_queue q WHERE replace(q.group_id,'-','')=replace(g.group_id::text,'-',''))))
+                FOR UPDATE OF g""", (gid,)).fetchone()
+            if not eligible:
+                continue
+            artifacts = db.execute('SELECT artifact_id,artifact_path FROM workflow_artifacts WHERE group_id=%s FOR UPDATE', (gid,)).fetchall()
+            for artifact in artifacts:
+                path = Path(artifact['artifact_path'])
+                try:
+                    # Never follow a symlink to delete a media/library file.
+                    if path.is_symlink() or not path.resolve().is_relative_to(_stage_root().resolve()):
+                        continue
+                    existed = path.is_file()
+                    if existed:
+                        path.unlink()
+                    if path.exists():
+                        continue
+                    db.execute('DELETE FROM workflow_artifacts WHERE artifact_id=%s', (artifact['artifact_id'],))
+                    removed += int(existed)
+                except OSError as exc:
+                    logger.warning('workflow event=recovery_cleanup_deferred artifact=%s error=%s', artifact['artifact_id'], exc)
+            # Deleted jobs must not leave an executable phantom workflow.
+            db.execute("UPDATE workflow_stages SET status='cancelled',finished_at=now(),updated_at=now() WHERE group_id=%s AND status IN ('pending','blocked','failed')", (gid,))
+            db.execute("UPDATE workflow_groups SET status='cancelled',finished_at=now(),updated_at=now() WHERE group_id=%s AND status NOT IN ('succeeded','cancelled')", (gid,))
+        try:
+            (_stage_root() / str(gid)).rmdir()
+        except OSError:
+            pass
+    return removed
 
 
 def cleanup_orphaned_workflow_artifacts() -> int:
@@ -563,23 +713,54 @@ def cleanup_orphaned_workflow_artifacts() -> int:
 
 
 def rollback_workflow(group_id: str) -> dict:
-    """Restore every preserved artifact for a workflow and mark it cancelled."""
+    """Restore a verified media LUW, never overwrite unrelated newer changes."""
     workflow_id = _workflow_id(group_id)
     restored = 0
     with connection() as db:
-        artifacts = db.execute("SELECT artifact_id,original_path,artifact_path,status FROM workflow_artifacts WHERE group_id=%s ORDER BY artifact_id", (workflow_id,)).fetchall()
+        artifacts = db.execute("SELECT artifact_id,original_path,artifact_path,status,checksum FROM workflow_artifacts WHERE group_id=%s ORDER BY artifact_id", (workflow_id,)).fetchall()
+        receipts = db.execute("""SELECT r.data FROM task_execution_receipts r JOIN task_queue q ON q.id=r.task_id
+            WHERE replace(q.group_id,'-','')=%s AND (r.step LIKE 'file:%%' OR r.step LIKE 'inplace:%%') ORDER BY r.updated_at DESC""", (workflow_id.hex,)).fetchall()
+    if len({a['original_path'] for a in artifacts}) != 1:
+        raise RuntimeError('Rollback must target one media LUW, not an entire multi-media batch')
+    from app.job_safety import stamp, output_space, replace_prepared, copy_recovery
     for artifact in artifacts:
         source = Path(str(artifact["artifact_path"]))
         target = Path(str(artifact["original_path"]))
-        if not source.is_file():
+        if artifact['status'] == 'rolled-back':
             continue
-        target.parent.mkdir(parents=True, exist_ok=True)
+        if artifact['status'] == 'copying' or not source.is_file() or not artifact['checksum']:
+            raise RuntimeError('Recovery original is missing or incomplete; rollback refused')
+        if _file_digest(source) != artifact['checksum']:
+            raise RuntimeError('Recovery original checksum mismatch; rollback refused')
+        expected = next((r['data']['after'] for r in receipts if (r['data'].get('after') or {}).get('path') == str(target.resolve())), None)
+        if not expected or 'ctime_ns' not in expected:
+            raise RuntimeError('No verified failed-output signature; manual recovery review is required')
+        uid = create_luw(str(target), 'workflow_rollback', 'maintenance', {}, group_id=group_id,
+                         idempotency_key=f'rollback:{workflow_id}:{uuid.uuid4()}')
+        if not acquire_luw_lock(uid, str(target)):
+            transition_luw(uid, 'cancelled', 'lock', 'Rollback deferred: media is in use')
+            raise RuntimeError('Media is in use; rollback refused')
         temporary = target.with_name(f".{target.name}.rollback-{workflow_id.hex[:8]}")
-        shutil.copy2(source, temporary)
-        temporary.replace(target)
-        restored += 1
-        with connection() as db:
-            db.execute("UPDATE workflow_artifacts SET status='rolled-back' WHERE artifact_id=%s", (artifact["artifact_id"],))
+        try:
+            transition_luw(uid, 'applying', 'rollback', 'Restoring verified original')
+            if stamp(target) != expected:
+                raise RuntimeError('Media changed after the failed operation; rollback refused')
+            with output_space(target.parent, source.stat().st_size):
+                copy_recovery(source, temporary)
+                if _file_digest(temporary) != artifact['checksum']:
+                    raise RuntimeError('Rollback copy verification failed')
+                replace_prepared(temporary, target, expected)
+            restored += 1
+            with connection() as db:
+                db.execute("UPDATE workflow_artifacts SET status='rolled-back' WHERE artifact_id=%s", (artifact["artifact_id"],))
+            transition_luw(uid, 'verifying', 'verify', 'Original restored')
+            commit_luw(uid, stamp(target))
+        except Exception as exc:
+            transition_luw(uid, 'failed', 'rollback', str(exc), error=str(exc))
+            raise
+        finally:
+            temporary.unlink(missing_ok=True)
+            release_luw_lock(uid, str(target))
     with connection() as db:
         db.execute("UPDATE workflow_stages SET status='cancelled', finished_at=now(), updated_at=now() WHERE group_id=%s AND status IN ('pending','running','failed')", (workflow_id,))
         db.execute("UPDATE workflow_groups SET status='cancelled', finished_at=now(), updated_at=now(), error=NULL WHERE group_id=%s", (workflow_id,))
@@ -737,7 +918,9 @@ def acquire_luw_lock(luw_id: str, resource_key: str, lease_seconds: int = 1800) 
                ON CONFLICT(resource_key) DO UPDATE
                SET luw_id=EXCLUDED.luw_id, lease_until=EXCLUDED.lease_until,
                    heartbeat_at=now()
-               WHERE workflow_luw_locks.lease_until < now()
+               WHERE (workflow_luw_locks.lease_until < now() AND NOT EXISTS
+                   (SELECT 1 FROM workflow_luws owner WHERE owner.luw_id=workflow_luw_locks.luw_id
+                    AND owner.status IN ('locked','applying','verifying')))
                   OR workflow_luw_locks.luw_id=EXCLUDED.luw_id
                RETURNING resource_key""",
             (resource_key, uid, max(30, lease_seconds)),

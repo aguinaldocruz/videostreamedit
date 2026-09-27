@@ -3,19 +3,51 @@ function alternativeTitleHint(item) {
   return values.length ? `Alternative titles:\n${values.join('\n')}` : '';
 }
 
-async function loadSelectedTvShow(show){if(!show)return;try{const details=await api("/api/v19/tv?show_id="+encodeURIComponent(show.id));const fresh=details.find(item=>String(item.id)===String(show.id))||details[0];if(fresh){Object.assign(show,fresh);state.currentShow=show;window._preserveShowSelection=true;renderShows();renderEpisodes()}}catch(error){toast(error.message,true)}}
+let selectedTvShowRequest=0;
+let selectedTvShowAbort=null;
+async function loadSelectedTvShow(show){
+  if(!show)return;
+  const request=++selectedTvShowRequest;
+  selectedTvShowAbort?.abort();
+  const controller=new AbortController();
+  selectedTvShowAbort=controller;
+  const selectedId=String(show.id);
+  try{
+    const details=await api("/api/v19/tv?show_id="+encodeURIComponent(selectedId),{signal:controller.signal});
+    // A slower response for a previously clicked show must never overwrite the
+    // show the user selected most recently.
+    if(request!==selectedTvShowRequest||String(state.currentShow?.id)!==selectedId)return;
+    const fresh=details.find(item=>String(item.id)===selectedId)||details[0];
+    if(fresh){Object.assign(show,fresh);window._preserveShowSelection=true;renderShows();renderEpisodes()}
+  }catch(error){
+    if(error?.name!=='AbortError'&&request===selectedTvShowRequest)toast(error.message,true);
+  }finally{
+    if(request===selectedTvShowRequest)selectedTvShowAbort=null;
+  }
+}
 
-renderMovies = function () {
+window.movieMatchesStatusFilters = function (file) {
   const reviewState = $('#movie-reviewed-filter')?.dataset.reviewState || 'all';
   const notesState = $('#movie-notes-filter')?.dataset.notesState || 'all';
   const plexState = $('#movie-plex-filter')?.dataset.plexState || 'all';
-  const files = state.movies.filter(file => matches([movieTitle(file), ...(file.alternative_titles || [])].join(' '), $('#movie-search').value)
-    && (reviewState === 'all' || (reviewState === 'reviewed' && file.reviewed) || (reviewState === 'not_reviewed' && !file.reviewed))
+  const detectionState = $('#movie-detection-filter')?.dataset.detectionState || 'all';
+  const finalState = $('#movie-final-filter')?.dataset.finalState || 'all';
+  return (reviewState === 'all' || (reviewState === 'reviewed' && file.reviewed) || (reviewState === 'not_reviewed' && !file.reviewed))
     && (notesState === 'all' || (notesState === 'has_notes' && Boolean(file.note)) || (notesState === 'no_notes' && !file.note))
-    && (plexState === 'all' || (plexState === 'changed' && file.plex_sync_change) || (plexState === 'not_changed' && !file.plex_sync_change)));
+    && (plexState === 'all' || (plexState === 'changed' && file.plex_sync_change) || (plexState === 'not_changed' && !file.plex_sync_change))
+    && (detectionState === 'all' || (detectionState === 'has_detection' && hasDetectionDiscrepancy(file)) || (detectionState === 'no_detection' && !hasDetectionDiscrepancy(file)))
+    && (finalState === 'all' || (finalState === 'final' && file.final_version) || (finalState === 'not_final' && !file.final_version));
+};
+window.movieRowHTML = function (file) {
+  const badges = `${file.note ? `<span class="note-tag" title="${attr(file.note)}">i</span>` : ''}${file.reviewed ? `<span class="reviewed-tag" title="Reviewed">✓</span>` : ''}${file.plex_sync_change ? `<span class="plex-sync-tag" title="Plex Sync Change">P</span>` : ''}${file.final_version ? `<button type="button" class="final-version-tag" data-final-toggle="movie" data-final-path="${attr(file.path)}" title="Final version · click to unfreeze">F</button>` : ''}${typeof reportConfidenceDot === 'function' ? reportConfidenceDot(file.portuguese_detection_confidence,file.portuguese_detection_metadata,file.portuguese_detection_language,'subtitle',file.portuguese_detection_no_confidence,file.portuguese_detection_region) : ''}${file.audio_detection_confidence >= 0.6 && typeof reportConfidenceDot === 'function' ? reportConfidenceDot(file.audio_detection_confidence,file.audio_detection_metadata,file.audio_detection_language,'audio') : ''}`;
+  return `<tr><td><strong class="movie-title title-with-alternatives" title="${attr(alternativeTitleHint(file))}"><span class="movie-primary-title">${esc(movieTitle(file))}</span><span class="movie-title-badges">${badges}</span></strong></td><td>${esc(file.root_name)}</td><td>${bytes(file.size)}</td><td><button class="edit-file" ${file.final_version ? 'disabled title="Final version · click F to unfreeze"' : ''} data-path="${attr(file.path)}" data-label="${attr(movieTitle(file))}">Stream properties</button></td></tr>`;
+};
+
+renderMovies = function () {
+  const files = state.movies.filter(file => matches([movieTitle(file), ...(file.alternative_titles || [])].join(' '), $('#movie-search').value) && movieMatchesStatusFilters(file));
   $('#movies-empty').style.display = files.length ? 'none' : 'block';
   $('#movies-empty').textContent = state.movies.length ? 'No matching movies.' : 'No movies found.';
-  $('#movie-list').innerHTML = files.map(file => `<tr><td><strong class="movie-title title-with-alternatives" title="${attr(alternativeTitleHint(file))}">${esc(movieTitle(file))}${file.note ? ` <span class="note-tag" title="${attr(file.note)}">i</span>` : ''}${file.reviewed ? ` <span class="reviewed-tag" title="Reviewed">✓</span>` : ''}${file.plex_sync_change ? ` <span class="plex-sync-tag" title="Plex Sync Change">P</span>` : ''}${file.final_version ? ` <span class="final-version-tag" title="Final version · view-only">F</span>` : ''}${typeof reportConfidenceDot === 'function' ? reportConfidenceDot(file.portuguese_detection_confidence,file.portuguese_detection_metadata,file.portuguese_detection_language,'subtitle',file.portuguese_detection_no_confidence) : ''}</strong></td><td>${esc(file.root_name)}</td><td>${bytes(file.size)}</td><td><button class="edit-file" ${file.final_version ? 'disabled title="Final version · open notes to unfreeze"' : ''} data-path="${attr(file.path)}" data-label="${attr(movieTitle(file))}">Stream properties</button></td></tr>`).join('');
+  $('#movie-list').innerHTML = files.map(movieRowHTML).join('');
   wireEditors();
 };
 
@@ -24,13 +56,17 @@ renderShows = function () {
   const notesState = $('#tv-notes-filter')?.dataset.notesState || 'all';
   const plexState = $('#tv-plex-filter')?.dataset.plexState || 'all';
   const indexState = $('#tv-index-filter')?.dataset.indexState || 'all';
+  const detectionState = $('#tv-detection-filter')?.dataset.detectionState || 'all';
+  const finalState = $('#tv-final-filter')?.dataset.finalState || 'all';
   const shows = state.shows.filter(show => matches([show.name, ...(show.alternative_titles || [])].join(' '), $('#show-search').value)
     && (reviewState === 'all' || (reviewState === 'reviewed' && show.reviewed) || (reviewState === 'not_reviewed' && !show.reviewed))
     && (notesState === 'all' || (notesState === 'has_notes' && Boolean(show.note)) || (notesState === 'no_notes' && !show.note))
     && (plexState === 'all' || (plexState === 'changed' && show.plex_sync_change) || (plexState === 'not_changed' && !show.plex_sync_change))
-    && (indexState === 'all' || (indexState === 'busy' && show.index_busy) || (indexState === 'not_busy' && !show.index_busy)));
+    && (indexState === 'all' || (indexState === 'busy' && show.index_busy) || (indexState === 'not_busy' && !show.index_busy))
+    && (detectionState === 'all' || (detectionState === 'has_detection' && hasDetectionDiscrepancy(show)) || (detectionState === 'no_detection' && !hasDetectionDiscrepancy(show)))
+    && (finalState === 'all' || (finalState === 'final' && show.final_version) || (finalState === 'not_final' && !show.final_version)));
   $('#tv-empty').style.display = shows.length ? 'none' : 'block';
-  $('#show-list').innerHTML = shows.map(show => `<button class="show-card ${state.currentShow?.id === show.id ? 'active' : ''}" data-id="${attr(show.id)}"><strong class="title-with-alternatives" title="${attr(alternativeTitleHint(show))}">${esc(clean(show.name))}${show.note ? ` <span class="note-tag" title="${attr(show.note)}">i</span>` : ''}${show.reviewed ? ` <span class="reviewed-tag" title="Reviewed">✓</span>` : ''}${show.plex_sync_change ? ` <span class="plex-sync-tag" title="Plex Sync Change">P</span>` : ''}${show.final_version ? ` <span class="final-version-tag" title="Final version · episodes are view-only">F</span>` : ''}${typeof reportConfidenceDot === 'function' ? reportConfidenceDot(show.portuguese_detection_confidence,show.portuguese_detection_metadata,show.portuguese_detection_language,'subtitle',show.portuguese_detection_no_confidence) : ''}</strong><small>${show.episode_count} episodes · ${esc(show.root_name)}</small></button>`).join('');
+  $('#show-list').innerHTML = shows.map(show => `<button class="show-card ${state.currentShow?.id === show.id ? 'active' : ''}" data-id="${attr(show.id)}"><strong class="title-with-alternatives" title="${attr(alternativeTitleHint(show))}">${esc(clean(show.name))}${show.note ? ` <span class="note-tag" title="${attr(show.note)}">i</span>` : ''}${show.reviewed ? ` <span class="reviewed-tag" title="Reviewed">✓</span>` : ''}${show.plex_sync_change ? ` <span class="plex-sync-tag" title="Plex Sync Change">P</span>` : ''}${show.final_version ? ` <span class="final-version-tag" role="button" tabindex="0" data-final-toggle="show" data-final-key="${attr(show.id)}" title="Final version · click to unfreeze all episodes">F</span>` : ''}${typeof reportConfidenceDot === 'function' ? reportConfidenceDot(show.portuguese_detection_confidence,show.portuguese_detection_metadata,show.portuguese_detection_language,'subtitle',show.portuguese_detection_no_confidence,show.portuguese_detection_region) : ''}</strong><small>${show.episode_count} episodes · ${esc(show.root_name)}</small></button>`).join('');
   document.querySelectorAll('.show-card').forEach(button => button.onclick = () => {state.currentShow = state.shows.find(show => show.id === button.dataset.id);state.currentSeason = '*';$('#episode-search').value = '';window._preserveShowSelection = true;renderShows();loadSelectedTvShow(state.currentShow)});
 };
 
@@ -41,6 +77,43 @@ renderEpisodes = function () {
   heading.title = state.currentShow ? alternativeTitleHint(state.currentShow) : '';
   heading.classList.toggle('title-with-alternatives', Boolean(heading.title));
 };
+
+/* Final-version badges are deliberate controls, not passive status labels. */
+document.addEventListener('click', async event => {
+  const button = event.target.closest('[data-final-toggle]');
+  if (!button) return;
+  event.preventDefault();
+  event.stopPropagation();
+  if (button.disabled || button.dataset.busy === 'true') return;
+  const kind = button.dataset.finalToggle;
+  const next = false; // the badge is rendered only while the target is final
+  button.dataset.busy = 'true';
+  try {
+    if (window.tvShowEditSession && (kind === 'show' || kind === 'episode')) {
+      await window.stageTvDraftFinal(kind, kind === 'show' ? button.dataset.finalKey : button.dataset.finalPath, next);
+      toast('Final-version change staged in the TV-show draft');
+      return;
+    }
+    let result;
+    if (kind === 'show') {
+      result = await api('/api/v86/final-version/show', {method:'PUT', body:JSON.stringify({entity_key:button.dataset.finalKey, final_version:next})});
+      await loadTv();
+      toast(`Final version removed from ${result.episodes} episode${result.episodes === 1 ? '' : 's'}`);
+    } else if (kind === 'episode') {
+      result = await api('/api/v86/final-version', {method:'PUT', body:JSON.stringify({path:button.dataset.finalPath, final_version:next})});
+      await loadTv();
+      toast('Episode Final version removed');
+    } else {
+      result = await api('/api/v86/final-version', {method:'PUT', body:JSON.stringify({path:button.dataset.finalPath, final_version:next})});
+      await loadMovies();
+      toast('Movie Final version removed');
+    }
+  } catch (error) {
+    toast(error.message, true);
+  } finally {
+    delete button.dataset.busy;
+  }
+}, true);
 
 /* Video-stream title metadata shown beside movie and episode titles. */
 (function () {

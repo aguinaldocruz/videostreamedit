@@ -6,9 +6,9 @@ VideoStreamEdit is a FastAPI application served by Uvicorn. The container includ
 
 ## Persistent state
 
-SQLite stores Plex configuration, selected libraries, the synchronized media catalog, reusable stream values, import roots, and navigation state at `/config/videostreamedit.db`. The Plex token is encrypted with the Fernet key at `/config/plex-token.key`.
+PostgreSQL stores the synchronized media catalog, indexes, queue state, reusable values, reports, and application settings. Protected connection credentials and encryption material live under `/config`; temporary workflow data lives under `/data`. The first-run wizard provisions a PostgreSQL database and application role, and Setup can back up or migrate the installation.
 
-The supplied Compose file maps repository-local `./config` to `/config`. Runtime contents are intentionally ignored by Git and Docker build context.
+The supplied Compose file maps `/home/docker/videostreamedit`, its `data` subdirectory, and its `backup` subdirectory to `/config`, `/data`, and `/backup`. Adjust the host paths for another installation. These runtime paths are outside the repository. Backups contain database and protected configuration, not media files.
 
 ## Media discovery
 
@@ -16,7 +16,7 @@ Plex supplies library metadata and the physical file paths. A synchronization st
 
 ## Media editing
 
-The editor probes streams and matching external subtitles, builds an FFmpeg stream-copy command, writes a uniquely named temporary file beside the source, preserves mode and timestamps, and atomically replaces the source after success. Failed edits remove the temporary output and retain the source.
+The editor probes streams and matching external subtitles. Metadata-only Matroska edits use a guarded MKVToolNix path; structural edits use FFmpeg stream copying into temporary output, validate it, preserve mode and timestamps, and replace the source only after success. Failed edits retain or restore the source at the per-media logical-unit-of-work boundary.
 
 Movie Import first copies the selected source and matching subtitles into the configured destination, applies the stream edit to the copy, and rolls back copied outputs if editing fails. Source cleanup is a separate, explicit user decision.
 

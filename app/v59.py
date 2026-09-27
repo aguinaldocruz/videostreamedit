@@ -41,26 +41,6 @@ class SuggestionDelete(BaseModel):
     new_value: str
 
 
-@app.on_event("startup")
-def migrate_language_aware_suggestions() -> None:
-    with connection() as db:
-        columns = {row["name"] for row in db.execute("PRAGMA table_info(track_name_correction_history)")}
-        if "track_language" not in columns:
-            db.execute("DROP TABLE IF EXISTS track_name_correction_history")
-            db.execute("DROP INDEX IF EXISTS track_name_correction_lookup")
-        db.executescript("""
-            CREATE TABLE IF NOT EXISTS track_name_correction_history (
-                stream_type TEXT NOT NULL CHECK(stream_type IN ('audio','subtitle')),
-                track_language TEXT NOT NULL DEFAULT '', old_value TEXT NOT NULL, new_value TEXT NOT NULL,
-                use_count INTEGER NOT NULL DEFAULT 1, last_used TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                enabled INTEGER NOT NULL DEFAULT 1,
-                PRIMARY KEY(stream_type,track_language,old_value,new_value)
-            );
-            CREATE INDEX IF NOT EXISTS track_name_correction_lookup
-                ON track_name_correction_history(stream_type,track_language,old_value,use_count DESC);
-        """)
-    if "track_language" not in columns:
-        logger.info("change=track_name_suggestions_migrated scope=language_aware previous_history=cleared")
 
 
 def normalized(value: str) -> str:
@@ -192,7 +172,11 @@ def applicable_suggestions(request: SuggestionRequest) -> dict:
                 continue
             total = sum(row["use_count"] for row in rows); best = rows[0]
             allowed, _ = mapping_allowed(db, stream_type, language, old_value, best["new_value"], (old_value, best["new_value"]))
-            if allowed and best["use_count"] >= 2 and best["use_count"] / total >= .60:
+            # A single enabled mapping is explicit user-maintained knowledge.
+            # It must remain offerable even after usage counters are reset to
+            # zero; counters rank alternatives but do not disable a mapping.
+            confident = len(rows) == 1 or (best["use_count"] >= 2 and best["use_count"] / total >= .60)
+            if allowed and confident:
                 found.append({"stream_type": stream_type, "track_language": language, "old_value": old_value, "new_value": best["new_value"], "use_count": best["use_count"]})
     return {"suggestions": found}
 

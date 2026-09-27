@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Find static assets with no repository-wide filename reference."""
+"""Find static assets without runtime source references (candidates, not proof)."""
 from __future__ import annotations
 
 import argparse
@@ -11,11 +11,13 @@ def main() -> int:
     parser.add_argument("--root", default=".")
     args = parser.parse_args()
     root = Path(args.root).resolve()
-    skip_dirs = {".git", ".venv", "models", ".pytest_cache", ".ruff_cache"}
-    source_ext = {".py", ".js", ".css", ".html", ".yml", ".yaml", ".md", ".sh", ".json"}
-    files = [p for p in root.rglob("*") if p.is_file() and not any(part in skip_dirs for part in p.parts) and p.suffix in source_ext]
-    corpus = "\n".join(p.read_text(errors="ignore") for p in files)
-    orphaned = [asset.name for asset in sorted(list((root / "app/static").glob("v*.css")) + list((root / "app/static").glob("v*.js"))) if corpus.count(asset.name) <= 1]
+    source_ext = {".py", ".js", ".css", ".html", ".json"}
+    # Documentation/test inventories and self-references cannot establish
+    # runtime reachability. Dynamic construction still needs manual review.
+    files = [p for p in (root / 'app').rglob('*') if p.is_file() and p.suffix in source_ext and 'vendor' not in p.parts]
+    sources = {p: p.read_text(errors='ignore') for p in files}
+    assets = sorted(p for p in (root / 'app/static').iterdir() if p.suffix in {'.css', '.js'})
+    orphaned = [asset.name for asset in assets if not any(asset.name in text for path, text in sources.items() if path != asset)]
     if orphaned:
         print("Potentially orphaned assets:")
         print("\n".join(orphaned))

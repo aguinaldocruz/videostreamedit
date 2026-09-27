@@ -29,6 +29,7 @@
   }
 
   function guardNavigation(action, mode = 'navigate') {
+    if(window.isStreamEditorBusy?.())return;
     if (typeof queuedChangeCount !== 'function' || queuedChangeCount() === 0) {
       action();
       return;
@@ -37,7 +38,7 @@
     const closing = mode === "close";
     document.querySelector("#pending-navigation-dialog > p").textContent = closing ? "Apply them before closing, or close without applying them?" : "Apply them before leaving, or move without applying them?";
     document.querySelector("#move-without-applying").textContent = closing ? "Close without applying" : "Move without applying";
-    const queueButton = document.querySelector("#pending-navigation-dialog [data-queue-pending]"); if (queueButton) queueButton.textContent = closing ? "Queue changes and close" : "Queue changes and move";
+    const queueButton = document.querySelector("#pending-navigation-dialog [data-queue-pending]"); if (queueButton) {queueButton.hidden=Boolean(window.activeTvDraftForPath?.(state.selectedPath));queueButton.textContent = closing ? "Queue changes and close" : "Queue changes and move";}
     pendingNavigation = action;
     $('#pending-navigation-dialog').showModal();
     $('#apply-before-navigation').focus({preventScroll: true});

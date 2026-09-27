@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import os
 import re
-import sqlite3
 from collections.abc import Iterable
 from contextlib import AbstractContextManager
 from typing import Any
@@ -84,48 +83,10 @@ class Connection(AbstractContextManager):
     def __init__(self, url: str | None = None):
         if not url:
             raise RuntimeError("DATABASE_URL is required for PostgreSQL mode")
-        self.raw = psycopg.connect(url, row_factory=dict_row)
+        self.raw = psycopg.connect(url, row_factory=dict_row, connect_timeout=10)
         self.total_changes = 0
 
-    def _special(self, sql: str) -> Cursor | None:
-        match = re.fullmatch(r"PRAGMA\s+table_info\(([^)]+)\)", sql.strip(), re.IGNORECASE)
-        if match:
-            table = match.group(1).strip(" `\"")
-            cur = self.raw.execute("""
-                SELECT ordinal_position AS cid, column_name AS name,
-                       data_type AS type, (is_nullable='NO') AS notnull,
-                       column_default AS dflt_value,
-                       0 AS pk
-                  FROM information_schema.columns
-                 WHERE table_schema='public' AND table_name=%s
-                 ORDER BY ordinal_position
-            """, (table,))
-            return Cursor(self, cur, sql)
-        if re.fullmatch(r"PRAGMA\s+(?:synchronous|busy_timeout)(?:\s*=\s*[^ ]+)?", sql.strip(), re.IGNORECASE):
-            return Cursor(self, self.raw.execute("SELECT 1 AS ok"), sql)
-        if re.fullmatch(r"PRAGMA\s+journal_mode(?:\s*=\s*\w+)?", sql.strip(), re.IGNORECASE):
-            cur = self.raw.execute("SELECT 'wal' AS journal_mode")
-            return Cursor(self, cur, sql)
-        if re.search(r"SELECT\s+sql\s+FROM\s+sqlite_master", sql, re.IGNORECASE):
-            match = re.search(r"name\s*=\s*'([^']+)'", sql, re.IGNORECASE)
-            table = match.group(1) if match else ""
-            rows = self.raw.execute("SELECT column_name FROM information_schema.columns WHERE table_schema='public' AND table_name=%s", (table,)).fetchall()
-            columns = {row["column_name"] for row in rows}
-            schema = f"CREATE TABLE {table} ({", ".join(sorted(columns))})" if columns else ""
-            cur = self.raw.execute("SELECT %s AS sql", (schema,))
-            return Cursor(self, cur, sql)
-        if re.search(r"sqlite_master", sql, re.IGNORECASE):
-            text = re.sub(r"sqlite_master", "information_schema.tables", sql, flags=re.IGNORECASE)
-            text = re.sub(r"type\s*=\s*'table'", "table_type='BASE TABLE'", text, flags=re.IGNORECASE)
-            text = text.replace("name", "table_name")
-            cur = self.raw.execute(_replace_qmarks(text), ())
-            return Cursor(self, cur, sql)
-        return None
-
     def execute(self, sql: str, params: tuple | list = ()) -> Cursor:
-        special = self._special(sql)
-        if special:
-            return special
         translated = _translate_sql(sql)
         if "ON CONFLICT DO UPDATE SET" in translated:
             table_match = re.search(r"INSERT\s+INTO\s+([\w\"]+)", translated, re.IGNORECASE)
@@ -143,27 +104,38 @@ class Connection(AbstractContextManager):
             else:
                 translated = translated.replace("ON CONFLICT DO UPDATE SET", "ON CONFLICT DO NOTHING", 1)
         savepoint = "vse_stmt_guard"
-        self.raw.execute(f"SAVEPOINT {savepoint}")
+        # Only schema alterations need statement-level recovery for a caught
+        # DuplicateColumn. Normal statements already belong to the connection
+        # transaction; wrapping each read/write adds two network round trips
+        # without recovering any of their errors.
+        guard_schema = bool(re.match(r"\s*ALTER\s+TABLE\b", translated, re.IGNORECASE))
+        generated_id = False
+        if re.match(r"\s*INSERT\s+INTO\b", translated, re.IGNORECASE) and not re.search(r"\bRETURNING\b", translated, re.IGNORECASE):
+            table = re.search(r"INSERT\s+INTO\s+([\w\"]+)", translated, re.IGNORECASE)
+            table_name = table.group(1).strip('"') if table else ""
+            # RETURNING binds the ID to this statement, unlike a sequence's
+            # global last_value, which another worker can advance concurrently.
+            has_id = self.raw.execute("SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name=%s AND column_name='id'", (table_name,)).fetchone()
+            if has_id:
+                translated = translated.rstrip(';') + ' RETURNING id'
+                generated_id = True
+        if guard_schema:
+            self.raw.execute(f"SAVEPOINT {savepoint}")
         try:
             cur = self.raw.execute(translated, params or ())
-            self.raw.execute(f"RELEASE SAVEPOINT {savepoint}")
+            if guard_schema:
+                self.raw.execute(f"RELEASE SAVEPOINT {savepoint}")
         except psycopg.errors.DuplicateColumn as exc:
+            if not guard_schema:
+                raise
             self.raw.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
             self.raw.execute(f"RELEASE SAVEPOINT {savepoint}")
-            raise sqlite3.OperationalError('duplicate column: ' + str(exc)) from exc
+            raise
         self.total_changes += max(cur.rowcount, 0)
         wrapper = Cursor(self, cur, translated)
-        if re.match(r"\s*INSERT\s+INTO\b", translated, re.IGNORECASE):
-            table = re.search(r"INSERT\s+INTO\s+([\w\"]+)", translated, re.IGNORECASE)
-            if table:
-                table_name = table.group(1).strip('"')
-                has_id = self.raw.execute("SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name=%s AND column_name='id'", (table_name,)).fetchone()
-                sequence = self.raw.execute("SELECT pg_get_serial_sequence(%s, 'id') AS sequence", (table_name,)).fetchone() if has_id else None
-                sequence_name = sequence["sequence"] if sequence else None
-                if sequence_name:
-                    sequence_name = sequence_name.replace('"', '""')
-                    value = self.raw.execute(f'SELECT last_value AS id FROM {sequence_name}').fetchone()
-                    wrapper.lastrowid = value["id"] if value else None
+        if generated_id:
+            values = cur.fetchall()
+            wrapper.lastrowid = values[-1]['id'] if values else None
         return wrapper
 
     def executemany(self, sql: str, seq: Iterable[tuple]) -> Cursor:
@@ -218,4 +190,3 @@ class Connection(AbstractContextManager):
 
 def connect() -> Connection:
     return Connection(DATABASE_URL)
-

@@ -11,6 +11,7 @@ from fastapi import HTTPException
 import app.v7 as media_editor
 import app.v28 as movie_import
 from app.v2 import make_language
+from app.v5 import plex_language_pair, split_tag
 from app.v40 import app, record_track_name_corrections
 
 logger = logging.getLogger("videostreamedit")
@@ -58,6 +59,8 @@ def requires_container_rewrite(request: media_editor.ReorderEditRequest, typed: 
         return True, external_removed
     if any(item.embed and f"external:{item.path}" not in removed for item in request.external_subtitles):
         return True, external_removed
+    if request.audio_compatibility:
+        return True, external_removed
     for stream_type, streams in typed.items():
         remaining = [index for index in range(len(streams)) if f"embedded:{stream_type}:{index}" not in removed]
         requested: list[int] = []
@@ -78,6 +81,11 @@ def desired_tag(request: media_editor.ReorderEditRequest, stream_type: str, tag:
 def matroska_metadata_command(source: Path, request: media_editor.ReorderEditRequest, typed: dict[str, list[dict]]) -> list[str]:
     command = ["mkvpropedit", str(source)]
     edits = 0
+    if request.clear_video_titles:
+        for index, stream in enumerate(s for s in media_editor.probe(source).get("streams", []) if s.get("codec_type") == "video"):
+            if str((stream.get("tags") or {}).get("title") or "").strip():
+                command += ["--edit", f"track:v{index + 1}", "--delete", "name"]
+                edits += 1
     for update in request.tracks:
         streams = typed[update.codec_type]
         if update.type_index >= len(streams):
@@ -104,12 +112,15 @@ def matroska_metadata_command(source: Path, request: media_editor.ReorderEditReq
             # unrelated flag independently; otherwise a subtitle operation
             # would clear the existing audio default (or vice versa).
             properties = []
-            if desired_default != "__preserve__":
-                wanted_default = identifier == desired_default
+            update = next((item for item in request.tracks if item.codec_type == stream_type and item.type_index == index), None)
+            default_override = getattr(update, 'default', None)
+            forced_override = getattr(update, 'forced', None)
+            if desired_default != "__preserve__" or default_override is not None:
+                wanted_default = default_override if default_override is not None else identifier == desired_default
                 if bool(current.get("default")) != wanted_default:
                     properties += ["--set", f"flag-default={int(wanted_default)}"]
-            if desired_forced != "__preserve__":
-                wanted_forced = identifier == desired_forced
+            if desired_forced != "__preserve__" or forced_override is not None:
+                wanted_forced = forced_override if forced_override is not None else identifier == desired_forced
                 if bool(current.get("forced")) != wanted_forced:
                     properties += ["--set", f"flag-forced={int(wanted_forced)}"]
             if properties:
@@ -140,16 +151,25 @@ def _verify_language_updates(source: Path, request: media_editor.ReorderEditRequ
         props = tracks[kind][index]
         actual = str(props.get("language_ietf") or props.get("language") or "").strip()
         expected = make_language(update.language, update.region)
-        # MKVToolNix may expose a three-letter legacy code when no IETF tag was requested.
-        if expected and actual.casefold() != expected.casefold():
-            mismatches.append(f"{kind} {index + 1}: expected {expected}, found {actual or "<empty>"}")
+        # Compare Plex language/region pairs, not the spelling of the legacy
+        # ISO-639 code. A regionless ``pt`` is written as legacy ``por`` with
+        # no IETF tag, and must verify as the same plain Portuguese value.
+        actual_language, actual_region = split_tag(actual)
+        expected_language, expected_region = split_tag(expected)
+        actual_language, actual_region = plex_language_pair(actual_language, actual_region)
+        expected_language, expected_region = plex_language_pair(expected_language, expected_region)
+        if expected and (actual_language != expected_language or actual_region != expected_region):
+            mismatches.append(f"{kind} {index + 1}: expected {expected}, found {actual or '<empty>'}")
     return mismatches
 
 def apply_in_place(source: Path, request: media_editor.ReorderEditRequest, typed: dict[str, list[dict]], external_removed: list[Path]) -> dict:
+    from app.job_safety import stamp, inplace_checkpoint
+    before = stamp(source)
     original = source.stat()
     command = matroska_metadata_command(source, request, typed)
     warnings = []
     if command:
+        inplace_checkpoint(source, before)
         try:
             subprocess.run(command, capture_output=True, text=True, timeout=600, check=True)
         except FileNotFoundError as exc:
@@ -157,6 +177,8 @@ def apply_in_place(source: Path, request: media_editor.ReorderEditRequest, typed
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
             raise HTTPException(422, (getattr(exc, "stderr", None) or "Matroska metadata edit failed")[-2000:]) from exc
         mismatches = _verify_language_updates(source, request)
+        if request.clear_video_titles and any(str((stream.get("tags") or {}).get("title") or "").strip() for stream in media_editor.probe(source).get("streams", []) if stream.get("codec_type") == "video"):
+            raise HTTPException(422, "Video stream title removal could not be verified")
         if mismatches:
             # Retry once with the exact generated command, then fail loudly if
             # another process or container rewrite removed the requested tag.
@@ -174,6 +196,8 @@ def apply_in_place(source: Path, request: media_editor.ReorderEditRequest, typed
             subtitle.unlink()
         except OSError as exc:
             warnings.append(f"Could not remove {subtitle.name}: {exc}")
+    if command:
+        inplace_checkpoint(source, before, applied=True)
     media = str(source).replace("\n", "\\n")
     for track in request.tracks:
         changed = []
@@ -195,8 +219,13 @@ def apply_in_place(source: Path, request: media_editor.ReorderEditRequest, typed
 
 @app.post("/api/v43/media/edit")
 def optimized_media_edit(request: media_editor.ReorderEditRequest) -> dict:
-    from app.v86 import assert_media_editable
-    assert_media_editable(request.path)
+    from app.v86 import assert_media_editable, assert_no_tv_draft_save
+    # An explicit Final Version=False is the transactional unlock itself;
+    # allow it to pass the lock guard so the staged unfreeze can commit.
+    if request.final_version is not False:
+        assert_media_editable(request.path)
+    else:
+        assert_no_tv_draft_save(request.path)
     # Invalidate only detector rows whose stream content/metadata is affected.
     # Track names, defaults and forced flags intentionally preserve detections.
     try:
@@ -207,6 +236,8 @@ def optimized_media_edit(request: media_editor.ReorderEditRequest) -> dict:
     except Exception as exc:
         logger.warning("subtitle_detection event=pre_edit_invalidation_failed error=%s", str(exc).replace("\n", " ")[-300:])
     source = media_editor.authorized_file(request.path)
+    if request.clear_video_titles and source.suffix.lower() not in MATROSKA_EXTENSIONS:
+        raise HTTPException(422, "Video-title removal currently requires a Matroska file; no remux was performed")
     data = media_editor.probe(source)
     typed = typed_streams(data)
     before = old_track_names(typed)
@@ -219,6 +250,12 @@ def optimized_media_edit(request: media_editor.ReorderEditRequest) -> dict:
             str(source).replace("\n", "\\n"), "container_structure" if structural else "non_matroska",
         )
         result = _remux_edit(request)
+    if request.final_version is not None:
+        # Final Version is part of the same media transaction: it is committed
+        # only after the stream edit succeeds, for both Apply Now and queued
+        # media_edit tasks.
+        from app.v86 import FinalVersionRequest, set_final_version
+        result["final_version"] = set_final_version(FinalVersionRequest(path=request.path, final_version=bool(request.final_version)))
         result["operation"] = "single_remux"
     record_track_name_corrections(request, before)
     try:

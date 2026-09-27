@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import app.v65 as tasks
 from app.v51 import SubtitleCleanup, apply_subtitle_cleanup
-from app.v70 import app  # noqa: F401 - importing this layer registers startup hooks
+from app.v69 import app  # noqa: F401 - imports the active application layers
 
 base_media_edit_task = tasks.TASK_HANDLERS["media_edit"]
 

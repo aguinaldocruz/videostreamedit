@@ -2,7 +2,7 @@
 
 VideoStreamEdit is a self-hosted intranet web application for browsing Plex movie and TV libraries and editing audio and subtitle stream metadata directly in the underlying media files.
 
-The project is intended for a trusted home network. Plex remains the source of catalog metadata while VideoStreamEdit keeps a local SQLite catalog and indexes so normal browsing does not repeatedly scan the filesystem or query every Plex item.
+The project is intended for a trusted home network. Plex remains the source of catalog metadata while VideoStreamEdit keeps a PostgreSQL catalog and indexes so normal browsing does not repeatedly scan the filesystem or query every Plex item.
 
 It provides an MP3Tag-style workflow for language, region, track name, default/forced flags, stream order, external subtitle integration, stream removal, reusable values, and compatible change templates. A separate Movie Import workflow copies new movies into a chosen library folder and applies stream edits during import.
 
@@ -30,6 +30,7 @@ It provides an MP3Tag-style workflow for language, region, track name, default/f
 ## Requirements
 
 - Docker Engine with the Compose plugin.
+- A reachable PostgreSQL server. The first-run wizard can create the application database and role using temporary administrator credentials.
 - A Plex Media Server reachable from the container.
 - The same media paths Plex reports mounted inside VideoStreamEdit.
 - Read/write permissions for the configured `PUID` and `PGID`.
@@ -40,7 +41,7 @@ It provides an MP3Tag-style workflow for language, region, track name, default/f
 2. Edit `docker-compose.yml`:
    - Change `/media/:/media` to match the paths exposed to Plex.
    - Set `PUID`, `PGID`, `TZ`, and the published port if needed.
-   - Keep `./config:/config` to retain application state locally.
+   - Set the `/config`, `/data`, and `/backup` host paths to persistent locations you control.
 3. Start the application:
 
    ```console
@@ -48,23 +49,25 @@ It provides an MP3Tag-style workflow for language, region, track name, default/f
    ```
 
 4. Open `http://localhost:8383`.
-5. In **Setup**, enter the Plex server URL and token, select libraries, and synchronize the catalog.
+5. Complete the first-run PostgreSQL wizard, then in **Setup → Connections → Plex** enter the server URL and token, select libraries, and synchronize the catalog.
 
 The first sync can take time. Subsequent syncs are incremental. The application must be able to access media using the exact paths returned by Plex.
 
-No `.env` file is required or used by the supplied Compose configuration.
+The supplied Compose file does not store PostgreSQL credentials. The wizard saves application credentials in protected persistent configuration; administrator credentials are used only during setup or migration.
 
 ## Volume layout
 
 ```yaml
 volumes:
   - /media/:/media
-  - ./config:/config
+  - /host/videostreamedit:/config
+  - /host/videostreamedit/data:/data
+  - /host/videostreamedit/backup:/backup
 ```
 
 Plex paths and VideoStreamEdit paths must match. For example, if Plex reports `/media/Movies/Film.mkv`, that exact path must exist inside this container.
 
-The `config/` directory is deliberately excluded from Git. It contains the SQLite database and Plex-token encryption key. Back up both files together.
+The supplied Compose file uses `/home/docker/videostreamedit` on the host for these paths; change it to suit your server. Persistent contents must not be committed to Git. Use **Setup → Data & safety → Backup** for scheduled or manual backups of PostgreSQL data and protected configuration. Media files are not included.
 
 ## Movie Import
 
@@ -78,7 +81,7 @@ Configure input and output roots in **Setup**, then use **Import Movies** to:
 
 ## How media changes work
 
-VideoStreamEdit uses FFmpeg stream copying, so audio and video payloads are not transcoded. It writes a temporary file beside the source and replaces the original only after FFmpeg succeeds. Matroska metadata inspection also uses MKVToolNix.
+Metadata-only Matroska changes can use MKVToolNix without remuxing the payload. Changes that alter streams use FFmpeg stream copying, so audio and video payloads are not transcoded. Those operations stage a temporary output and replace the original only after validation succeeds.
 
 Some operations can still take a long time because the complete container must be rewritten. Free space is required on the same filesystem during processing.
 
@@ -88,11 +91,12 @@ Subtitle HTML cleanup validates the current codec, complete FFmpeg extraction, a
 
 ## Background work
 
-Setup exposes the generic **Tasks** queue and incremental **Indexes** queues:
+**Setup → Tasks** exposes the task queue, incremental indexes, schedules, priorities, and staged OCR rollback work:
 
 - **Core** — stream metadata and fast filter values.
 - **Subtitles** — extended subtitle properties and HTML inspection.
-- **Previews** — audio preview cache work.
+
+Media review streams directly and does not maintain a preview cache.
 
 Index checks are incremental by media fingerprint. A rebuild is only needed after an intentional catalog/index reset.
 

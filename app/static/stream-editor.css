@@ -1,0 +1,21 @@
+/* Keep the full table accessible instead of collapsing/clipping controls. */
+#stream-dialog{max-height:94dvh;overflow:hidden}
+#stream-dialog #stream-form{display:flex;flex-direction:column;max-height:94dvh;min-height:0}
+#stream-dialog .dialog-title{flex:0 0 auto;gap:.6rem;flex-wrap:wrap}
+#stream-dialog .dialog-title>div{min-width:0;flex:1 1 19rem}
+#stream-dialog .stream-editor-context{margin:.3rem 0 0;font-size:.74rem;color:var(--vse-accent,#62b0ff);white-space:normal}
+#stream-dialog .stream-content{min-height:0;max-height:none;overflow:auto;flex:1 1 auto;scrollbar-gutter:stable}
+#stream-dialog .stream-grid.v7{box-sizing:border-box;min-width:1080px;grid-template-columns:24px 145px minmax(190px,1.2fr) 14px minmax(230px,1.7fr) 66px 66px 78px 70px;gap:6px}
+#stream-dialog .stream-grid.v7 .language-region-select{grid-column:auto}
+#stream-dialog .stream-grid.head{position:sticky;top:-12px;z-index:3}
+#stream-dialog .stream-grid input[name=title]{width:100%;min-width:0}
+#stream-dialog .dialog-actions{flex:0 0 auto;flex-wrap:wrap;gap:.45rem;padding:.65rem .8rem}
+#stream-dialog .dialog-actions button{white-space:nowrap;min-height:2.1rem;flex:0 0 auto}
+#stream-dialog .dialog-actions button:disabled{cursor:default}
+#stream-dialog .stream-review-name{text-decoration-color:color-mix(in srgb,currentColor 40%,transparent);text-underline-offset:3px}
+#stream-dialog .stream-review-name:focus-visible{outline:2px solid var(--vse-accent,#62b0ff);outline-offset:3px}
+#stream-dialog .stream-row:has([data-dirty=true]){border-left:3px solid var(--vse-accent,#62b0ff)}
+#stream-dialog [hidden]{display:none!important}
+#stream-dialog[data-editor-phase=loading] .stream-content{opacity:.55;pointer-events:none}
+#stream-dialog[data-editor-phase=saving] .stream-content{pointer-events:none}
+@media(max-width:750px){#stream-dialog .dialog-actions{justify-content:flex-end}#stream-dialog .dialog-title{padding:.6rem}#stream-dialog #selected-file{max-width:85vw}}

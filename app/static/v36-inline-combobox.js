@@ -23,6 +23,10 @@ function savedComboboxValues(input, filter) {
     });
 }
 
+function isBulkTrackName(input) {
+  return input.name === 'track_name' && input.matches('.season-bulk-value,.movie-header-bulk-value');
+}
+
 function positionSavedCombobox(menu, input) {
   const rect = input.getBoundingClientRect();
   const spaceBelow = window.innerHeight - rect.bottom - 12;
@@ -49,6 +53,7 @@ function activateSavedComboboxOption(index) {
 function chooseSavedComboboxValue(input, value) {
   suppressSavedComboboxInput = true;
   input.value = value;
+  if (isBulkTrackName(input)) input.placeholder = value === '' ? 'Clear track name (blank)' : 'Leave unchanged';
   delete input.dataset.fastDefaultFrom;
   input.classList.remove('fast-default-suggestion');
   input.removeAttribute('title');
@@ -68,6 +73,17 @@ showSavedValueMenu = function (input, filter = false) {
   menu.className = 'saved-value-menu saved-combobox-menu';
   menu.setAttribute('role', 'listbox');
   menu.setAttribute('aria-label', 'Saved values');
+  if (isBulkTrackName(input)) {
+    const clear = document.createElement('button');
+    clear.type = 'button';
+    clear.className = 'saved-value-option';
+    clear.textContent = 'Clear track name (blank)';
+    clear.title = 'Remove the track name from matching streams';
+    clear.setAttribute('role', 'option');
+    clear.onpointerdown = event => event.preventDefault();
+    clear.onclick = () => chooseSavedComboboxValue(input, '');
+    menu.append(clear);
+  }
   if (!values.length) {
     const empty = document.createElement('div');
     empty.className = 'saved-combobox-empty';
@@ -103,7 +119,7 @@ showSavedValueMenu = function (input, filter = false) {
 installSavedValuePopups = function (root = document) {
   root.querySelectorAll('.stream-row input[type="text"][name],input.season-bulk-value[data-saved-field],input.movie-header-bulk-value[data-saved-field]').forEach(input => {
     if (input.dataset.inlineComboboxReady === 'true') return;
-    if (!(v8Saved[input.dataset.savedField || input.name] || []).length) return;
+    if (!isBulkTrackName(input) && !(v8Saved[input.dataset.savedField || input.name] || []).length) return;
     input.dataset.inlineComboboxReady = 'true';
     input.setAttribute('autocomplete', 'off');
     input.setAttribute('role', 'combobox');

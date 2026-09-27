@@ -7,7 +7,7 @@ from pydantic import BaseModel
 
 import app.v28 as v28_module
 from app.v2 import is_blocked, resolve_existing
-from app.v11 import connection
+from app.v11 import connection, column_exists
 from app.v31 import app
 
 
@@ -26,8 +26,7 @@ def initialize_output_folder() -> None:
                 path TEXT PRIMARY KEY
             );
         """)
-        columns = {row["name"] for row in db.execute("PRAGMA table_info(import_output_config)")}
-        if "last_folder" not in columns:
+        if not column_exists(db, 'import_output_config', 'last_folder'):
             db.execute("ALTER TABLE import_output_config ADD COLUMN last_folder TEXT NOT NULL DEFAULT ''")
 
 

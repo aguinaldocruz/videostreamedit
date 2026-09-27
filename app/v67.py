@@ -23,8 +23,8 @@ class IndexSchedule(BaseModel):
 
 
 def valid_job(job: str) -> None:
-    if job not in index_jobs.JOBS:
-        raise HTTPException(404, "Unknown indexing job")
+    if job not in (*index_jobs.JOBS, "subtitle_detection", "voice_detection"):
+        raise HTTPException(404, "Unknown scheduled job")
 
 
 def parse_time(value: str) -> tuple[int, int]:
@@ -77,13 +77,33 @@ def run_scheduler() -> None:
     logger.info("index_scheduler event=worker_started")
     while True:
         now = datetime.now().astimezone()
-        with connection() as db:
-            schedules = [dict(row) for row in db.execute("SELECT job,frequency,time_of_day,last_run FROM index_job_schedule WHERE frequency!='disabled'")]
+        try:
+            # Final-Version retirement happens on the transition to final,
+            # not on every scheduler tick. Workers also recheck eligibility.
+            # In particular, do not mutate workflow tables while other startup
+            # handlers may still be initializing their schema.
+            with connection() as db:
+                schedules = [dict(row) for row in db.execute("SELECT job,frequency,time_of_day,last_run FROM index_job_schedule WHERE frequency!='disabled'")]
+        except Exception as exc:
+            logger.warning("index_scheduler event=schedule_read_failed error=%s", str(exc).replace("\n", " ")[-500:])
+            threading.Event().wait(30)
+            continue
         for schedule in schedules:
             job = schedule["job"]
-            if job == "previews":
-                # Preview media work is on-demand; this legacy schedule row is
-                # retained only for compatibility with existing Setup data.
+            if job in {"subtitle_detection", "voice_detection"}:
+                try:
+                    if not schedule_due(schedule["frequency"], schedule["time_of_day"], schedule["last_run"], now):
+                        continue
+                    from app.v80 import flush_deferred_language_detection
+                    with connection() as db:
+                        paths = [str(row["path"]) for row in db.execute("SELECT path FROM deferred_language_detection ORDER BY requested_at,path LIMIT 250").fetchall()]
+                    for path in paths:
+                        flush_deferred_language_detection(path, "subtitle" if job == "subtitle_detection" else "audio")
+                    with connection() as db:
+                        db.execute("UPDATE index_job_schedule SET last_run=?,updated_at=CURRENT_TIMESTAMP WHERE job=?", (now.isoformat(timespec="seconds"), job))
+                    logger.info("detection_scheduler event=scheduled_run subtitle_or_voice=%s media=%d", job, len(paths))
+                except Exception as exc:
+                    logger.warning("detection_scheduler event=scheduled_run_failed job=%s error=%s", job, str(exc).replace("\n", " "))
                 continue
             try:
                 if not schedule_due(schedule["frequency"], schedule["time_of_day"], schedule["last_run"], now):
@@ -114,7 +134,8 @@ def initialize_index_schedules() -> None:
             );
             INSERT OR IGNORE INTO index_job_schedule(job) VALUES('core');
             INSERT OR IGNORE INTO index_job_schedule(job) VALUES('subtitles');
-            INSERT OR IGNORE INTO index_job_schedule(job) VALUES('previews');
+            INSERT OR IGNORE INTO index_job_schedule(job) VALUES('subtitle_detection');
+            INSERT OR IGNORE INTO index_job_schedule(job) VALUES('voice_detection');
         """)
 
 

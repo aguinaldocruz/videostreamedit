@@ -1,0 +1,53 @@
+name: videostreamedit
+
+# First-run deployment: PostgreSQL is external and intentionally absent from
+# this file. Start this file, open http://localhost:8383, and complete the
+# database wizard. The administrator credentials are used once to create the
+# target database and application role; only the encrypted application URL is
+# retained under /config.
+services:
+  videostreamedit:
+    build:
+      context: .
+    image: videostreamedit:local
+    container_name: videostreamedit
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 90s
+    ports:
+      - "8383:8080"
+    environment:
+      PUID: "1000"
+      PGID: "1000"
+      DATABASE_BACKEND: "postgres" # wizard runs without a database until configured and restarted
+      LANGUAGE_ID_URL: "http://language-id:9000"
+      WORKFLOW_MIN_FREE_GB: "5"
+      WORKFLOW_RESERVED_GB: "2"
+    volumes:
+      - /media/:/media
+      - /home/docker/videostreamedit:/config
+      - /home/docker/videostreamedit/data:/data
+      - /home/docker/videostreamedit/backup:/backup
+    depends_on:
+      language-id:
+        condition: service_started
+    security_opt:
+      - no-new-privileges:true
+
+  language-id:
+    build:
+      context: ./language-id
+    image: videostreamedit-language-id:local
+    container_name: videostreamedit-language-id
+    restart: unless-stopped
+    init: true
+    ports:
+      - "9000:9000"
+    environment:
+      HF_HOME: "/models/huggingface"
+      TRANSFORMERS_CACHE: "/models/huggingface"
+      SPEECHBRAIN_CACHE: "/models/speechbrain"
+    volumes:
+      - /home/docker/videostreamedit/language-id-models:/models
+    security_opt:
+      - no-new-privileges:true

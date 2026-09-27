@@ -95,9 +95,9 @@ def complete_extracted_text(path: Path, selector: str) -> str:
         )
         return result.stdout.decode("utf-8", errors="replace")
     except subprocess.CalledProcessError as exc:
-        return (exc.stdout or b"").decode("utf-8", errors="replace")
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        return ""
+        raise HTTPException(422, 'Complete subtitle extraction failed; refusing to replace it with partial text') from exc
+    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        raise HTTPException(503, 'Complete subtitle extraction unavailable or timed out; original retained') from exc
 
 
 def damage_kind(text: str) -> str:
@@ -165,35 +165,6 @@ def inspect_extended(path: Path, text_cache: dict | None = None) -> list[tuple]:
     return found
 
 
-_original_run_index = movie_index._run_index
-
-
-def extended_run_index(items: list[dict]) -> None:
-    # Preserve the established index lifecycle, then add the heavier subtitle scan.
-    _original_run_index(items)
-    with movie_index._index_lock:
-        movie_index._index_state.update(running=bool(items), total=len(items), completed=0)
-    for completed, item in enumerate(items, 1):
-        path = Path(item["path"])
-        if not path.is_file():
-            continue
-        try:
-            values = inspect_extended(path)
-            with connection() as db:
-                db.execute("DELETE FROM subtitle_extended_index WHERE path=?", (str(path),))
-                db.executemany("INSERT INTO subtitle_extended_index(path,source,type_index,external_path,codec,encoding,markup,damage) VALUES(?,?,?,?,?,?,?,?)", values)
-        except Exception as exc:
-            logger.warning("change=subtitle_extended_index_failed path=%s error=%s", str(path).replace("\n", "\\n"), exc)
-        with movie_index._index_lock:
-            movie_index._index_state["completed"] = completed
-    with movie_index._index_lock:
-        movie_index._index_state["running"] = False
-    logger.info("change=subtitle_extended_index_completed media=%d", len(items))
-
-
-movie_index._run_index = extended_run_index
-
-
 def filter_values() -> dict:
     base = movie_index.movie_stream_filter_values()
     with connection() as db:
@@ -241,6 +212,8 @@ def strip_html(text: str) -> str:
 
 
 def clean_external_html(subtitle: Path, operation_id: str | None = None) -> None:
+    from app.job_safety import stamp, replace_prepared, output_space
+    original = stamp(subtitle)
     text, current = decode_external(subtitle.read_bytes())
     if not HTML_TAG.search(text):
         logger.info("change=subtitle_html_cleanup_skipped reason=no_tags file=%s source=external", str(subtitle).replace("\n", "\\n"))
@@ -249,14 +222,17 @@ def clean_external_html(subtitle: Path, operation_id: str | None = None) -> None
     token = re.sub(r"[^A-Za-z0-9_-]", "", str(operation_id or uuid.uuid4().hex))[-48:]
     temporary = subtitle.with_name(f".{subtitle.name}.vse-{token}.tmp")
     try:
-        temporary.write_bytes(strip_html(text).encode(codecs[current], errors="replace"))
-        os.chmod(temporary, subtitle.stat().st_mode)
-        os.replace(temporary, subtitle)
+        with output_space(subtitle.parent, original['size'] * 2):
+            temporary.write_bytes(strip_html(text).encode(codecs[current], errors="replace"))
+            os.chmod(temporary, subtitle.stat().st_mode)
+            replace_prepared(temporary, subtitle, original)
     finally:
         temporary.unlink(missing_ok=True)
 
 
 def clean_embedded(media: Path, type_index: int, operation_id: str | None = None) -> None:
+    from app.job_safety import stamp, replace_prepared, output_space, run_write_command
+    original = stamp(media)
     streams = probe(media).get("streams", [])
     subtitle_globals = [index for index, stream in enumerate(streams) if stream.get("codec_type") == "subtitle"]
     if type_index < 0 or type_index >= len(subtitle_globals):
@@ -305,12 +281,19 @@ def clean_embedded(media: Path, type_index: int, operation_id: str | None = None
         temporary.unlink(missing_ok=True)
         command.insert(1, "-y")
         try:
-            subprocess.run(command, capture_output=True, text=True, timeout=3600, check=True)
-            os.chmod(temporary, media.stat().st_mode)
-            os.replace(temporary, media)
+            with output_space(media.parent, int(original['size'] * 1.1) + 64 * 1024**2):
+                run_write_command(command, media.parent)
+                # Verify a readable container with the same stream count before
+                # publishing it. A zero-exit encoder alone is not verification.
+                if len(probe(temporary).get('streams', [])) != len(streams):
+                    raise RuntimeError('Subtitle cleanup output stream verification failed')
+                os.chmod(temporary, media.stat().st_mode)
+                replace_prepared(temporary, media, original)
         except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
             temporary.unlink(missing_ok=True)
             raise HTTPException(422, (getattr(exc, "stderr", None) or "Subtitle cleanup failed")[-1600:]) from exc
+        finally:
+            temporary.unlink(missing_ok=True)
 
 
 @app.post("/api/v51/subtitle-cleanup")

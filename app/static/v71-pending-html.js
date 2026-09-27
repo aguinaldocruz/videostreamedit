@@ -8,6 +8,11 @@
   const htmlButton=$('#subtitle-cleanup-apply');
   if(htmlButton)htmlButton.onclick=()=>{const body=selectedCleanup();if(!body)return;const key=cleanupKey(body);if(pendingHtmlCleanups.has(key)){pendingHtmlCleanups.delete(key);toast('Pending HTML-tag removal undone');updateHtmlButton()}else{pendingHtmlCleanups.set(key,body);toast('HTML-tag removal added to pending changes');$('#stream-preview-dialog').close()}updateQueuedChangeLabels()};
 
+  // The normal Apply Now flow may contain only an HTML cleanup (no stream
+  // field/remux request). Expose an explicit reset so every successful media
+  // apply starts a clean editor session in that case too.
+  window.clearPendingHtmlCleanups=function(){pendingHtmlCleanups.clear();updateHtmlButton()};
+
   const countWithoutHtml=queuedChangeCount;
   queuedChangeCount=function(){return countWithoutHtml()+pendingHtmlCleanups.size};
   const summaryWithoutHtml=queuedChangeSummary;

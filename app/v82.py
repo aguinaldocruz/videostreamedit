@@ -42,7 +42,7 @@ def ensure_unified_index() -> None:
                 ON media_stream_index(stream_type,language,region,track_name,path);
             CREATE INDEX IF NOT EXISTS media_stream_index_path ON media_stream_index(path);
             CREATE TABLE IF NOT EXISTS media_stream_index_state (
-                path TEXT PRIMARY KEY, modified_ns INTEGER NOT NULL, size INTEGER NOT NULL,
+                path TEXT PRIMARY KEY, modified_ns BIGINT NOT NULL, size BIGINT NOT NULL,
                 schema_version INTEGER NOT NULL DEFAULT 2, indexed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
             CREATE TABLE IF NOT EXISTS core_index_parity_audit (
@@ -60,7 +60,7 @@ def ensure_unified_index() -> None:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 status TEXT NOT NULL DEFAULT 'pending',
                 total INTEGER NOT NULL DEFAULT 0,
-                cursor_cursor_offset INTEGER NOT NULL DEFAULT 0,
+                cursor_offset INTEGER NOT NULL DEFAULT 0,
                 checked INTEGER NOT NULL DEFAULT 0,
                 mismatches INTEGER NOT NULL DEFAULT 0,
                 missing INTEGER NOT NULL DEFAULT 0,
@@ -69,15 +69,10 @@ def ensure_unified_index() -> None:
             );
             CREATE INDEX IF NOT EXISTS core_index_parity_runs_status
                 ON core_index_parity_runs(status, id);
-            CREATE TABLE IF NOT EXISTS performance_metric (
-                name TEXT PRIMARY KEY, count INTEGER NOT NULL DEFAULT 0,
-                total REAL NOT NULL DEFAULT 0, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-            );
             CREATE TABLE IF NOT EXISTS media_video_title (
                 path TEXT PRIMARY KEY, title TEXT NOT NULL DEFAULT '', video_index INTEGER NOT NULL DEFAULT 0,
-                modified_ns INTEGER NOT NULL, size INTEGER NOT NULL, indexed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                modified_ns BIGINT NOT NULL, size BIGINT NOT NULL, indexed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
-            CREATE INDEX IF NOT EXISTS media_video_title_path ON media_video_title(path);
         """)
         if not column_exists(db, "media_stream_index_state", "content_signature"):
             db.execute("ALTER TABLE media_stream_index_state ADD COLUMN content_signature TEXT NOT NULL DEFAULT ''")
@@ -235,67 +230,12 @@ indexes.processors["core"] = unified_core_index
 
 @app.on_event("startup")
 def initialize_unified_stream_index() -> None:
+    # Current schema only. Historical cut-over migrations must never wipe
+    # catalog/index data or enqueue a whole library on application startup.
     ensure_unified_index()
-    with connection() as db:
-        migrated = db.execute("SELECT 1 FROM feature_migrations WHERE name='unified_stream_index_v1'").fetchone()
-        if not migrated:
-            db.execute("DELETE FROM media_stream_index")
-            db.execute("DELETE FROM media_stream_index_state")
-            db.execute("DELETE FROM index_task_queue WHERE job='core' AND status IN ('pending','running','succeeded','cancelled')")
-            db.execute("""INSERT INTO index_task_queue(job,path,reason,status,created_at,updated_at)
-                SELECT 'core',path,'Unified stream index migration','pending',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP FROM plex_media""")
-            db.execute("INSERT INTO feature_migrations(name) VALUES('unified_stream_index_v1')")
-            logger.info("core_index event=unified_migration_queued")
-        migrated_parser = db.execute("SELECT 1 FROM feature_migrations WHERE name='unified_stream_index_parser_v2'").fetchone()
-        if not migrated_parser:
-            db.execute("DELETE FROM media_stream_index")
-            db.execute("DELETE FROM media_stream_index_state")
-            db.execute("UPDATE index_task_queue SET status='cancelled',finished_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE job='core' AND status IN ('pending','running')")
-            db.execute("INSERT OR IGNORE INTO index_task_queue(job,path,reason,status,created_at,updated_at) SELECT 'core',path,'Unified parser v2 migration','pending',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP FROM plex_media")
-            db.execute("INSERT INTO feature_migrations(name) VALUES('unified_stream_index_parser_v2')")
-            logger.info("core_index event=parser_migration_queued version=2")
-        parser_v3 = db.execute("SELECT 1 FROM feature_migrations WHERE name='plex_aware_parser_v3'").fetchone()
-        if not parser_v3:
-            # Re-evaluate every cached stream row with the same IETF-aware
-            # parser used by Stream Properties; retain old rows until each
-            # media is refreshed so filters remain usable during the rollout.
-            db.execute("INSERT OR IGNORE INTO index_task_queue(job,path,reason,status,created_at,updated_at) SELECT 'core',path,'Plex-aware parser v3 migration','pending',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP FROM plex_media")
-            db.execute("INSERT INTO feature_migrations(name) VALUES('plex_aware_parser_v3')")
-            logger.info("core_index event=plex_aware_parser_migration_queued version=3")
-        canonical = db.execute("SELECT 1 FROM feature_migrations WHERE name='canonical_index_design_v3'").fetchone()
-        if not canonical:
-            # Keep Plex configuration/catalog and all learning/saved-property
-            # data, but discard historical jobs, duplicate index contents,
-            # preview files, and stale synchronization markers.  The unified
-            # core index is then rebuilt from the current catalog below.
-            for table in (
-                "index_task_queue", "task_queue", "media_change_request",
-                "media_stream_index", "media_stream_index_state",
-                "external_subtitle_index", "external_sidecar_index_state",
-                "subtitle_extended_index", "subtitle_extended_media",
-                "preview_cache_index", "preview_cache_files",
-            ):
-                db.execute(f"DELETE FROM {table}")
-            db.execute("UPDATE plex_config SET last_sync=NULL WHERE id=1")
-            db.execute("DELETE FROM plex_sync_state")
-            db.execute("INSERT INTO feature_migrations(name) VALUES('canonical_index_design_v3')")
-            db.execute("INSERT INTO index_task_queue(job,path,reason,status,created_at,updated_at) SELECT 'core',path,'Canonical index design v3 migration','pending',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP FROM plex_media")
-            logger.info("core_index event=canonical_migration_queued version=3")
-        # Legacy movie/TV projection tables are no longer part of the schema.
-        # They were parity-checked and emptied before this migration; dropping
-        # them prevents accidental writes and removes duplicate storage.
-        for table in ("movie_stream_index_value", "movie_stream_index", "tv_stream_index_value", "tv_stream_index_media"):
-            db.execute(f"DROP TABLE IF EXISTS {table}")
-        db.execute("INSERT OR IGNORE INTO feature_migrations(name) VALUES('legacy_projection_schema_removed_v1')")
-
-        language_migration = db.execute("SELECT 1 FROM feature_migrations WHERE name='plex_language_semantics_v4'").fetchone()
-        if not language_migration:
-            db.execute("INSERT INTO index_task_queue(job,path,reason,status,created_at,updated_at) SELECT 'core',path,'Plex language semantics v4 migration','pending',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP FROM (SELECT DISTINCT path FROM media_stream_index WHERE lower(language)='und') media WHERE NOT EXISTS (SELECT 1 FROM index_task_queue q WHERE q.job='core' AND q.path=media.path AND q.status IN ('pending','running'))")
-            db.execute("INSERT INTO feature_migrations(name) VALUES('plex_language_semantics_v4')")
-            logger.info("core_index event=plex_language_semantics_migration_queued version=4")
 
 
-def selected_movies(paths: list[str]) -> list[dict]:
+def selected_movies(paths: list[str], *, require_editable: bool = True) -> list[dict]:
     unique = list(dict.fromkeys(paths))
     found = []
     with connection() as db:
@@ -305,9 +245,10 @@ def selected_movies(paths: list[str]) -> list[dict]:
             found.extend(dict(row) for row in rows)
     if {row["path"] for row in found} != set(unique):
         raise HTTPException(409, "The movie selection changed. Refresh Movies and try again")
-    from app.v86 import assert_media_editable
-    for row in found:
-        assert_media_editable(row["path"])
+    if require_editable:
+        from app.v86 import assert_media_editable
+        for row in found:
+            assert_media_editable(row["path"])
     return found
 
 
@@ -315,22 +256,42 @@ class MovieStreamRequest(tv_bulk.SeasonStreamRequest):
     paths: list[str] = tv_bulk.Field(min_length=1, max_length=30000)
 
 
+def _movie_stream_values(rows) -> list[dict]:
+    values = []
+    for row in rows:
+        value = dict(row)
+        value["language"] = tv_bulk.comparable_language(value["language"])
+        try:
+            value["filename_tags"] = json.loads(value["filename_tags"] or "[]")
+        except (TypeError, json.JSONDecodeError):
+            value["filename_tags"] = []
+        values.append(value)
+    return values
+
+
+@app.get("/api/v82/movies/stream-values")
+def all_movie_stream_values() -> dict:
+    """Read indexed movie values without sending or locking every movie path."""
+    with connection() as db:
+        rows = db.execute(
+            "SELECT s.path,s.stream_type,s.language,s.region,s.track_name,s.filename_tags "
+            "FROM media_stream_index s WHERE EXISTS "
+            "(SELECT 1 FROM plex_media p WHERE p.path=s.path AND p.kind='movie')"
+        ).fetchall()
+    return {"values": _movie_stream_values(rows), "errors": []}
+
+
 @app.post("/api/v82/movies/stream-values")
 def movie_stream_values(request: MovieStreamRequest) -> dict:
-    items = selected_movies(request.paths)
+    # Inspecting filter values is read-only; Final-version movies remain
+    # visible in the catalog even though editing them is forbidden.
+    items = selected_movies(request.paths, require_editable=False)
     values = []
     with connection() as db:
         for start in range(0, len(items), 800):
             group = [item["path"] for item in items[start:start + 800]]
             rows = db.execute(f"SELECT path,stream_type,language,region,track_name,filename_tags FROM media_stream_index WHERE path IN ({','.join('?' for _ in group)})", group).fetchall()
-            for row in rows:
-                value = dict(row)
-                value["language"] = tv_bulk.comparable_language(value["language"])
-                try:
-                    value["filename_tags"] = json.loads(value["filename_tags"] or "[]")
-                except (TypeError, json.JSONDecodeError):
-                    value["filename_tags"] = []
-                values.append(value)
+            values.extend(_movie_stream_values(rows))
     return {"values": values, "movies": len(items), "errors": []}
 
 
@@ -340,6 +301,27 @@ class MovieStreamBulkEdit(tv_bulk.SeasonStreamBulkEdit):
 
 class MovieBulkTaskStatus(tv_bulk.BaseModel):
     task_ids: list[int] = tv_bulk.Field(min_length=1, max_length=30000)
+
+
+class MovieIndexWorkStatus(tv_bulk.BaseModel):
+    paths: list[str] = tv_bulk.Field(min_length=1, max_length=30000)
+
+
+@app.post("/api/v82/movies/index-work")
+def movie_index_work_status(request: MovieIndexWorkStatus) -> dict:
+    """Let the listing refresh only after its edited movies have new core data."""
+    paths = list(dict.fromkeys(request.paths))
+    active = 0
+    with connection() as db:
+        for start in range(0, len(paths), 800):
+            group = paths[start:start + 800]
+            row = db.execute(
+                f"SELECT count(*) AS amount FROM index_task_queue WHERE job='core' "
+                f"AND status IN ('pending','running') AND path IN ({','.join('?' for _ in group)})",
+                group,
+            ).fetchone()
+            active += int(row["amount"] or 0)
+    return {"active": active, "ready": active == 0}
 
 
 def process_filtered_stream_edit(task_id: int, payload: dict) -> dict:
@@ -360,7 +342,7 @@ def process_filtered_stream_edit(task_id: int, payload: dict) -> dict:
         return {"path": path, "streams": matched, "skipped": True, "reason": "Media already has the requested values"}
     tasks.update_progress(task_id, 1, 2, prefix + f"Applying changes to {matched} matching stream(s)")
     result = optimized_media_edit(ReorderEditRequest.model_validate(edit))
-    reindex = ["core", "previews"] if request.filters.stream_type == "external" or request.remove else ["core"]
+    reindex = ["core"] if request.filters.stream_type == "external" or request.remove else ["core"]
     queues.request_media_indexes(path, reindex, "Queued filtered movie edit completed")
     tasks.update_progress(task_id, 2, 2, prefix + "Stream changes applied")
     return {**result, "path": path, "streams": matched}
@@ -533,18 +515,30 @@ def clear_unified_index(job: str) -> None:
 
 def prune_queue_history() -> dict:
     """Bound finished queue history while retaining recent diagnostics."""
+    from app.postgres_store import cleanup_retired_workflow_recovery
+    cleanup_retired_workflow_recovery()
     with connection() as db:
+        from app.postgres_store import _lock_workflow_mutation
+        _lock_workflow_mutation(db.raw)
         generic = db.execute(
             """DELETE FROM task_queue WHERE status IN ('succeeded','cancelled') AND id NOT IN
-               (SELECT id FROM task_queue WHERE status IN ('succeeded','cancelled') ORDER BY id DESC LIMIT 2000)"""
+               (SELECT id FROM task_queue WHERE status IN ('succeeded','cancelled') ORDER BY id DESC LIMIT 2000)""" + _history_safe_clause('task_queue')
         ).rowcount
         indexed = db.execute(
             """DELETE FROM index_task_queue WHERE status IN ('succeeded','cancelled') AND id NOT IN
-               (SELECT id FROM index_task_queue WHERE status IN ('succeeded','cancelled') ORDER BY id DESC LIMIT 5000)"""
+               (SELECT id FROM index_task_queue WHERE status IN ('succeeded','cancelled') ORDER BY id DESC LIMIT 5000)""" + _history_safe_clause('index_task_queue')
         ).rowcount
     if generic or indexed:
         logger.info("queue_retention event=pruned generic=%d index=%d", generic, indexed)
     return {"generic": generic, "index": indexed}
+
+
+def _history_safe_clause(table: str) -> str:
+    if table not in {'task_queue', 'index_task_queue'}:
+        raise ValueError('Invalid history table')
+    return f""" AND NOT EXISTS (SELECT 1 FROM workflow_stages s
+        WHERE s.group_id::text={table}.group_id AND s.status IN ('pending','running','blocked'))
+        AND NOT EXISTS (SELECT 1 FROM workflow_artifacts a WHERE a.group_id::text={table}.group_id)"""
 
 
 _original_clear_index = queues.clear_index
@@ -754,8 +748,12 @@ def core_index_compatibility() -> dict:
 
 @app.post("/api/v82/setup/queues/prune")
 def prune_finished_queue_history() -> dict:
+    from app.postgres_store import cleanup_retired_workflow_recovery
+    cleanup_retired_workflow_recovery()
     with connection() as db:
-        generic = db.execute("DELETE FROM task_queue WHERE status IN ('succeeded','cancelled')").rowcount
-        indexed = db.execute("DELETE FROM index_task_queue WHERE status IN ('succeeded','cancelled')").rowcount
+        from app.postgres_store import _lock_workflow_mutation
+        _lock_workflow_mutation(db.raw)
+        generic = db.execute("DELETE FROM task_queue WHERE status IN ('succeeded','cancelled')" + _history_safe_clause('task_queue')).rowcount
+        indexed = db.execute("DELETE FROM index_task_queue WHERE status IN ('succeeded','cancelled')" + _history_safe_clause('index_task_queue')).rowcount
     logger.info("queue_retention event=finished_history_cleared generic=%d index=%d", generic, indexed)
     return {"generic": generic, "index": indexed}

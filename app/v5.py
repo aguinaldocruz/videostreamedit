@@ -45,8 +45,9 @@ def plex_language_pair(language, region=None):
     """Return stream language/region using Plex semantics."""
     language = canonical_language(language or "")
     region = str(region or "").strip().upper()
-    if language == "pt" and not region:
-        region = "PT"
+    # Keep regionless Portuguese distinct from the regional Plex values.
+    # ``pt`` means Portuguese (unspecified), while ``pt-BR`` and ``pt-PT``
+    # carry an explicit region. Silently defaulting to PT loses user intent.
     return language, region
 
 
@@ -85,19 +86,6 @@ class SingleEditRequest(BaseModel):
     forced_subtitle: int | None = Field(default=None, ge=0)
 
 
-@app.middleware("http")
-async def v5_assets(request: Request, call_next):
-    if request.method == "GET":
-        assets = {
-            "/": ("v5.html", "text/html"),
-            "/app.css": ("v5.css", "text/css"),
-            "/app.js": ("v5.js", "text/javascript"),
-            "/previous.css": ("v4.css", "text/css"),
-        }
-        if request.url.path in assets:
-            filename, media_type = assets[request.url.path]
-            return FileResponse(STATIC_DIR / filename, media_type=media_type)
-    return await call_next(request)
 
 
 def split_tag(value: str) -> tuple[str, str]:
@@ -158,19 +146,28 @@ def external_subtitles(media: Path) -> list[dict]:
 
 @app.get("/api/media/details")
 def media_details(path: str) -> dict:
-    media = authorized_file(path)
-    counters = {"audio": 0, "subtitle": 0}
-    streams = []
-    for stream in probe(media).get("streams", []):
-        codec_type = stream.get("codec_type")
-        if codec_type not in counters:
-            continue
-        type_index = counters[codec_type]
-        counters[codec_type] += 1
-        tags = stream.get("tags") or {}
-        language, region = split_tag(tags.get("language") or "")
-        streams.append({"codec_type": codec_type, "type_index": type_index, "codec": stream.get("codec_name") or "unknown", "language": language, "region": region, "title": tags.get("title") or "", "default": bool((stream.get("disposition") or {}).get("default")), "forced": bool((stream.get("disposition") or {}).get("forced")), "external": False})
-    return {"path": str(media), "streams": streams, "external_subtitles": external_subtitles(media)}
+    # Keep the legacy URL Plex-aware as well. Older cached assets and external
+    # integrations still call this route; returning ffprobe's legacy ``por``
+    # here would make a correctly tagged pt-BR stream appear to revert.
+    try:
+        from app.v13 import media_details_with_ietf
+        return media_details_with_ietf(path)
+    except Exception:
+        # During very early startup v13 may not yet be imported. Preserve the
+        # bounded legacy fallback rather than making the endpoint unavailable.
+        media = authorized_file(path)
+        counters = {"audio": 0, "subtitle": 0}
+        streams = []
+        for stream in probe(media).get("streams", []):
+            codec_type = stream.get("codec_type")
+            if codec_type not in counters:
+                continue
+            type_index = counters[codec_type]
+            counters[codec_type] += 1
+            tags = stream.get("tags") or {}
+            language, region = split_tag(tags.get("language_ietf") or tags.get("language") or "")
+            streams.append({"codec_type": codec_type, "type_index": type_index, "codec": stream.get("codec_name") or "unknown", "language": language, "region": region, "title": tags.get("title") or "", "default": bool((stream.get("disposition") or {}).get("default")), "forced": bool((stream.get("disposition") or {}).get("forced")), "external": False})
+        return {"path": str(media), "streams": streams, "external_subtitles": external_subtitles(media)}
 
 
 def checked_external(media: Path, value: str) -> Path:

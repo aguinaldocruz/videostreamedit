@@ -2,6 +2,22 @@
 
 Generated 2026-09-18. Evidence-only inventory; verified inactive modules/assets were removed only after cross-reference checks.
 
+## Reconciliation — 2026-09-27
+
+The table below is a historical snapshot, not the current asset manifest.
+Runtime-reference checks now exclude documentation and test-only mentions.
+The following unused source assets have been removed: `v49-stream-preview.css`,
+`v50-stream-preview.css`, `v60-preview-layout.css`, `v61-preview-overflow.css`,
+`v69-stream-preview.css`, `v94-preview.css`, `v77-bulk-track-name.css`, and
+`v77-bulk-track-name.js`. None is assembled by the current runtime.
+Subsequent cleanup removed `v81-performance.js` and `v7-addon.js`: neither is
+served by the current bundle. Import-only modules `v15.py` and `v70.py` were
+removed after redirecting their callers. The unreferenced root `old-v79.js`
+source snapshot was removed. Bootstrap assets are explicitly mapped by
+`web_assets.py`, not orphaned. Current filename-level audit finds no orphan assets.
+Run `python scripts/legacy_audit.py` for current filename-reference candidates;
+that check alone does not prove behavioral reachability or safe removal.
+
 ## Rules
 
 - “Not referenced” means only that the active `/assets/v19.css` or `/assets/v19.js` assembly does not name the file directly.

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import time
 import urllib.error
 import urllib.parse
@@ -17,7 +18,7 @@ import app.v5 as v5_module
 import app.v7 as v7_module
 from app.plex_secret import decrypt_token, encrypt_token
 from app.v2 import connection, resolve_existing
-from app.v8 import STATIC_DIR, app, asset
+from app.v8 import STATIC_DIR, app
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -57,36 +58,65 @@ def initialize_plex() -> None:
                 path TEXT PRIMARY KEY, kind TEXT NOT NULL CHECK(kind IN ('movie','episode')),
                 rating_key TEXT NOT NULL, library_key TEXT NOT NULL, library_name TEXT NOT NULL,
                 title TEXT NOT NULL, show_title TEXT, season_number INTEGER, episode_number INTEGER,
-                size INTEGER NOT NULL DEFAULT 0, modified INTEGER NOT NULL DEFAULT 0
+                size BIGINT NOT NULL DEFAULT 0, modified BIGINT NOT NULL DEFAULT 0,
+                plex_imdb_id TEXT NOT NULL DEFAULT '', plex_tmdb_id TEXT NOT NULL DEFAULT '',
+                plex_year INTEGER NOT NULL DEFAULT 0
             );
             CREATE INDEX IF NOT EXISTS plex_media_kind ON plex_media(kind);
             CREATE INDEX IF NOT EXISTS plex_media_show ON plex_media(show_title, season_number, episode_number);
             CREATE INDEX IF NOT EXISTS plex_media_tv_summary ON plex_media(kind, library_key, show_title, library_name);
             CREATE TABLE IF NOT EXISTS plex_internal_change_scope (
                 path TEXT PRIMARY KEY,
-                expected_size INTEGER NOT NULL DEFAULT 0,
-                expected_modified INTEGER NOT NULL DEFAULT 0,
+                expected_size BIGINT NOT NULL DEFAULT 0,
+                expected_modified BIGINT NOT NULL DEFAULT 0,
                 scope_json TEXT NOT NULL,
                 reason TEXT NOT NULL DEFAULT '',
-                created_at INTEGER NOT NULL DEFAULT 0,
-                expires_at INTEGER NOT NULL
+                created_at BIGINT NOT NULL DEFAULT 0,
+                expires_at BIGINT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS plex_internal_change_scope_expiry
                 ON plex_internal_change_scope(expires_at);
         """)
         if not column_exists(db, "plex_config", "auth_method"):
             db.execute("ALTER TABLE plex_config ADD COLUMN auth_method TEXT NOT NULL DEFAULT 'manual'")
+        for column, statement in (
+            ("plex_imdb_id", "ALTER TABLE plex_media ADD COLUMN plex_imdb_id TEXT NOT NULL DEFAULT ''"),
+            ("plex_tmdb_id", "ALTER TABLE plex_media ADD COLUMN plex_tmdb_id TEXT NOT NULL DEFAULT ''"),
+            ("plex_year", "ALTER TABLE plex_media ADD COLUMN plex_year INTEGER NOT NULL DEFAULT 0"),
+        ):
+            if not column_exists(db, "plex_media", column):
+                db.execute(statement)
 
 
 def column_exists(db, table: str, column: str) -> bool:
     """Check schema metadata without issuing a duplicate ALTER statement."""
-    if os.getenv("DATABASE_BACKEND", "sqlite").lower() == "postgres":
-        return bool(db.execute(
-            "SELECT 1 FROM information_schema.columns WHERE table_schema=current_schema() AND table_name=? AND column_name=?",
-            (table, column),
-        ).fetchone())
-    safe_table = "".join(ch for ch in table if ch.isalnum() or ch == "_")
-    return any(str(row[1]) == column for row in db.execute(f"PRAGMA table_info({safe_table})").fetchall())
+    return bool(db.execute(
+        "SELECT 1 FROM information_schema.columns WHERE table_schema=current_schema() AND table_name=? AND column_name=?",
+        (table, column),
+    ).fetchone())
+
+
+def plex_external_ids(item: dict) -> tuple[str, str, int]:
+    """Extract stable IMDb/TMDB identifiers from Plex GUID metadata."""
+    imdb = tmdb = ""
+    raw_guids = item.get("Guid") or item.get("guid") or []
+    if isinstance(raw_guids, dict):
+        raw_guids = [raw_guids]
+    for guid in raw_guids if isinstance(raw_guids, list) else []:
+        value = str(guid.get("id") if isinstance(guid, dict) else guid).strip()
+        lower = value.casefold()
+        match = re.search(r"(?:imdb[^:]*://|\bimdb[:/]+)(tt)?(\d{5,})", lower)
+        if match and not imdb:
+            imdb = match.group(2)
+        elif ("tmdb" in lower or lower.startswith("themoviedb")) and not tmdb:
+            match = re.search(r"(\d{2,})", value)
+            if match:
+                tmdb = match.group(1)
+    try:
+        year = int(item.get("year") or 0)
+    except (TypeError, ValueError):
+        year = 0
+    return imdb, tmdb, year
 
 
 PLEX_CLIENT_ID = "videostreamedit"
@@ -132,21 +162,6 @@ def section_list(url: str | None = None, token: str | None = None) -> tuple[str,
     return root.get("friendlyName") or "Plex Media Server", libraries
 
 
-@app.middleware("http")
-async def v11_assets(request: Request, call_next):
-    if request.method == "GET" and request.url.path == "/":
-        html = (STATIC_DIR / "v5.html").read_text().replace('href="/app.css"', 'href="/assets/v11.css"').replace('src="/app.js"', 'src="/assets/v11.js"')
-        return HTMLResponse(html, headers={"Cache-Control": "no-store, max-age=0"})
-    if request.method == "GET" and request.url.path == "/assets/v11.css":
-        names = ("v3.css", "v4.css", "v5.css", "v7-addon.css", "v8-addon.css", "v10-progress.css", "v11-plex.css", "v12-context.css")
-        css = "\n".join((STATIC_DIR / name).read_text() for name in names).replace("@import url('/base.css');", "").replace("@import url('/previous.css');", "")
-        return asset(css, "text/css")
-    if request.method == "GET" and request.url.path == "/assets/v11.js":
-        javascript = (STATIC_DIR / "v5.js").read_text().replace("'/api/movies'", "'/api/v11/movies'").replace("'/api/tv'", "'/api/v11/tv'")
-        for name in ("v8-addon.js", "v9-session.js", "v10-progress.js", "v11-plex.js", "v12-context.js"):
-            javascript += "\n" + (STATIC_DIR / name).read_text()
-        return asset(javascript, "text/javascript")
-    return await call_next(request)
 
 
 @app.post("/api/v11/plex/auth/start")
@@ -259,12 +274,13 @@ def sync_plex() -> dict:
                 for part in media.get("Part", []):
                     path=part.get("file");
                     if not path: continue
-                    records.append((path,media_kind,str(item.get("ratingKey", "")),library["library_key"],library["title"],item.get("title") or Path(path).stem,show_titles.get(str(item.get("grandparentRatingKey"))) or item.get("grandparentTitle"),item.get("parentIndex"),item.get("index"),int(part.get("size") or 0),int(item.get("updatedAt") or 0)))
+                    imdb_id, tmdb_id, year = plex_external_ids(item)
+                    records.append((path,media_kind,str(item.get("ratingKey", "")),library["library_key"],library["title"],item.get("title") or Path(path).stem,show_titles.get(str(item.get("grandparentRatingKey"))) or item.get("grandparentTitle"),item.get("parentIndex"),item.get("index"),int(part.get("size") or 0),int(item.get("updatedAt") or 0),imdb_id,tmdb_id,year))
     changed_records = [record for record in records if previous.get(str(record[0])) != (str(record[1]), int(record[9] or 0), int(record[10] or 0))]
     cleared_reviews = clear_reviewed_for_sync_records(changed_records)
     with connection() as db:
         db.execute("DELETE FROM plex_media")
-        db.executemany("INSERT OR REPLACE INTO plex_media(path,kind,rating_key,library_key,library_name,title,show_title,season_number,episode_number,size,modified) VALUES(?,?,?,?,?,?,?,?,?,?,?)",records)
+        db.executemany("INSERT OR REPLACE INTO plex_media(path,kind,rating_key,library_key,library_name,title,show_title,season_number,episode_number,size,modified,plex_imdb_id,plex_tmdb_id,plex_year) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",records)
         db.execute("UPDATE plex_config SET last_sync = datetime('now') WHERE id=1")
     logger.info("change=plex_catalog_synced libraries=%d media=%d changed=%d reviewed_cleared=%d", len(selected), len(records), len(changed_records), cleared_reviews)
     return {"libraries":len(selected),"media":len(records),"configuration":get_plex_config()}

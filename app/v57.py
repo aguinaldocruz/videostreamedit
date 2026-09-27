@@ -1,12 +1,11 @@
 from __future__ import annotations
 
 import logging
-import shutil
 from pathlib import Path
 
 from app.v11 import connection
 from app.v39 import RefreshMovieIndex
-from app.v54 import cache_folder, index_core
+from app.v54 import index_core
 from app.v55 import app
 
 logger = logging.getLogger("uvicorn.error")
@@ -30,7 +29,5 @@ def refresh_changed_media(payload: RefreshMovieIndex) -> dict:
     with connection() as db:
         db.execute("DELETE FROM subtitle_extended_index WHERE path=?", (payload.path,))
         db.execute("DELETE FROM subtitle_extended_media WHERE path=?", (payload.path,))
-        db.execute("DELETE FROM preview_cache_index WHERE path=?", (payload.path,))
-    shutil.rmtree(cache_folder(payload.path), ignore_errors=True)
-    logger.info("index_event=media_refreshed file=%s core=updated subtitles=invalidated previews=invalidated", payload.path.replace("\n", "\\n"))
+    logger.info("index_event=media_refreshed file=%s core=updated subtitles=invalidated", payload.path.replace("\n", "\\n"))
     return {"indexed": True, "path": payload.path}

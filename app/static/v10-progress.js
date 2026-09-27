@@ -19,9 +19,9 @@ function queuedChangeSummary(){
   for(const[key,value]of Object.entries(current.values)){const initial=editorBaseline.values[key];if(!initial)continue;if(value.removed){if(!initial.removed)remove++;continue}if(value.external&&value.embed!==initial.embed)embed++;if(!value.external||value.embed)for(const field of['language','region','title'])if(value[field]!==initial[field])metadata++}
   for(const type of['audio','subtitle'])if(current.order[type].join('\n')!==editorBaseline.order[type].join('\n'))orders++;
   for(const field of['defaultAudio','forcedAudio','defaultSubtitle','forcedSubtitle'])if(current[field]!==editorBaseline[field])tags++;
-  if(metadata)groups.push(`${metadata} metadata`);if(tags)groups.push(`${tags} tag`);if(orders)groups.push(`${orders} reorder`);if(embed)groups.push(`${embed} embed`);if(remove)groups.push(`${remove} removal`);return groups.join(' · ');
+  if(metadata)groups.push(`${metadata} metadata`);if(tags)groups.push(`${tags} tag`);if(orders)groups.push(`${orders} reorder`);if(embed)groups.push(`${embed} embed`);if(remove)groups.push(`${remove} removal`);const finalButton=$('#stream-final-version');if(finalButton?.dataset.finalPending!==undefined)groups.push(finalButton.dataset.finalPending==='true'?'Final version':'Unfreeze final');return groups.join(' · ');
 }
 
 const progressUpdateQueuedChangeLabels=updateQueuedChangeLabels;
-updateQueuedChangeLabels=function(){progressUpdateQueuedChangeLabels();if(applyProgressBusy)return;const count=queuedChangeCount();setApplyProgress(0,0,count?`${count} change${count===1?'':'s'} queued`:'Ready',count?queuedChangeSummary():'No pending changes')};
+updateQueuedChangeLabels=function(){progressUpdateQueuedChangeLabels();if(applyProgressBusy)return;const count=queuedChangeCount();setApplyProgress(0,0,count?`${count} unapplied change${count===1?'':'s'}`:'Ready',count?queuedChangeSummary():'No pending changes')};
 ensureApplyProgress();setApplyProgress(0,0,'Ready','No pending changes');

@@ -23,18 +23,9 @@ class TrackNameSuggestionRequest(BaseModel):
 
 @app.on_event("startup")
 def initialize_track_name_corrections() -> None:
+    from app.learning_schema import ensure_learning_schema
     with connection() as db:
-        db.executescript("""
-            CREATE TABLE IF NOT EXISTS track_name_correction_history (
-                stream_type TEXT NOT NULL CHECK(stream_type IN ('audio','subtitle')),
-                old_value TEXT NOT NULL, new_value TEXT NOT NULL,
-                use_count INTEGER NOT NULL DEFAULT 1,
-                last_used TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY(stream_type, old_value, new_value)
-            );
-            CREATE INDEX IF NOT EXISTS track_name_correction_lookup
-                ON track_name_correction_history(stream_type, old_value, use_count DESC);
-        """)
+        ensure_learning_schema(db)
 
 
 def existing_track_names(request: media_editor.ReorderEditRequest) -> dict[tuple[str, int], str]:

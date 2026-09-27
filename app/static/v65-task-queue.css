@@ -31,3 +31,4 @@
 .dispatcher-request-actions{display:flex;gap:.4rem;margin-top:.35rem}.dispatcher-request-actions button{font-size:.75rem}
 
 .dispatcher-request-metrics{padding:.35rem 0;color:var(--muted);font-size:.78rem}
+.dispatcher-requests-panel>summary{display:flex;justify-content:space-between;align-items:center;gap:.75rem}.dispatcher-requests-panel>summary small{color:var(--muted);font-weight:400}

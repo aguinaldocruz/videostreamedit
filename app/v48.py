@@ -27,12 +27,6 @@ class LearnedSuggestionDelete(BaseModel):
     new_value: str
 
 
-@app.on_event("startup")
-def initialize_learned_suggestion_maintenance() -> None:
-    with connection() as db:
-        columns = {row["name"] for row in db.execute("PRAGMA table_info(track_name_correction_history)")}
-        if "enabled" not in columns:
-            db.execute("ALTER TABLE track_name_correction_history ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1")
 
 
 def learned_suggestions() -> list[dict]:

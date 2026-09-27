@@ -5,6 +5,11 @@ import json
 import logging
 import re
 import subprocess
+import os
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from pathlib import Path
 from typing import Literal
 
@@ -12,7 +17,7 @@ from fastapi import HTTPException, Request
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
-from app.v2 import probe
+from app.v2 import DATA_DIR, probe
 from app.v5 import canonical_language, external_subtitles
 from app.v11 import (
     connection,
@@ -20,13 +25,17 @@ from app.v11 import (
     plex_authorized_file,
     plex_movies,
     plex_tv,
+    plex_request,
+    plex_external_ids,
     sync_plex,
 )
-from app.v16 import STATIC_DIR, app, asset
+from app.v16 import STATIC_DIR, app
 from app.preflight_dispatcher import enqueue_bulk_preflight, register_approval_handler, register_handler
 
 logger = logging.getLogger("videostreamedit")
+_listing_cache: dict[str, tuple[float, object]] = {}
 from app.subtitle_detector_config import SUBTITLE_DETECTOR_VERSION
+from app.plex_secret import decrypt_token, encrypt_token
 
 
 @app.on_event("startup")
@@ -112,6 +121,9 @@ def evaluate_forced_subtitles(request: ForcedEvaluationRequest) -> dict:
     media = plex_authorized_file(request.path)
     from app.v86 import assert_media_editable
     assert_media_editable(str(media))
+    from app.detection_policy import subtitle_assessment, source_stamp, is_final
+    initial_stamp = source_stamp(media)
+    evaluation_cache = {}
     info = probe(media)
     duration = float((info.get("format") or {}).get("duration") or 0)
     subtitles = []
@@ -122,12 +134,14 @@ def evaluate_forced_subtitles(request: ForcedEvaluationRequest) -> dict:
         tags = stream.get("tags") or {}
         codec = str(stream.get("codec_name") or "unknown")
         text = _extract_subtitle_text(media, subtitle_index, codec)
+        evaluation_cache[('embedded', subtitle_index)] = text
         metrics = _subtitle_metrics(text, duration)
         sdh_label, sdh_confidence, sdh_evidence = analyze_sdh(text)
         allowed = {value.casefold().split("-", 1)[0].split("_", 1)[0] for value in common_detection_languages()}
         detected_language, language_confidence, language_evidence = detect_common_variant(text, allowed) if text else ("", 0.0, "")
         language_confidence = calibrate_subtitle_confidence(language_confidence, int(metrics.get("cues") or 0), len(re.sub(r"\s+", " ", text).strip()), float(metrics.get("coverage") or 0.0))
         quality_issue = subtitle_quality_issue(text, damage_kind(text))
+        detected_language, language_confidence, language_evidence, assessment = subtitle_assessment(text, codec, tags.get('language'), '', allowed)
         subtitles.append({"detected_language": detected_language, "language_confidence": language_confidence, "language_evidence": language_evidence, "quality_issue": quality_issue, "evidence_sample": normalized_evidence_sample(text), "source": "embedded", "type_index": subtitle_index, "codec": codec, "language": tags.get("language") or "", "title": tags.get("title") or "", "forced": bool((stream.get("disposition") or {}).get("forced")), "default": bool((stream.get("disposition") or {}).get("default")), "sdh_label": sdh_label, "sdh_confidence": sdh_confidence, "sdh_evidence": sdh_evidence, **metrics})
         subtitle_index += 1
     for item in external_subtitles(media):
@@ -143,6 +157,13 @@ def evaluate_forced_subtitles(request: ForcedEvaluationRequest) -> dict:
         language_confidence = calibrate_subtitle_confidence(language_confidence, int(metrics.get("cues") or 0), len(re.sub(r"\s+", " ", text).strip()), float(metrics.get("coverage") or 0.0))
         quality_issue = subtitle_quality_issue(text, damage_kind(text))
         subtitles.append({"detected_language": detected_language, "language_confidence": language_confidence, "language_evidence": language_evidence, "quality_issue": quality_issue, "evidence_sample": normalized_evidence_sample(text), "source": "external", "path": str(path), "codec": path.suffix.lstrip(".") or "unknown", "language": item.get("language") or "", "title": item.get("title") or path.name, "forced": bool(item.get("forced")), "default": bool(item.get("default")), "sdh_label": sdh_label, "sdh_confidence": sdh_confidence, "sdh_evidence": sdh_evidence, **metrics})
+        evaluation_cache[('external', str(path))] = (text, '')
+        detected_language, language_confidence, language_evidence, assessment = subtitle_assessment(text, path.suffix.lstrip('.'), item.get('language'), item.get('region'), allowed)
+        subtitles[-1].update(detected_language=detected_language, language_confidence=language_confidence, language_evidence=language_evidence)
+    if is_final(str(media)) or source_stamp(media) != initial_stamp:
+        raise HTTPException(409, 'Media changed or became Final Version during evaluation; results discarded')
+    from app.v79 import inspect_portuguese_language
+    inspect_portuguese_language(str(media), text_cache=evaluation_cache)
     text_items = [item for item in subtitles if item["text_available"]]
     for item in subtitles:
         if item.get("quality_issue"):
@@ -195,6 +216,10 @@ def video_titles(request: VideoTitleRequest) -> dict:
 
 @app.post("/api/v19/video-title/edit")
 def edit_video_title(request: VideoTitleEditRequest) -> dict:
+    # Video-track title edits are media mutations too; Final Version is a
+    # hard view-only lock shared by the stream editor and report actions.
+    from app.v86 import assert_media_editable
+    assert_media_editable(request.path)
     path = plex_authorized_file(request.path)
     if path.suffix.lower() not in {".mkv", ".mka", ".mks", ".mk3d"}:
         raise HTTPException(422, "Video track title editing currently requires a Matroska file")
@@ -246,9 +271,15 @@ def sync_plex_with_title_aliases() -> dict:
     return result
 
 
-def aliases_by_path() -> dict[str, list[str]]:
+def aliases_by_path(paths: set[str] | None = None) -> dict[str, list[str]]:
     with connection() as db:
-        rows = db.execute("SELECT path,alternatives FROM plex_title_aliases").fetchall()
+        query = "SELECT path,alternatives FROM plex_title_aliases"
+        args: list[str] = []
+        if paths:
+            marks = ",".join("?" for _ in paths)
+            query += f" WHERE path IN ({marks})"
+            args.extend(paths)
+        rows = db.execute(query, args).fetchall()
     return {row["path"]: json.loads(row["alternatives"]) for row in rows}
 
 
@@ -301,16 +332,21 @@ def queued_change_summary(task_type: str, label: str, payload_json: str) -> str:
     return label or task_type.replace("_", " ").title()
 
 
-def change_requests_by_path() -> dict[str, list[dict]]:
+def change_requests_by_path(paths: set[str] | None = None) -> dict[str, list[dict]]:
     with connection() as db:
-        exists = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='media_change_request'").fetchone()
+        exists = db.execute("SELECT 1 FROM information_schema.tables WHERE table_schema=current_schema() AND table_name='media_change_request'").fetchone()
         if not exists:
             return {}
-        rows = db.execute(
-            """SELECT marker.path,queue.id,queue.status,queue.task_type,queue.label,queue.payload_json,marker.requested_at
+        query = """SELECT marker.path,queue.id,queue.status,queue.task_type,queue.label,queue.payload_json,marker.requested_at
                  FROM media_change_request marker JOIN task_queue queue ON queue.id=marker.task_id
-                WHERE queue.status IN ('pending','running','failed') ORDER BY queue.id"""
-        ).fetchall()
+                WHERE queue.status IN ('pending','running','failed')"""
+        args: list[str] = []
+        if paths:
+            marks = ",".join("?" for _ in paths)
+            query += f" AND marker.path IN ({marks})"
+            args.extend(paths)
+        query += " ORDER BY queue.id"
+        rows = db.execute(query, args).fetchall()
     result: dict[str, list[dict]] = {}
     for row in rows:
         result.setdefault(row["path"], []).append({
@@ -325,13 +361,12 @@ def change_requested_paths() -> set[str]:
 
 
 def report_blocked_paths() -> set[str]:
-    """Return media temporarily hidden from reports while work is active.
+    """Return media hidden from actionable reports.
 
-    Report rows must disappear as soon as a media edit, preflight, index, or
-    dependent task is queued/running. Once all work finishes, this set no
-    longer contains the path and the report naturally re-evaluates its current
-    indexed state. Failed tasks are intentionally not blocked so the finding
-    can be reviewed or retried.
+    Pending edits and preflight work are hidden immediately. Final Version
+    media are also hidden permanently until the user explicitly unfreezes them;
+    they remain indexed and browseable outside report views. Failed tasks are
+    intentionally not blocked so a finding can be reviewed or retried.
     """
     blocked: set[str] = set()
 
@@ -360,9 +395,6 @@ def report_blocked_paths() -> set[str]:
                 collect(json.loads(row["payload_json"] or "{}"))
             except (TypeError, ValueError, json.JSONDecodeError):
                 pass
-        for row in db.execute("SELECT path FROM index_task_queue WHERE status IN ('pending','running')").fetchall():
-            if row["path"]:
-                blocked.add(str(row["path"]))
         # Cover queue rows created by older callers that did not insert a
         # media_change_request marker yet.
         for row in db.execute("SELECT payload_json FROM task_queue WHERE status IN ('pending','running')").fetchall():
@@ -370,17 +402,44 @@ def report_blocked_paths() -> set[str]:
                 collect(json.loads(row["payload_json"] or "{}"))
             except (TypeError, ValueError, json.JSONDecodeError):
                 pass
+        # Final Version media remain indexed and viewable, but are excluded from actionable reports.
+        final_notes = db.execute("SELECT entity_type,entity_key FROM media_notes WHERE final_version=1").fetchall()
+        final_entities = {(str(row["entity_type"]), str(row["entity_key"])) for row in final_notes}
+        for row in db.execute("SELECT path,kind,library_key,show_title FROM plex_media WHERE kind IN ('movie','episode')").fetchall():
+            path = str(row["path"])
+            if row["kind"] == "movie":
+                if ("movie", path) in final_entities:
+                    blocked.add(path)
+                continue
+            if ("tv", "episode:" + path) in final_entities:
+                blocked.add(path)
+                continue
+            parent_key = f"{row['library_key']}:{row['show_title'] or 'Unknown show'}"
+            if ("tv", parent_key) in final_entities:
+                blocked.add(path)
     return blocked
 
 
-def audio_detection_by_path() -> dict[str, dict]:
+def audio_detection_by_path(paths: set[str] | None = None) -> dict[str, dict]:
+    if paths is not None and not paths:
+        return {}
+    from app.detection_policy import final_paths, language_matches
+    excluded = final_paths(paths)
     with connection() as db:
         try:
-            rows = db.execute("SELECT path,metadata_language,detected_language,confidence FROM audio_language_detection WHERE mismatch=1").fetchall()
+            query = "SELECT d.path,d.metadata_language,d.detected_language,d.confidence,s.language AS current_language,s.region AS current_region FROM audio_language_detection d JOIN media_stream_index s ON s.path=d.path AND s.stream_type='audio' AND s.source='embedded' AND s.type_index=d.type_index WHERE d.mismatch=1"
+            args: list[str] = []
+            if paths:
+                marks = ",".join("?" for _ in paths)
+                query += f" AND d.path IN ({marks})"
+                args.extend(paths)
+            rows = db.execute(query, args).fetchall()
         except Exception:
             return {}
     result = {}
     for row in rows:
+        if row['path'] in excluded or language_matches(row['detected_language'], row['current_language'], row['current_region']): continue
+        if not language_matches(row['metadata_language'], row['current_language'], row['current_region']): continue
         item = {"confidence": float(row["confidence"]), "metadata_language": str(row["metadata_language"] or ""), "detected_language": str(row["detected_language"] or "")}
         current = result.get(str(row["path"]))
         if current is None or item["confidence"] > current["confidence"]:
@@ -388,20 +447,51 @@ def audio_detection_by_path() -> dict[str, dict]:
     return result
 
 
-def subtitle_detection_by_path() -> dict[str, dict]:
-    """Aggregate mismatch and no-confidence subtitle findings per media path."""
+def _canonical_detection_value(language: str, region: str = "") -> tuple[str, str]:
+    from app.detection_policy import language_key
+    return language_key(language, region)
+
+
+
+def _detection_row_current(row) -> bool:
+    current_language = row["current_language"] if "current_language" in row.keys() else None
+    if current_language is None:
+        return False
+    current = _canonical_detection_value(current_language, row["current_region"] or "")
+    stored = _canonical_detection_value(row["metadata_language"] or "", row["metadata_region"] or "")
+    return current == stored
+
+
+def subtitle_detection_by_path(paths: set[str] | None = None) -> dict[str, dict]:
+    """Aggregate mismatch and no-confidence subtitle findings per media path, ignoring stale metadata rows."""
+    if paths is not None and not paths:
+        return {}
+    from app.detection_policy import final_paths, language_matches
+    excluded = final_paths(paths)
     with connection() as db:
-        rows = db.execute(
-            "SELECT path,metadata_language,detected_language,confidence,analysis_status FROM portuguese_language_detection"
-        ).fetchall()
+        query = "SELECT d.path,d.source,d.type_index,d.external_path,d.metadata_language,d.metadata_region,d.detected_language,d.confidence,d.analysis_status,s.language AS current_language,s.region AS current_region FROM portuguese_language_detection d LEFT JOIN media_stream_index s ON s.path=d.path AND s.stream_type IN ('subtitle','external') AND s.source=d.source AND s.type_index=d.type_index AND COALESCE(s.external_path,'')=COALESCE(d.external_path,'')"
+        args: list[str] = []
+        if paths:
+            marks = ",".join("?" for _ in paths)
+            query += f" WHERE d.path IN ({marks})"
+            args.extend(paths)
+        rows = db.execute(query, args).fetchall()
     result: dict[str, dict] = {}
     for row in rows:
+        if row['path'] in excluded: continue
+        if row['analysis_status'] == 'mismatch' and language_matches(row['detected_language'], row['current_language'], row['current_region']): continue
+        if not _detection_row_current(row):
+            continue
+        status = str(row["analysis_status"] or "")
+        if status not in {"mismatch", "no_confidence", "unreadable"}:
+            continue
         path = str(row["path"])
         confidence = float(row["confidence"] or 0)
         detected = str(row["detected_language"] or "")
         item = result.setdefault(path, {
             "confidence": 0.0,
             "metadata_language": "",
+            "metadata_region": "",
             "detected_language": "",
             "no_confidence": False,
         })
@@ -412,6 +502,7 @@ def subtitle_detection_by_path() -> dict[str, dict]:
             item.update({
                 "confidence": confidence,
                 "metadata_language": str(row["metadata_language"] or ""),
+                "metadata_region": str(row["metadata_region"] or ""),
                 "detected_language": detected,
             })
     return result
@@ -419,11 +510,21 @@ def subtitle_detection_by_path() -> dict[str, dict]:
 
 @app.get("/api/v19/movies")
 def plex_movies_with_alternatives() -> list[dict]:
-    aliases = aliases_by_path()
-    requested = change_requests_by_path()
-    audio_detection = audio_detection_by_path()
-    detection = subtitle_detection_by_path()
-    return [{**movie, "alternative_titles": aliases.get(movie["path"], []), "change_requested": movie["path"] in requested, "change_requests": requested.get(movie["path"], []), "portuguese_detection_confidence": (detection.get(str(movie["path"])) or {}).get("confidence"), "portuguese_detection_metadata": (detection.get(str(movie["path"])) or {}).get("metadata_language"), "portuguese_detection_language": (detection.get(str(movie["path"])) or {}).get("detected_language"), "portuguese_detection_no_confidence": bool((detection.get(str(movie["path"])) or {}).get("no_confidence")), "audio_detection_confidence": (audio_detection.get(str(movie["path"])) or {}).get("confidence"), "audio_detection_metadata": (audio_detection.get(str(movie["path"])) or {}).get("metadata_language"), "audio_detection_language": (audio_detection.get(str(movie["path"])) or {}).get("detected_language")} for movie in plex_movies()]
+    cached = _listing_cache.get("movies")
+    if cached and time.monotonic() - cached[0] < 2.0:
+        return cached[1]  # type: ignore[return-value]
+    # Scope every enrichment query to the movie catalog. The previous version
+    # scanned detection/change rows for TV episodes as well, making a simple
+    # movie-list refresh compete with long subtitle jobs.
+    movies = plex_movies()
+    paths = {str(movie["path"]) for movie in movies}
+    aliases = aliases_by_path(paths)
+    requested = change_requests_by_path(paths)
+    audio_detection = audio_detection_by_path(paths)
+    detection = subtitle_detection_by_path(paths)
+    result = [{**movie, "alternative_titles": aliases.get(movie["path"], []), "change_requested": movie["path"] in requested, "change_requests": requested.get(movie["path"], []), "portuguese_detection_confidence": (detection.get(str(movie["path"])) or {}).get("confidence"), "portuguese_detection_metadata": (detection.get(str(movie["path"])) or {}).get("metadata_language"), "portuguese_detection_region": (detection.get(str(movie["path"])) or {}).get("metadata_region"), "portuguese_detection_language": (detection.get(str(movie["path"])) or {}).get("detected_language"), "portuguese_detection_no_confidence": bool((detection.get(str(movie["path"])) or {}).get("no_confidence")), "audio_detection_confidence": (audio_detection.get(str(movie["path"])) or {}).get("confidence"), "audio_detection_metadata": (audio_detection.get(str(movie["path"])) or {}).get("metadata_language"), "audio_detection_language": (audio_detection.get(str(movie["path"])) or {}).get("detected_language")} for movie in movies]
+    _listing_cache["movies"] = (time.monotonic(), result)
+    return result
 
 
 
@@ -432,29 +533,16 @@ def _tv_summary_payload() -> list[dict]:
     with connection() as db:
         rows = db.execute("SELECT library_key,library_name,show_title,count(*) AS episode_count FROM plex_media WHERE kind='episode' GROUP BY library_key,library_name,show_title ORDER BY show_title COLLATE NOCASE").fetchall()
         path_rows = db.execute("SELECT library_key,show_title,path FROM plex_media WHERE kind='episode'").fetchall()
-        note_rows = db.execute("SELECT entity_key,note,reviewed,plex_sync_change FROM media_notes WHERE entity_type='tv'").fetchall()
+        note_rows = db.execute("SELECT entity_key,note,reviewed,plex_sync_change,final_version FROM media_notes WHERE entity_type='tv'").fetchall()
         busy_paths = {str(row['path']) for row in db.execute("SELECT DISTINCT path FROM index_task_queue WHERE status IN ('pending','running','failed')").fetchall()}
-        detection_rows = db.execute("SELECT path,metadata_language,detected_language,confidence,analysis_status FROM portuguese_language_detection").fetchall()
-        audio_rows = db.execute("SELECT path,metadata_language,detected_language,confidence FROM audio_language_detection WHERE mismatch=1").fetchall()
     notes = {str(row['entity_key']): row for row in note_rows}
     paths_by_key: dict[str, list[str]] = {}
     for row in path_rows:
         key = f"{row['library_key']}:{row['show_title'] or 'Unknown show'}"
         paths_by_key.setdefault(key, []).append(str(row['path']))
-    def strongest(rows):
-        result = {}
-        for row in rows:
-            path = str(row['path'])
-            value = float(row['confidence'] or 0)
-            if path not in result or value > result[path]['confidence']:
-                result[path] = {'confidence': value, 'metadata_language': str(row['metadata_language'] or ''), 'detected_language': str(row['detected_language'] or ''), 'no_confidence': False}
-            keys = row.keys() if hasattr(row, 'keys') else ()
-            status = str(row['analysis_status'] or '') if 'analysis_status' in keys else ''
-            if status in {'no_confidence', 'unreadable'}:
-                result.setdefault(path, {'confidence': 0.0, 'metadata_language': '', 'detected_language': '', 'no_confidence': False})['no_confidence'] = True
-        return result
-    detections = strongest(detection_rows)
-    audio_detections = strongest(audio_rows)
+    scoped_paths = {path for paths in paths_by_key.values() for path in paths}
+    detections = subtitle_detection_by_path(scoped_paths)
+    audio_detections = audio_detection_by_path(scoped_paths)
     result = []
     for row in rows:
         key = f"{row['library_key']}:{row['show_title'] or 'Unknown show'}"
@@ -475,46 +563,71 @@ def _tv_summary_payload() -> list[dict]:
 
 @app.get("/api/v19/tv/summary")
 def tv_summary_read_model() -> list[dict]:
-    return _tv_summary_payload()
+    cached = _listing_cache.get("tv-summary")
+    if cached and time.monotonic() - cached[0] < 2.0:
+        return cached[1]  # type: ignore[return-value]
+    result = _tv_summary_payload()
+    _listing_cache["tv-summary"] = (time.monotonic(), result)
+    return result
 @app.get("/api/v19/tv")
 def plex_tv_with_alternatives(show_id: str | None = None) -> list[dict]:
-    aliases = aliases_by_path()
-    requested = change_requests_by_path()
     shows = plex_tv(show_id)
-    audio_detection = audio_detection_by_path()
+    # Selected-show browsing is the hot path. Restrict enrichment queries to
+    # its episodes instead of scanning every detection, alias, and task row.
+    selected_paths = {
+        str(episode["path"])
+        for show in shows
+        for season in show["seasons"]
+        for episode in season["episodes"]
+    }
+    scoped = selected_paths if show_id else None
+    aliases = aliases_by_path(scoped)
+    requested = change_requests_by_path(scoped)
+    audio_detection = audio_detection_by_path(scoped)
     # Index activity is derived from the live queue, so the filter remains useful
     # while a long-running core/subtitle/preview index is in progress.
     with connection() as db:
-        busy_paths = {
-            str(row["path"])
-            for row in db.execute(
-                "SELECT DISTINCT path FROM index_task_queue WHERE status IN ('pending','running','failed')"
-            ).fetchall()
-        }
+        busy_query = "SELECT DISTINCT path FROM index_task_queue WHERE status IN ('pending','running','failed')"
+        busy_args: list[str] = []
+        if scoped:
+            marks = ",".join("?" for _ in selected_paths)
+            busy_query += f" AND path IN ({marks})"
+            busy_args.extend(scoped)
+        busy_paths = {str(row["path"]) for row in db.execute(busy_query, busy_args).fetchall()}
         # Use already indexed audio/subtitle streams only. Listing must not probe
         # episode files, especially for large shows. Video metadata rows are
         # deliberately excluded; external sidecars count as subtitle streams.
-        detection = subtitle_detection_by_path()
+        detection = subtitle_detection_by_path(scoped)
+        stream_query = (
+            "SELECT path, "
+            "SUM(CASE WHEN stream_type='audio' THEN 1 ELSE 0 END) AS audio_count, "
+            "SUM(CASE WHEN stream_type='subtitle' THEN 1 ELSE 0 END) AS subtitle_count, "
+            "SUM(CASE WHEN stream_type='external' THEN 1 ELSE 0 END) AS external_count "
+            "FROM media_stream_index WHERE stream_type IN ('audio','subtitle','external')"
+        )
+        stream_args: list[str] = []
+        if scoped:
+            marks = ",".join("?" for _ in selected_paths)
+            stream_query += f" AND path IN ({marks})"
+            stream_args.extend(scoped)
+        stream_query += " GROUP BY path"
         stream_counts = {
             str(row["path"]): {
                 "audio": int(row["audio_count"] or 0),
                 "subtitle": int(row["subtitle_count"] or 0),
                 "external": int(row["external_count"] or 0),
             }
-            for row in db.execute(
-                "SELECT path, "
-                "SUM(CASE WHEN stream_type='audio' THEN 1 ELSE 0 END) AS audio_count, "
-                "SUM(CASE WHEN stream_type='subtitle' THEN 1 ELSE 0 END) AS subtitle_count, "
-                "SUM(CASE WHEN stream_type='external' THEN 1 ELSE 0 END) AS external_count "
-                "FROM media_stream_index WHERE stream_type IN ('audio','subtitle','external') GROUP BY path"
-            ).fetchall()
+            for row in db.execute(stream_query, stream_args).fetchall()
         }
+        note_rows = db.execute("SELECT entity_key,final_version FROM media_notes WHERE entity_type='tv'").fetchall()
+    notes = {str(row["entity_key"]): row for row in note_rows}
     for show in shows:
         paths = [episode["path"] for season in show["seasons"] for episode in season["episodes"]]
         show["index_busy"] = any(path in busy_paths for path in paths)
         show["portuguese_detection_confidence"] = max((detection[path]["confidence"] for path in paths if path in detection), default=None)
         top_detection = max((detection[path] for path in paths if path in detection), key=lambda item: item["confidence"], default=None)
         show["portuguese_detection_metadata"] = top_detection["metadata_language"] if top_detection else None
+        show["portuguese_detection_region"] = top_detection.get("metadata_region") if top_detection else None
         show["portuguese_detection_language"] = top_detection["detected_language"] if top_detection else None
         show["portuguese_detection_no_confidence"] = any(bool(detection[path].get("no_confidence")) for path in paths if path in detection)
         top_audio = max((audio_detection[path] for path in paths if path in audio_detection), key=lambda item: item["confidence"], default=None)
@@ -530,12 +643,16 @@ def plex_tv_with_alternatives(show_id: str | None = None) -> list[dict]:
                 episode_detection = detection.get(episode["path"]) or {}
                 episode["portuguese_detection_confidence"] = episode_detection.get("confidence")
                 episode["portuguese_detection_metadata"] = episode_detection.get("metadata_language")
+                episode["portuguese_detection_region"] = episode_detection.get("metadata_region")
                 episode["portuguese_detection_language"] = episode_detection.get("detected_language")
                 episode["portuguese_detection_no_confidence"] = bool(episode_detection.get("no_confidence"))
                 audio_episode = audio_detection.get(episode["path"]) or {}
                 episode["audio_detection_confidence"] = audio_episode.get("confidence")
                 episode["audio_detection_metadata"] = audio_episode.get("metadata_language")
                 episode["audio_detection_language"] = audio_episode.get("detected_language")
+                episode_note = notes.get("episode:" + str(episode["path"]))
+                show_note = notes.get(str(show.get("id") or ""))
+                episode["final_version"] = bool((episode_note and episode_note["final_version"]) or (show_note and show_note["final_version"]))
     return shows
 
 
@@ -543,6 +660,13 @@ IMAGE_SUBTITLE_CODECS = (
     "dvd_subtitle", "dvb_subtitle", "hdmv_pgs_subtitle", "pgssub", "pgs",
     "vobsub", "xsub", "sup", "idx", "s_hdmv/pgs", "s_vobsub", "s_dvbsub",
 )
+
+
+def _report_episode_label(row) -> str:
+    """Keep SQL-backed TV report rows identifiable even when episode titles repeat."""
+    season = int(row.get("season_number") or 0)
+    episode = int(row.get("episode_number") or 0)
+    return f"S{season:02d}E{episode:02d} · {row.get('title') or Path(str(row.get('path') or '')).stem}"
 
 
 @app.get("/api/v19/reports/image-subtitles")
@@ -558,7 +682,7 @@ def image_subtitle_report(kind: str) -> dict:
             "ORDER BY path,type_index,external_path",
             IMAGE_SUBTITLE_CODECS,
         ).fetchall()
-    rows = [row for row in rows if str(row["path"]) not in blocked_paths]
+    rows = [row for row in rows if _detection_row_current(row) and str(row["path"]) not in blocked_paths]
     active_paths = set()
     with connection() as db:
         active = db.execute("SELECT payload_json FROM preflight_requests WHERE operation_type=? AND status IN ('pending','running')", ("image_subtitle_convert_bulk",)).fetchall()
@@ -603,6 +727,10 @@ def image_subtitle_report(kind: str) -> dict:
                     "root_name": str(show.get("root_name") or ""),
                     "media_count": match_count,
                     "image_subtitle_count": subtitle_count,
+                    "episodes": [{"path": str(episode["path"]), "episode": episode.get("name") or Path(episode["path"]).stem,
+                                  "media_count": 1, "image_subtitle_count": len(refs_by_path[str(episode["path"])]),
+                                  "streams": refs_by_path[str(episode["path"])]}
+                                 for season in show["seasons"] for episode in season["episodes"] if str(episode["path"]) in refs_by_path],
                     "paths": [episode["path"] for season in show["seasons"] for episode in season["episodes"] if refs_by_path.get(str(episode["path"]))],
                     "streams": [ref for season in show["seasons"] for episode in season["episodes"] for ref in refs_by_path.get(str(episode["path"]), [])],
                 }
@@ -627,20 +755,19 @@ def html_subtitle_report(kind: str) -> dict:
         rows = db.execute(
             "SELECT path,source,type_index,external_path,codec FROM subtitle_extended_index "
             "WHERE markup LIKE ? AND lower(codec) IN (" + placeholders + ") "
-            "AND path NOT IN (SELECT CAST(payload_json AS JSONB)->>'path' FROM task_queue "
-            "WHERE task_type IN ('subtitle_html_cleanup') "
-            "AND status IN ('pending','running')) "
-            "AND path NOT IN (SELECT media_path FROM preflight_requests "
-            "WHERE operation_type='subtitle_html_cleanup' AND status IN ('pending','running')) "
-            "AND path NOT IN (SELECT path FROM index_task_queue WHERE job='subtitles' "
-            "AND status IN ('pending','running')) "
+            "AND NOT EXISTS (SELECT 1 FROM task_queue t "
+            "WHERE t.task_type='subtitle_html_cleanup' AND t.status IN ('pending','running') "
+            "AND CAST(t.payload_json AS JSONB)->>'path'=subtitle_extended_index.path) "
+            "AND NOT EXISTS (SELECT 1 FROM preflight_requests p "
+            "WHERE p.operation_type='subtitle_html_cleanup' AND p.status IN ('pending','running') "
+            "AND p.media_path=subtitle_extended_index.path) "
             "ORDER BY path,type_index,external_path",
             ("%HTML tags%", *text_codecs),
         ).fetchall()
     rows = [row for row in rows if str(row["path"]) not in blocked_paths]
     refs_by_path = {}
     for row in rows:
-        refs_by_path.setdefault(str(row["path"]), []).append({"path": str(row["path"]), "source": row["source"], "type_index": int(row["type_index"]), "external_path": row["external_path"] or "", "codec": row["codec"] or ""})
+        refs_by_path.setdefault(str(row["path"]), []).append({"path": str(row["path"]), "source": row["source"], "type_index": (int(row["type_index"]) if row["type_index"] is not None else -1), "external_path": row["external_path"] or "", "codec": row["codec"] or ""})
     by_path = {path: len(refs) for path, refs in refs_by_path.items()}
     if kind == "movies":
         items = []
@@ -654,7 +781,7 @@ def html_subtitle_report(kind: str) -> dict:
             media_count = sum(1 for season in show["seasons"] for episode in season["episodes"] if by_path.get(str(episode["path"]), 0))
             subtitle_count = sum(by_path.get(str(episode["path"]), 0) for season in show["seasons"] for episode in season["episodes"])
             if media_count:
-                items.append({"title": str(show["name"]), "root_name": str(show.get("root_name") or ""), "media_count": media_count, "html_subtitle_count": subtitle_count, "paths": [episode["path"] for season in show["seasons"] for episode in season["episodes"] if refs_by_path.get(str(episode["path"]))], "streams": [ref for season in show["seasons"] for episode in season["episodes"] for ref in refs_by_path.get(str(episode["path"]), [])]})
+                items.append({"title": str(show["name"]), "root_name": str(show.get("root_name") or ""), "media_count": media_count, "html_subtitle_count": subtitle_count, "episodes": [{"path": str(ep["path"]), "episode": ep.get("name") or Path(ep["path"]).stem, "media_count": 1, "html_subtitle_count": len(refs_by_path[str(ep["path"])]), "streams": refs_by_path[str(ep["path"])]} for season in show["seasons"] for ep in season["episodes"] if str(ep["path"]) in refs_by_path], "paths": [episode["path"] for season in show["seasons"] for episode in season["episodes"] if refs_by_path.get(str(episode["path"]))], "streams": [ref for season in show["seasons"] for episode in season["episodes"] for ref in refs_by_path.get(str(episode["path"]), [])]})
     items.sort(key=lambda item: item["title"].casefold())
     return {"kind": kind, "items": items, "title_count": len(items), "media_count": sum(item["media_count"] for item in items)}
 
@@ -680,7 +807,7 @@ def damaged_subtitle_report(kind: str) -> dict:
     for row in rows:
         refs_by_path.setdefault(str(row["path"]), []).append({
             "path": str(row["path"]), "source": row["source"],
-            "type_index": int(row["type_index"]), "external_path": row["external_path"] or "",
+            "type_index": (int(row["type_index"]) if row["type_index"] is not None else -1), "external_path": row["external_path"] or "",
             "codec": row["codec"] or "", "damage": row["damage"] or "",
         })
     if kind == "movies":
@@ -762,7 +889,7 @@ def queue_report_subtitle_action(request: ReportSubtitleActionRequest) -> dict:
             continue
         seen.add(key)
         if request.action == "html_cleanup":
-            payload = {"path": path, "type_index": type_index if source != "external" else None, "external_path": external_path or None}
+            payload = {"path": path, "type_index": type_index if source != "external" else None, "external_path": external_path or None, "_report_html_verified": True}
             html_items.append(payload)
             continue
         language = str(raw.get("language") or "").strip()
@@ -791,17 +918,18 @@ def portuguese_language_report(kind: str) -> dict:
     blocked_paths = report_blocked_paths()
     with connection() as db:
         rows = db.execute(
-            "SELECT d.path,d.source,d.type_index,d.external_path,d.metadata_language,d.detected_language,d.confidence,d.metadata_region,d.evidence,d.sdh_label,d.sdh_confidence,d.sdh_evidence,d.evidence_sample,d.analysis_status,d.analysis_reason,d.cue_count,d.text_chars,d.text_coverage,d.markup_count,d.damage "
-            "FROM portuguese_language_detection d JOIN plex_media p ON p.path=d.path "
-            "WHERE d.detector_version>=? AND d.confidence>=0.60 "
+            "SELECT d.path,d.source,d.type_index,d.external_path,d.metadata_language,d.detected_language,d.confidence,d.metadata_region,d.evidence,d.sdh_label,d.sdh_confidence,d.sdh_evidence,d.evidence_sample,d.analysis_status,d.analysis_reason,d.cue_count,d.text_chars,d.text_coverage,d.markup_count,d.damage,s.language AS current_language,s.region AS current_region "
+            "FROM portuguese_language_detection d JOIN plex_media p ON p.path=d.path LEFT JOIN media_stream_index s ON s.path=d.path AND s.stream_type IN ('subtitle','external') AND s.source=d.source AND s.type_index=d.type_index AND COALESCE(s.external_path,'')=COALESCE(d.external_path,'') "
+            "WHERE d.detector_version>=? AND d.confidence>=0.60 AND d.analysis_status='mismatch' "
             "AND ((?='movies' AND p.kind='movie') OR (?='tv' AND p.kind='episode')) "
             "AND d.path NOT IN (SELECT path FROM index_task_queue WHERE status IN ('pending','running')) ORDER BY d.path",
             (SUBTITLE_DETECTOR_VERSION, kind, kind),
         ).fetchall()
-    rows = [row for row in rows if str(row["path"]) not in blocked_paths]
+    from app.detection_policy import language_matches
+    rows = [row for row in rows if str(row["path"]) not in blocked_paths and _detection_row_current(row) and not language_matches(row['detected_language'], row['current_language'], row['current_region'])]
     by_path = {}
     for row in rows:
-        by_path.setdefault(str(row["path"]), []).append({"source": row["source"], "type_index": int(row["type_index"]), "external_path": row["external_path"], "metadata_language": row["metadata_language"], "metadata_region": row["metadata_region"], "detected_language": row["detected_language"], "confidence": round(float(row["confidence"]) * 100, 1), "evidence": row["evidence"], "evidence_sample": row["evidence_sample"] or "", "analysis_status": row["analysis_status"] or "mismatch", "analysis_reason": row["analysis_reason"] or "", "cue_count": int(row["cue_count"] or 0), "text_chars": int(row["text_chars"] or 0), "text_coverage": round(float(row["text_coverage"] or 0) * 100, 1), "markup_count": int(row["markup_count"] or 0), "damage": row["damage"] or "", "sdh_label": row["sdh_label"] or "", "sdh_confidence": round(float(row["sdh_confidence"] or 0) * 100, 1), "sdh_evidence": row["sdh_evidence"] or ""})
+        by_path.setdefault(str(row["path"]), []).append({"source": row["source"], "type_index": (int(row["type_index"]) if row["type_index"] is not None else -1), "external_path": row["external_path"], "metadata_language": row["metadata_language"], "metadata_region": row["metadata_region"], "detected_language": row["detected_language"], "confidence": round(float(row["confidence"]) * 100, 1), "evidence": row["evidence"], "evidence_sample": row["evidence_sample"] or "", "analysis_status": row["analysis_status"] or "mismatch", "analysis_reason": row["analysis_reason"] or "", "cue_count": int(row["cue_count"] or 0), "text_chars": int(row["text_chars"] or 0), "text_coverage": round(float(row["text_coverage"] or 0) * 100, 1), "markup_count": int(row["markup_count"] or 0), "damage": row["damage"] or "", "sdh_label": row["sdh_label"] or "", "sdh_confidence": round(float(row["sdh_confidence"] or 0) * 100, 1), "sdh_evidence": row["sdh_evidence"] or ""})
     items = []
     if kind == "movies":
         for movie in plex_movies():
@@ -852,14 +980,14 @@ def subtitle_no_confidence_report(kind: str, status: str | None = None, reason: 
         params.append(f"%{reason.strip()}%")
     with connection() as db:
         rows = db.execute(
-            "SELECT d.path,d.source,d.type_index,d.external_path,d.metadata_language,d.metadata_region,d.analysis_status,d.analysis_reason,d.confidence,d.cue_count,d.text_chars,d.text_coverage,d.markup_count,d.damage,d.evidence_sample,p.title,p.show_title,p.kind "
-            "FROM portuguese_language_detection d JOIN plex_media p ON p.path=d.path WHERE " + " AND ".join(clauses) + " ORDER BY p.title COLLATE NOCASE,d.path,d.type_index",
+            "SELECT d.path,d.source,d.type_index,d.external_path,d.metadata_language,d.metadata_region,d.analysis_status,d.analysis_reason,d.confidence,d.cue_count,d.text_chars,d.text_coverage,d.markup_count,d.damage,d.evidence_sample,p.title,p.show_title,p.kind,s.language AS current_language,s.region AS current_region "
+            "FROM portuguese_language_detection d JOIN plex_media p ON p.path=d.path JOIN media_stream_index s ON s.path=d.path AND s.stream_type IN ('subtitle','external') AND s.source=d.source AND s.type_index=d.type_index AND COALESCE(s.external_path,'')=COALESCE(d.external_path,'') WHERE " + " AND ".join(clauses) + " ORDER BY p.title COLLATE NOCASE,d.path,d.type_index",
             params,
         ).fetchall()
-    rows = [row for row in rows if str(row["path"]) not in blocked_paths]
+    rows = [row for row in rows if str(row["path"]) not in blocked_paths and _detection_row_current(row)]
     items = []
     for row in rows:
-        items.append({"path": str(row["path"]), "title": str(row["title"] or Path(str(row["path"])).stem), "show_title": str(row["show_title"] or ""), "source": row["source"], "type_index": int(row["type_index"]), "external_path": row["external_path"] or "", "metadata_language": row["metadata_language"] or "", "metadata_region": row["metadata_region"] or "", "status": row["analysis_status"], "reason": row["analysis_reason"] or "", "confidence": round(float(row["confidence"] or 0) * 100, 1), "cue_count": int(row["cue_count"] or 0), "text_chars": int(row["text_chars"] or 0), "text_coverage": round(float(row["text_coverage"] or 0) * 100, 1), "markup_count": int(row["markup_count"] or 0), "damage": row["damage"] or "", "evidence_sample": row["evidence_sample"] or ""})
+        items.append({"path": str(row["path"]), "title": str(row["title"] or Path(str(row["path"])).stem), "show_title": str(row["show_title"] or ""), "source": row["source"], "type_index": (int(row["type_index"]) if row["type_index"] is not None else -1), "external_path": row["external_path"] or "", "metadata_language": row["metadata_language"] or "", "metadata_region": row["metadata_region"] or "", "status": row["analysis_status"], "reason": row["analysis_reason"] or "", "confidence": round(float(row["confidence"] or 0) * 100, 1), "cue_count": int(row["cue_count"] or 0), "text_chars": int(row["text_chars"] or 0), "text_coverage": round(float(row["text_coverage"] or 0) * 100, 1), "markup_count": int(row["markup_count"] or 0), "damage": row["damage"] or "", "evidence_sample": row["evidence_sample"] or ""})
     return {"kind": kind, "status": status, "reason": reason or "", "items": items, "media_count": len({item["path"] for item in items}), "stream_count": len(items)}
 
 
@@ -875,7 +1003,7 @@ def revalidate_subtitle_report(request: SubtitleRevalidateRequest) -> dict:
         if not path or path in seen:
             continue
         seen.add(path)
-        scope = {"subtitle_indices": indices}
+        scope = {"subtitle_indices": indices, "skip_detection": True}
         queued += int(enqueue("subtitles", path, "User revalidated subtitle inspection report", scope) or 0)
     return {"requested": len(seen), "queued": queued}
 
@@ -896,7 +1024,7 @@ def preflight_language_fix(payload: dict, fingerprint: dict) -> dict:
                 index = int(track.get("type_index", -1))
             except (TypeError, ValueError):
                 continue
-            row = db.execute("SELECT d.detected_language,d.confidence,s.language,s.region FROM portuguese_language_detection d LEFT JOIN media_stream_index s ON s.path=d.path AND s.source='embedded' AND s.type_index=d.type_index WHERE d.path=? AND d.source='embedded' AND d.type_index=?", (path, index)).fetchone()
+            row = db.execute("SELECT d.detected_language,d.confidence,s.language,s.region FROM portuguese_language_detection d LEFT JOIN media_stream_index s ON s.path=d.path AND s.stream_type IN ('subtitle','external') AND s.source='embedded' AND s.type_index=d.type_index WHERE d.path=? AND d.source='embedded' AND d.type_index=?", (path, index)).fetchone()
             pair = _detected_language_pair(row["detected_language"] if row else "") if row else None
             if not row or not pair or float(row["confidence"] or 0) < 0.80:
                 continue
@@ -946,7 +1074,7 @@ def fix_portuguese_language_report(request: LanguageDetectionFixRequest) -> dict
         if not _detected_language_pair(row["detected_language"]):
             skipped += 1
             continue
-        grouped.setdefault(str(row["path"]), []).append({"type_index": int(row["type_index"]), "detected_language": str(row["detected_language"] or "")})
+        grouped.setdefault(str(row["path"]), []).append({"type_index": (int(row["type_index"]) if row["type_index"] is not None else -1), "detected_language": str(row["detected_language"] or "")})
     items = [{"path": path, "tracks": tracks} for path, tracks in grouped.items()]
     preflight = enqueue_bulk_preflight("language_detection_fix_bulk", items, mode="queued", priority=60, deduplicate=True) if items else None
     queued_streams = sum(len(item["tracks"]) for item in items)
@@ -1079,6 +1207,540 @@ def forced_stream_report(kind: str) -> dict:
     return {"kind": kind, "items": items, "title_count": len(items), "media_count": sum(item["media_count"] for item in items)}
 
 
+
+@app.get("/api/v19/reports/english-only")
+def english_only_report(kind: str) -> dict:
+    if kind not in {"tv", "movies"}: raise HTTPException(400, "Kind must be tv or movies")
+    blocked=report_blocked_paths()
+    with connection() as db:
+        rows=db.execute("SELECT i.path,i.stream_type,i.language,p.title,p.show_title,p.season_number,p.episode_number FROM media_stream_index i JOIN plex_media p ON p.path=i.path WHERE ((?='movies' AND p.kind='movie') OR (?='tv' AND p.kind='episode')) AND i.stream_type IN ('audio','subtitle','external') AND i.path NOT IN (SELECT path FROM index_task_queue WHERE status IN ('pending','running')) ORDER BY p.show_title,p.season_number,p.episode_number,p.title,i.type_index",(kind,kind)).fetchall()
+    def en(v):
+        c=str(v or '').strip().casefold().replace('_','-')
+        return c in {'en','eng','english'} or c.startswith('en-')
+    groups={}
+    for row in rows:
+        if str(row['path']) in blocked: continue
+        groups.setdefault(str(row['path']),[]).append(dict(row))
+    matches=[]
+    for path,streams in groups.items():
+        audio=[x for x in streams if x['stream_type']=='audio']; subs=[x for x in streams if x['stream_type'] in {'subtitle','external'}]
+        mode='audio_only_english' if audio and not subs and all(en(x.get('language')) for x in audio) else ('subtitle_only_english' if subs and not audio and all(en(x.get('language')) for x in subs) else '')
+        if mode:
+            r=streams[0]; matches.append({'path':path,'title':r.get('title') or Path(path).stem,'show_title':r.get('show_title') or 'Unknown show','season_number':r.get('season_number'),'episode_number':r.get('episode_number'),'mode':mode,'audio_count':len(audio),'subtitle_count':len(subs),'streams':streams})
+    if kind=='movies':
+        items=[{'title':Path(str(x['title'])).stem,'path':x['path'],'media_count':1,'mode':x['mode'],'audio_count':x['audio_count'],'subtitle_count':x['subtitle_count'],'streams':x['streams']} for x in matches]
+    else:
+        grouped={}
+        for x in matches: grouped.setdefault(x['show_title'],[]).append({'episode':_report_episode_label(x),'path':x['path'],'mode':x['mode'],'audio_count':x['audio_count'],'subtitle_count':x['subtitle_count'],'streams':x['streams']})
+        items=[{'title':k,'media_count':len(v),'episodes':sorted(v,key=lambda e:str(e['episode']).casefold())} for k,v in grouped.items()]
+    items.sort(key=lambda x:str(x['title']).casefold())
+    return {'kind':kind,'items':items,'title_count':len(items),'media_count':sum(x.get('media_count',1) for x in items)}
+
+@app.get("/api/v19/reports/audio-only")
+def audio_only_report(kind: str) -> dict:
+    """List indexed media with audio streams and no embedded or external subtitles."""
+    if kind not in {"tv", "movies"}: raise HTTPException(400, "Kind must be tv or movies")
+    blocked_paths=report_blocked_paths()
+    with connection() as db:
+        rows=db.execute("""SELECT i.path,i.stream_type,i.type_index,i.external_path,i.language,i.region,i.track_name,i.codec,
+                                  p.title,p.show_title,p.season_number,p.episode_number,p.kind
+            FROM media_stream_index i JOIN plex_media p ON p.path=i.path
+            WHERE ((?='movies' AND p.kind='movie') OR (?='tv' AND p.kind='episode'))
+              AND i.stream_type IN ('audio','subtitle','external')
+              AND i.path NOT IN (SELECT path FROM index_task_queue WHERE status IN ('pending','running'))
+            ORDER BY p.show_title,p.season_number,p.episode_number,p.title,i.stream_type,i.type_index""",(kind,kind)).fetchall()
+    by_path={}
+    media={}
+    for row in rows:
+        path=str(row["path"])
+        if path in blocked_paths: continue
+        by_path.setdefault(path,[]).append(dict(row)); media[path]=dict(row)
+    eligible={path:v for path,v in by_path.items() if any(x.get("stream_type")=="audio" for x in v) and not any(x.get("stream_type") in {"subtitle","external"} for x in v)}
+    if kind=="movies":
+        items=[]
+        for path,streams in eligible.items():
+            row=media[path]
+            items.append({"title":Path(str(row.get("title") or path)).stem,"path":path,"root_name":row.get("library_name") or "","media_count":1,"audio_count":sum(x.get("stream_type")=="audio" for x in streams),"streams":streams})
+    else:
+        grouped={}
+        for path,streams in eligible.items():
+            row=media[path]; show=str(row.get("show_title") or "Unknown show")
+            grouped.setdefault(show,[]).append({"episode":_report_episode_label(row),"path":path,"audio_count":sum(x.get("stream_type")=="audio" for x in streams),"streams":streams})
+        items=[{"title":show,"root_name":"","media_count":len(eps),"audio_count":sum(e["audio_count"] for e in eps),"episodes":sorted(eps,key=lambda e:str(e["episode"]).casefold())} for show,eps in grouped.items()]
+    items.sort(key=lambda x:x["title"].casefold())
+    return {"kind":kind,"items":items,"title_count":len(items),"media_count":sum(x.get("media_count",1) for x in items),"audio_count":sum(x.get("audio_count",0) for x in items)}
+
+
+@app.get("/api/v19/reports/external-only")
+def external_only_report(kind: str) -> dict:
+    """List media with external subtitles, including media with embedded subtitles."""
+    if kind not in {"tv", "movies"}:
+        raise HTTPException(400, "Kind must be tv or movies")
+    blocked_paths = report_blocked_paths()
+    with connection() as db:
+        rows = db.execute("""SELECT i.path,i.stream_type,i.type_index,i.external_path,i.language,i.region,i.track_name,i.codec,
+                                  p.title,p.show_title,p.season_number,p.episode_number,p.kind
+            FROM media_stream_index i JOIN plex_media p ON p.path=i.path
+            WHERE ((?='movies' AND p.kind='movie') OR (?='tv' AND p.kind='episode'))
+              AND i.stream_type IN ('audio','subtitle','external')
+              AND i.path NOT IN (SELECT path FROM index_task_queue WHERE status IN ('pending','running'))
+            ORDER BY p.show_title,p.season_number,p.episode_number,p.title,i.stream_type,i.type_index""", (kind, kind)).fetchall()
+    by_path = {}
+    media = {}
+    for row in rows:
+        path = str(row["path"])
+        if path in blocked_paths:
+            continue
+        by_path.setdefault(path, []).append(dict(row))
+        media[path] = dict(row)
+    eligible = {
+        path: streams for path, streams in by_path.items()
+        if any(x.get("stream_type") == "external" for x in streams)
+    }
+    if kind == "movies":
+        items = []
+        for path, streams in eligible.items():
+            row = media[path]
+            items.append({"title": Path(str(row.get("title") or path)).stem, "path": path,
+                          "root_name": row.get("library_name") or "", "media_count": 1,
+                          "external_count": sum(x.get("stream_type") == "external" for x in streams),
+                          "streams": streams})
+    else:
+        grouped = {}
+        for path, streams in eligible.items():
+            row = media[path]
+            show = str(row.get("show_title") or "Unknown show")
+            grouped.setdefault(show, []).append({
+                "episode": _report_episode_label(row), "path": path,
+                "external_count": sum(x.get("stream_type") == "external" for x in streams),
+                "streams": streams,
+            })
+        items = [{"title": show, "root_name": "", "media_count": len(eps),
+                  "external_count": sum(e["external_count"] for e in eps),
+                  "episodes": sorted(eps, key=lambda e: str(e["episode"]).casefold())}
+                 for show, eps in grouped.items()]
+    items.sort(key=lambda x: str(x["title"]).casefold())
+    return {"kind": kind, "items": items, "title_count": len(items),
+            "media_count": sum(x.get("media_count", 1) for x in items),
+            "external_count": sum(x.get("external_count", 0) for x in items)}
+
+
+@app.get("/api/v19/reports/video-titles")
+def video_title_report(kind: Literal["movies", "tv"]) -> dict:
+    blocked = report_blocked_paths()
+    with connection() as db:
+        rows = db.execute("""SELECT p.path,p.title,p.show_title,p.season_number,p.episode_number,v.title AS video_title
+            FROM media_video_title v JOIN plex_media p ON p.path=v.path
+            WHERE p.kind=? AND trim(coalesce(v.title,''))<>''
+            AND NOT EXISTS (SELECT 1 FROM index_task_queue q WHERE q.path=p.path AND q.status IN ('pending','running'))
+            ORDER BY p.show_title,p.season_number,p.episode_number,p.title""",
+            ("movie" if kind == "movies" else "episode",)).fetchall()
+    media = [dict(row) for row in rows if row["path"] not in blocked]
+    if kind == "movies":
+        items = [{**row, "media_count": 1} for row in media]
+    else:
+        groups = {}
+        for row in media:
+            groups.setdefault(row["show_title"] or "Unknown show", []).append({**row, "episode": _report_episode_label(row)})
+        items = [{"title": title, "episodes": episodes, "media_count": len(episodes)} for title, episodes in groups.items()]
+    return {"kind": kind, "items": items, "title_count": len(items), "media_count": len(media)}
+
+
+class VideoTitleReportRemoval(BaseModel):
+    kind: Literal["movies", "tv"]
+    paths: list[str] = Field(min_length=1, max_length=30000)
+
+
+@app.post("/api/v19/reports/video-titles/remove")
+def queue_video_title_removal(request: VideoTitleReportRemoval) -> dict:
+    from app.preflight_dispatcher import enqueue_bulk_preflight
+    result = video_title_report(request.kind)
+    eligible = {item["path"] for group in result["items"] for item in (group.get("episodes") or [group])}
+    paths = [path for path in dict.fromkeys(request.paths) if path in eligible]
+    if not paths:
+        return {"queued": 0, "skipped": len(request.paths)}
+    pending = enqueue_bulk_preflight("video_title_cleanup", [{"path": path} for path in paths], mode="queued", priority=80, deduplicate=True)
+    return {"queued": len(paths), "preflight_id": pending["id"]}
+
+
+def validate_video_title_cleanup(payload: dict, fingerprint: dict) -> dict:
+    from app.v86 import assert_media_editable
+    path = plex_authorized_file(payload["path"])
+    assert_media_editable(str(path))
+    if path.suffix.lower() not in {".mkv", ".mka", ".mks", ".mk3d"}:
+        return {"decision": "invalid", "reason": "Video-title removal requires Matroska; conversion is not automatic", "path": str(path)}
+    has_title = any(str((stream.get("tags") or {}).get("title") or "").strip() for stream in probe(path).get("streams", []) if stream.get("codec_type") == "video")
+    return {"decision": "approved" if has_title else "skipped", "reason": "Video stream titles found" if has_title else "Video stream titles already empty", "path": str(path)}
+
+
+def approve_video_title_cleanup(payload: dict, result: dict) -> dict:
+    from app.v65 import enqueue
+    ids = []
+    for item in payload.get("_bulk_items") or []:
+        edit = {"path": item["path"], "clear_video_titles": True,
+                "default_audio": "__preserve__", "forced_audio": "__preserve__",
+                "default_subtitle": "__preserve__", "forced_subtitle": "__preserve__"}
+        job = enqueue("media_edit", {"edit": edit}, f"Remove video stream titles · {Path(item['path']).name}", deduplicate=True)
+        ids.append(job["id"])
+    return {"task_ids": ids, "queued": len(ids), "task_type": "media_edit"}
+
+
+from app.preflight_dispatcher import register_handler, register_approval_handler
+register_handler("video_title_cleanup", validate_video_title_cleanup)
+register_approval_handler("video_title_cleanup", approve_video_title_cleanup)
+
+
+@app.get("/api/v19/reports/availability")
+def report_availability() -> dict:
+    """Summarize indexed findings without building every report or probing files."""
+    keys = ("image", "damaged", "html", "language", "confidence", "duplicate_audio",
+            "duplicate_subtitle", "uncommon", "forced", "audio_only", "english_only", "external_only", "video_titles")
+    found = {key: {"tv": set(), "movies": set()} for key in keys}
+    blocked = report_blocked_paths()
+
+    def mark(key, path, kind):
+        if path not in blocked and kind in {"movie", "episode"}:
+            found[key]["movies" if kind == "movie" else "tv"].add(path)
+
+    common = {value.casefold().replace("_", "-").split("-", 1)[0] for value in _configured_common_languages()}
+    allowed = {kind: set(_duplicate_language_values(kind)) for kind in ("audio", "subtitle")}
+    with connection() as db:
+        pending_rows = db.execute("SELECT path,job FROM index_task_queue WHERE status IN ('pending','running')").fetchall()
+        pending = {str(row["path"]) for row in pending_rows}
+        pending_subtitles = {str(row["path"]) for row in pending_rows if row["job"] == "subtitles"}
+        for row in db.execute("SELECT v.path,p.kind FROM media_video_title v JOIN plex_media p ON p.path=v.path WHERE trim(coalesce(v.title,''))<>''").fetchall():
+            if row["path"] not in pending:
+                mark("video_titles", row["path"], row["kind"])
+        excluded_row = db.execute("SELECT value FROM language_detection_settings WHERE key='forced_report_excluded_track_names'").fetchone()
+        try:
+            excluded = {str(value).strip().casefold() for value in json.loads(excluded_row["value"] or "[]")} if excluded_row else set()
+        except (TypeError, ValueError):
+            excluded = set()
+        marks = ",".join("?" for _ in IMAGE_SUBTITLE_CODECS)
+        for row in db.execute(
+            "SELECT DISTINCT i.path,p.kind FROM media_stream_index i JOIN plex_media p ON p.path=i.path "
+            "WHERE i.stream_type IN ('subtitle','external') AND lower(trim(i.codec)) IN (" + marks + ")",
+            IMAGE_SUBTITLE_CODECS,
+        ).fetchall():
+            mark("image", str(row["path"]), row["kind"])
+        for row in db.execute(
+            "SELECT i.path,p.kind,i.track_name FROM media_stream_index i JOIN plex_media p ON p.path=i.path WHERE i.is_forced=1"
+        ).fetchall():
+            path = str(row["path"])
+            if path not in pending and str(row["track_name"] or "").strip().casefold() not in excluded:
+                mark("forced", path, row["kind"])
+
+        # Read only grouped language counts, not all stream details/filename tags.
+        rows = db.execute(
+            "SELECT i.path,p.kind,i.stream_type,i.language,count(*) AS stream_count "
+            "FROM media_stream_index i JOIN plex_media p ON p.path=i.path "
+            "WHERE p.kind IN ('movie','episode') AND i.stream_type IN ('audio','subtitle','external') "
+            "GROUP BY i.path,p.kind,i.stream_type,i.language"
+        ).fetchall()
+        media = {}
+        for row in rows:
+            path = str(row["path"])
+            if path in blocked or path in pending:
+                continue
+            entry = media.setdefault(path, {"kind": row["kind"], "audio": 0, "subtitle": 0, "external": 0,
+                "non_en_audio": 0, "non_en_subtitle": 0, "uncommon_audio": set(), "uncommon_subtitle": set(),
+                "duplicates": {"audio": {}, "subtitle": {}}})
+            stream_type = str(row["stream_type"])
+            language = str(row["language"] or "").strip()
+            normalized = language.casefold().replace("_", "-")
+            count = int(row["stream_count"])
+            entry[stream_type] += count
+            base_type = "subtitle" if stream_type == "external" else stream_type
+            if normalized not in {"en", "eng", "english"} and not normalized.startswith("en-"):
+                entry["non_en_" + base_type] += count
+            if normalized and normalized != "und" and normalized.split("-", 1)[0] not in common:
+                entry["uncommon_" + base_type].add(language.casefold())
+            if stream_type in allowed:
+                canonical = canonical_language(language)
+                if canonical and (not allowed[stream_type] or canonical in allowed[stream_type]):
+                    counts = entry["duplicates"][stream_type]
+                    counts[canonical] = counts.get(canonical, 0) + count
+
+        suppressions = {(str(row["path"]), str(row["stream_type"]), canonical_language(str(row["language"]))): str(row["fingerprint"])
+                        for row in db.execute("SELECT path,stream_type,language,fingerprint FROM duplicate_language_report_suppressions").fetchall()}
+        # Fetch dismissed groups in one query, avoiding a round-trip for every dismissal.
+        suppressed_streams = {}
+        if suppressions:
+            for row in db.execute(
+                "SELECT i.path,i.stream_type,i.source,i.type_index,i.external_path,i.codec,i.language,i.region,i.track_name "
+                "FROM media_stream_index i WHERE EXISTS (SELECT 1 FROM duplicate_language_report_suppressions s "
+                "WHERE s.path=i.path AND s.stream_type=i.stream_type)"
+            ).fetchall():
+                key = (str(row["path"]), str(row["stream_type"]), canonical_language(str(row["language"] or "")))
+                suppressed_streams.setdefault(key, []).append(dict(row))
+        for path, entry in media.items():
+            kind = entry["kind"]
+            subs = entry["subtitle"] + entry["external"]
+            if entry["audio"] and not subs:
+                mark("audio_only", path, kind)
+            if (entry["audio"] and not subs and not entry["non_en_audio"]) or (subs and not entry["audio"] and not entry["non_en_subtitle"]):
+                mark("english_only", path, kind)
+            if entry["external"]:
+                mark("external_only", path, kind)
+            if len(entry["uncommon_audio"]) > 2 or len(entry["uncommon_subtitle"]) > 2:
+                mark("uncommon", path, kind)
+            for stream_type, counts in entry["duplicates"].items():
+                for language, count in counts.items():
+                    if count < 2:
+                        continue
+                    fingerprint = suppressions.get((path, stream_type, language))
+                    if fingerprint:
+                        streams = suppressed_streams.get((path, stream_type, language), [])
+                        if _duplicate_group_fingerprint(streams) == fingerprint:
+                            continue
+                    mark("duplicate_" + stream_type, path, kind)
+                    break
+
+        codecs = ("subrip", "srt", "ass", "ssa", "webvtt", "mov_text", "text")
+        marks = ",".join("?" for _ in codecs)
+        for row in db.execute(
+            "SELECT DISTINCT s.path,p.kind,s.markup,s.damage FROM subtitle_extended_index s "
+            "JOIN plex_media p ON p.path=s.path WHERE lower(s.codec) IN (" + marks + ") "
+            "AND (s.markup LIKE ? OR (s.damage IS NOT NULL AND s.damage!='' AND s.damage!='None'))",
+            (*codecs, "%HTML tags%"),
+        ).fetchall():
+            path = str(row["path"])
+            if "HTML tags" in str(row["markup"] or ""):
+                mark("html", path, row["kind"])
+            if row["damage"] and row["damage"] != "None" and path not in pending_subtitles:
+                mark("damaged", path, row["kind"])
+        for row in db.execute(
+            "SELECT DISTINCT d.path,p.kind,d.analysis_status,d.detected_language,d.metadata_language,d.metadata_region,s.language AS current_language,s.region AS current_region FROM portuguese_language_detection d "
+            "JOIN plex_media p ON p.path=d.path JOIN media_stream_index s ON s.path=d.path AND s.stream_type IN ('subtitle','external') AND s.source=d.source AND s.type_index=d.type_index AND COALESCE(s.external_path,'')=COALESCE(d.external_path,'') WHERE d.detector_version>=? AND "
+            "((d.analysis_status='mismatch' AND d.confidence>=0.60) OR d.analysis_status IN ('no_confidence','unreadable'))",
+            (SUBTITLE_DETECTOR_VERSION,),
+        ).fetchall():
+            path = str(row["path"])
+            from app.detection_policy import language_matches
+            if not _detection_row_current(row):
+                continue
+            if row['analysis_status'] == 'mismatch' and language_matches(row['detected_language'], row['current_language'], row['current_region']):
+                continue
+            if path not in pending:
+                mark("language" if row["analysis_status"] == "mismatch" else "confidence", path, row["kind"])
+    counts = {key: {kind: len(paths) for kind, paths in kinds.items()} for key, kinds in found.items()}
+    return {"reports": {key: {kind: bool(count) for kind, count in kinds.items()} for key, kinds in counts.items()},
+            "counts": counts}
+
+
+
+
+class OpenSubtitlesSettings(BaseModel):
+    enabled: bool = False
+    api_key: str = ""
+    username: str = ""
+    password: str = ""
+    languages: list[str] = Field(default_factory=lambda: ["pt", "en"])
+
+class OpenSubtitlesSearchRequest(BaseModel):
+    path: str = Field(min_length=1, max_length=4096)
+    query: str = ""
+    languages: list[str] | None = None
+
+class OpenSubtitlesDownloadRequest(BaseModel):
+    path: str = Field(min_length=1, max_length=4096)
+    file_id: int = Field(gt=0)
+    language: str = ""
+    file_name: str = ""
+
+OPEN_SUBTITLES_API = "https://api.opensubtitles.com/api/v1"
+OPEN_SUBTITLES_STAGE = DATA_DIR / "opensubtitles-staging"
+
+def _os_settings() -> dict:
+    with connection() as db:
+        rows=db.execute("SELECT key,value FROM application_settings WHERE key LIKE 'opensubtitles_%'").fetchall()
+    values={str(row["key"]):str(row["value"] or "") for row in rows}
+    try: languages=json.loads(values.get("opensubtitles_languages", '["pt","en"]'))
+    except (TypeError,ValueError,json.JSONDecodeError): languages=["pt","en"]
+    enabled = str(values.get("opensubtitles_enabled", "")).strip().lower() in {"1", "true", "yes", "on"}
+    return {"enabled":enabled,"api_key":decrypt_token(values.get("opensubtitles_api_key","")),"username":decrypt_token(values.get("opensubtitles_username","")),"password":decrypt_token(values.get("opensubtitles_password","")),"languages":[str(x).strip() for x in languages if str(x).strip()]}
+
+def _os_request(method: str, path: str, settings: dict, payload: dict|None=None, token: str="") -> dict:
+    body=json.dumps(payload).encode() if payload is not None else None
+    headers={"Accept":"application/json","Content-Type":"application/json","Api-Key":settings["api_key"],"User-Agent":"VideoStreamEdit/1.0"}
+    if token: headers["Authorization"]="Bearer "+token
+    request=urllib.request.Request(OPEN_SUBTITLES_API+path,data=body,headers=headers,method=method)
+    try:
+        with urllib.request.urlopen(request,timeout=30) as response: return json.loads(response.read().decode("utf-8","replace"))
+    except (urllib.error.HTTPError,urllib.error.URLError,TimeoutError,json.JSONDecodeError) as exc:
+        detail=getattr(exc,"reason",str(exc)); raise HTTPException(502,f"OpenSubtitles request failed: {detail}") from exc
+
+@app.get("/api/v19/opensubtitles/settings")
+def get_opensubtitles_settings() -> dict:
+    settings=_os_settings()
+    return {"enabled":settings["enabled"],"configured":bool(settings["api_key"] and settings["username"] and settings["password"]),"api_key":("••••" if settings["api_key"] else ""),"username":settings["username"],"languages":settings["languages"]}
+
+@app.put("/api/v19/opensubtitles/settings")
+def save_opensubtitles_settings(request: OpenSubtitlesSettings) -> dict:
+    languages=[]
+    for value in request.languages:
+        value=str(value).strip().lower().replace("_","-")
+        if value and value not in languages: languages.append(value)
+    if not languages: raise HTTPException(400,"At least one searchable language is required")
+    with connection() as db:
+        db.execute("INSERT OR REPLACE INTO application_settings(key,value) VALUES('opensubtitles_enabled',?)", ("1" if request.enabled else "0",))
+        for key,value in (("opensubtitles_api_key",request.api_key.strip()),("opensubtitles_username",request.username.strip()),("opensubtitles_password",request.password)):
+            if value: db.execute("INSERT OR REPLACE INTO application_settings(key,value) VALUES(?,?)",(key,encrypt_token(value)))
+        db.execute("INSERT OR REPLACE INTO application_settings(key,value) VALUES('opensubtitles_languages',?)",(json.dumps(languages,ensure_ascii=False),))
+    return get_opensubtitles_settings()
+
+@app.get("/api/v19/opensubtitles/context")
+def opensubtitles_context(path: str) -> dict:
+    media_path = str(Path(path))
+    with connection() as db:
+        row = db.execute("SELECT kind,title,show_title,season_number,episode_number,rating_key,plex_imdb_id,plex_tmdb_id,plex_year FROM plex_media WHERE path=?", (media_path,)).fetchone()
+    if row and not (row["plex_imdb_id"] or row["plex_tmdb_id"]) and row["rating_key"]:
+        try:
+            metadata = plex_request("/library/metadata/" + urllib.parse.quote(str(row["rating_key"]))).get("MediaContainer", {}).get("Metadata", [])
+            if metadata:
+                imdb_id, tmdb_id, year = plex_external_ids(metadata[0])
+                if imdb_id or tmdb_id:
+                    with connection() as update_db:
+                        update_db.execute("UPDATE plex_media SET plex_imdb_id=?,plex_tmdb_id=?,plex_year=? WHERE path=?", (imdb_id, tmdb_id, year, media_path))
+                    row = dict(row)
+                    row.update(plex_imdb_id=imdb_id, plex_tmdb_id=tmdb_id, plex_year=year)
+        except Exception as exc:
+            logger.info("opensubtitles event=plex_identifier_backfill_failed path=%s error=%s", media_path.replace("\n", " "), str(exc).replace("\n", " ")[-200:])
+    if not row:
+        stem = Path(media_path).stem
+        return {"kind":"movie","query":stem,"title":stem,"show_title":"","season_number":None,"episode_number":None,"imdb_id":"","tmdb_id":"","year":None,"match_source":"title"}
+    kind = str(row["kind"] or "movie")
+    title = str(row["title"] or Path(media_path).stem)
+    if kind == "episode":
+        show = str(row["show_title"] or title)
+        season = int(row["season_number"] or 0)
+        episode = int(row["episode_number"] or 0)
+        query = f"{show} S{season:02d}E{episode:02d}"
+        return {"kind":"episode","query":query,"title":title,"show_title":show,"season_number":season,"episode_number":episode,"imdb_id":str(row["plex_imdb_id"] or ""),"tmdb_id":str(row["plex_tmdb_id"] or ""),"year":int(row["plex_year"] or 0) or None,"match_source":"imdb" if row["plex_imdb_id"] else ("tmdb" if row["plex_tmdb_id"] else "title")}
+    return {"kind":"movie","query":Path(media_path).stem,"title":title,"show_title":"","season_number":None,"episode_number":None,"imdb_id":str(row["plex_imdb_id"] or ""),"tmdb_id":str(row["plex_tmdb_id"] or ""),"year":int(row["plex_year"] or 0) or None,"match_source":"imdb" if row["plex_imdb_id"] else ("tmdb" if row["plex_tmdb_id"] else "title")}
+
+def _opensubtitles_quota(settings: dict) -> dict:
+    if not settings.get("enabled"):
+        return {"available":False,"reason":"disabled"}
+    if not settings.get("api_key") or not settings.get("username") or not settings.get("password"):
+        return {"available":False,"reason":"not_configured"}
+    try:
+        login=_os_request("POST","/login",settings,{"username":settings["username"],"password":settings["password"]})
+        token=str(login.get("token") or "")
+        if not token: return {"available":False,"reason":"login_failed"}
+        info=_os_request("GET","/infos/user",settings,token=token)
+        data=info.get("data") if isinstance(info,dict) else {}
+        if not isinstance(data,dict): data=info if isinstance(info,dict) else {}
+        user=data.get("user") if isinstance(data.get("user"),dict) else data
+        def number(*keys):
+            for key in keys:
+                value=user.get(key)
+                if value is not None:
+                    try: return int(value)
+                    except (TypeError,ValueError): pass
+            return None
+        used=number("downloads_count","downloads_used","download_count")
+        limit=number("downloads_limit","download_limit","daily_download_limit")
+        remaining=number("downloads_remaining","remaining_downloads")
+        if remaining is None and used is not None and limit is not None: remaining=max(0,limit-used)
+        reset=user.get("reset_time") or user.get("downloads_reset_time") or user.get("next_reset")
+        return {"available":True,"used":used,"limit":limit,"remaining":remaining,"reset_at":str(reset or "")}
+    except HTTPException:
+        return {"available":False,"reason":"quota_unavailable"}
+
+@app.get("/api/v19/opensubtitles/quota")
+def opensubtitles_quota() -> dict:
+    return _opensubtitles_quota(_os_settings())
+
+@app.get("/api/v19/opensubtitles/search")
+def search_opensubtitles(path: str, query: str = "", languages: str = "") -> dict:
+    settings=_os_settings()
+    if not settings["enabled"]: raise HTTPException(409,"Enable OpenSubtitles in Setup first")
+    if not settings["api_key"]: raise HTTPException(409,"Configure an OpenSubtitles API key in Setup first")
+    media=Path(path); search=str(query).strip() or media.stem
+    selected=[x.strip().lower() for x in languages.split(",") if x.strip()] or settings["languages"]
+    with connection() as db:
+        context = db.execute(
+            "SELECT kind,title,show_title,season_number,episode_number,plex_imdb_id,plex_tmdb_id,plex_year FROM plex_media WHERE path=?",
+            (str(media),),
+        ).fetchone()
+    params = {"languages": ",".join(selected)}
+    match_source = "title"
+    if context:
+        kind = str(context["kind"] or "movie")
+        imdb_id = str(context["plex_imdb_id"] or "")
+        tmdb_id = str(context["plex_tmdb_id"] or "")
+        if imdb_id:
+            params["imdb_id"] = imdb_id
+            match_source = "imdb"
+        elif tmdb_id:
+            params["tmdb_id"] = tmdb_id
+            match_source = "tmdb"
+        else:
+            params["query"] = search
+            match_source = "title"
+        if kind == "episode":
+            # OpenSubtitles has two mutually exclusive episode lookup modes:
+            # an episode IMDb/TMDB id by itself, or a parent-show id together
+            # with season/episode. Plex stores the episode feature id here, so
+            # never append season/episode to an episode id.
+            if imdb_id or tmdb_id:
+                pass
+            else:
+                params["type"] = "episode"
+                if context["season_number"] is not None:
+                    params["season_number"] = str(int(context["season_number"] or 0))
+                if context["episode_number"] is not None:
+                    params["episode_number"] = str(int(context["episode_number"] or 0))
+        elif context["plex_year"]:
+            params["year"] = str(int(context["plex_year"]))
+    else:
+        params["query"] = search
+    result=_os_request("GET","/subtitles?"+urllib.parse.urlencode(params),settings)
+    # A stale Plex identifier should not hide valid subtitles. Retry the
+    # documented title/episode query when an identifier produces no results.
+    if not (result.get("data") or []) and match_source in {"imdb", "tmdb"}:
+        fallback = {"query": search}
+        if context and str(context["kind"] or "movie") == "episode":
+            fallback["type"] = "episode"
+            if context["season_number"] is not None:
+                fallback["season_number"] = str(int(context["season_number"] or 0))
+            if context["episode_number"] is not None:
+                fallback["episode_number"] = str(int(context["episode_number"] or 0))
+        elif context and context["plex_year"]:
+            fallback["year"] = str(int(context["plex_year"]))
+        fallback["languages"] = params["languages"]
+        result = _os_request("GET", "/subtitles?" + urllib.parse.urlencode(fallback), settings)
+        if result.get("data"):
+            params = fallback
+            match_source = "title-fallback"
+    entries=[]
+    for item in result.get("data") or []:
+        attrs=item.get("attributes") or {}; files=attrs.get("files") or []
+        entries.append({"id":item.get("id"),"language":attrs.get("language") or "","format":attrs.get("format") or "","release":attrs.get("release") or attrs.get("movie_name") or "","hearing_impaired":bool(attrs.get("hearing_impaired")),"fps":attrs.get("fps"),"files":[{"file_id":f.get("file_id"),"file_name":f.get("file_name") or ""} for f in files if f.get("file_id")]})
+    return {"items":entries,"total_count":result.get("total_count",len(entries)),"languages":selected,"match_source":match_source,"search_params":{key:value for key,value in params.items() if key not in {"languages"}}}
+
+@app.post("/api/v19/opensubtitles/download")
+def download_opensubtitles(request: OpenSubtitlesDownloadRequest) -> dict:
+    settings=_os_settings()
+    if not settings["enabled"]: raise HTTPException(409,"Enable OpenSubtitles in Setup first")
+    if not settings["api_key"] or not settings["username"] or not settings["password"]: raise HTTPException(409,"Configure OpenSubtitles API key, username, and password in Setup first")
+    login=_os_request("POST","/login",settings,{"username":settings["username"],"password":settings["password"]})
+    token=str(login.get("token") or "")
+    if not token: raise HTTPException(502,"OpenSubtitles login did not return a token")
+    result=_os_request("POST","/download",settings,{"file_id":request.file_id,"sub_format":"srt"},token)
+    link=str(result.get("link") or "")
+    if not link: raise HTTPException(502,"OpenSubtitles did not return a download link")
+    try:
+        with urllib.request.urlopen(urllib.request.Request(link,headers={"User-Agent":"VideoStreamEdit/1.0"}),timeout=60) as response: content=response.read()
+    except (urllib.error.URLError,TimeoutError) as exc: raise HTTPException(502,f"Could not download subtitle file: {getattr(exc,'reason',str(exc))}") from exc
+    original=Path(request.path).resolve(); OPEN_SUBTITLES_STAGE.mkdir(parents=True,exist_ok=True)
+    safe=re.sub(r"[^A-Za-z0-9._-]+","_",request.file_name.strip() or (original.stem+"."+(request.language or "und")+".srt"))
+    target=OPEN_SUBTITLES_STAGE/(hashlib.sha256((str(original)+str(request.file_id)).encode()).hexdigest()[:16]+"-"+safe)
+    target.write_bytes(content)
+    target.with_name(target.name+".json").write_text(json.dumps({"original_path":str(original),"language":request.language or "und","file_name":request.file_name or target.name},ensure_ascii=False),encoding="utf-8")
+    return {"staged":True,"staged_path":str(target),"original_path":str(original),"language":request.language or "und","bytes":len(content),"message":"Subtitle downloaded to staging; review before integrating it."}
+
 def _configured_common_languages() -> list[str]:
     with connection() as db:
         row = db.execute("SELECT value FROM language_detection_settings WHERE key=\'common_languages\'").fetchone()
@@ -1178,21 +1840,4 @@ def remove_uncommon_languages(request: UncommonLanguageRemoval) -> dict:
     return movie_stream_bulk_edit(MovieStreamBulkEdit.model_validate(payload))
 
 
-@app.middleware("http")
-async def v19_title_assets(request: Request, call_next):
-    if request.method == "GET" and request.url.path == "/":
-        html = (STATIC_DIR / "v5.html").read_text()
-        html = html.replace('<title>VideoStreamEdit</title><link rel="stylesheet" href="/app.css">', '<title>VideoStreamEdit · Stream Metadata Editor</title><meta name="theme-color" content="#14191f"><link rel="icon" href="/brand/favicon.ico" sizes="any"><link rel="icon" type="image/png" sizes="32x32" href="/brand/favicon-32.png"><link rel="icon" type="image/png" sizes="16x16" href="/brand/favicon-16.png"><link rel="apple-touch-icon" sizes="180x180" href="/brand/apple-touch-icon.png"><link rel="manifest" href="/manifest.webmanifest"><link rel="stylesheet" href="/assets/v19.css">')
-        html = html.replace('<header><h1>VideoStreamEdit</h1><div id="page-title" class="header-page-title"><h2>Movies</h2><p>Choose a movie to edit its audio and subtitle streams.</p></div><nav>', '<header><a class="brand" href="/" aria-label="VideoStreamEdit home"><img src="/brand/header-icon.png" width="48" height="48" alt=""><span><strong>VideoStreamEdit</strong><small>Stream metadata editor</small></span></a><div id="page-title" class="header-page-title"><h2>Movies</h2><p>Choose a movie to edit its audio and subtitle streams.</p></div><nav>')
-        html = html.replace('<script src="/app.js"></script>', '<script src="/assets/v19.js"></script>')
-        return HTMLResponse(html, headers={"Cache-Control": "no-store, max-age=0"})
-    if request.method == "GET" and request.url.path == "/assets/v19.css":
-        names = ("v3.css", "v4.css", "v5.css", "v7-addon.css", "v8-addon.css", "v10-progress.css", "v11-plex.css", "v12-context.css", "v14-brand.css", "v15-path.css", "v16-bulk.css", "v18-value-popup.css", "v19-titles.css", "v20-clone.css", "v22-bulk-clone.css", "v23-session-changes.css", "v25-template-history.css", "v26-stream-layout.css", "v27-fast-defaults.css", "v28-movie-import.css", "v29-change-highlights.css", "v30-destination-order.css", "v31-destination-browser.css", "v32-output-folder.css", "v33-global-busy.css", "v36-inline-combobox.css", "v37-filename.css", "v38-movie-filters.css", "v39-movie-index.css", "v40-track-suggestions.css", "v44-prompt-settings.css", "v46-navigation-pending.css", "v48-setup-tabs.css", "v49-stream-preview.css", "v50-stream-preview.css", "v51-subtitle-properties.css", "v54-split-index.css", "v58-manual-audio-name.css", "v60-preview-layout.css", "v61-preview-overflow.css", "v63-index-controls.css", "v65-task-queue.css", "v67-index-schedules.css", "v68-plex-sync.css", "v69-stream-preview.css", "v77-bulk-track-name.css", "v78-change-requested.css", "v79-season-filters.css", "v82-movie-streams.css", "v83-media-review.css", "v84-activity.css", "v85-remove-cycle.css", "v86-tasks-layout.css", "v87-language-region.css", "v88-reports.css", "v89-design-tokens.css", "v90-stream-properties.css", "v91-listings.css", "v92-dashboard-setup.css", "v93-movie-import.css", "v94-preview.css", "v95-global-busy.css", "v96-dialogs.css", "v97-accessibility.css")
-        return asset("\n".join((STATIC_DIR / name).read_text() for name in names), "text/css")
-    if request.method == "GET" and request.url.path == "/assets/v19.js":
-        javascript = (STATIC_DIR / "v33-global-busy.js").read_text() + "\n" + (STATIC_DIR / "v5.js").read_text().replace("'/api/movies'", "'/api/v19/movies'").replace("'/api/tv'", "'/api/v19/tv'")
-        for name in ("v8-addon.js", "v9-session.js", "v10-progress.js", "v11-plex.js", "v12-context.js", "v15-path.js", "v16-bulk.js", "v18-value-popup.js", "v19-titles.js", "v20-clone.js", "v21-navigation.js", "v22-bulk-clone.js", "v23-session-changes.js", "v25-removal-safety.js", "v25-template-history.js", "v27-fast-defaults.js", "v28-movie-import.js", "v29-change-highlights.js", "v30-destination-order.js", "v31-destination-browser.js", "v32-output-folder.js", "v36-inline-combobox.js", "v37-filename.js", "v39-movie-index.js", "v42-track-suggestions.js", "v44-prompt-settings.js", "v45-keyboard-navigation.js", "v46-navigation-pending.js", "v47-suggestion-shortcut.js", "v48-setup-tabs.js", "v69-stream-preview.js", "v51-subtitle-properties.js", "v54-split-index.js", "v56-background-index.js", "v58-manual-audio-name.js", "v62-escape-close.js", "v63-index-controls.js", "v65-task-queue.js", "v66-close-pending.js", "v67-index-schedules.js", "v68-plex-sync.js", "v71-pending-html.js", "v72-preview-html-detection.js", "v75-rename-refresh.js", "v76-apply-queue.js", "v77-bulk-track-name.js", "v78-change-requested.js", "v79-season-filters.js", "v81-performance.js", "v82-movie-streams.js", "v83-media-review.js", "v84-activity.js", "v85-remove-cycle.js", "v86-tasks-layout.js", "v87-language-region.js", "v88-reports.js"):
-            javascript += "\n" + (STATIC_DIR / name).read_text()
-        javascript = javascript.replace("/api/media/details", "/api/v13/media/details").replace("/api/v11/plex/sync", "/api/v19/plex/sync").replace("/api/v7/media/edit", "/api/v43/media/edit")
-        return asset(javascript, "text/javascript")
-    return await call_next(request)
+from app import web_assets as _web_assets  # noqa: E402,F401

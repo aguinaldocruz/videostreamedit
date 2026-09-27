@@ -29,10 +29,10 @@ from app.v11 import column_exists, connection
 from app.v79 import app
 
 logger = logging.getLogger("uvicorn.error")
-JOBS = ("core", "subtitles", "previews")
+JOBS = ("core", "subtitles")
 conditions = {job: threading.Condition() for job in JOBS}
 threads: dict[str, list[threading.Thread]] = {}
-WORKER_COUNTS = {"core": 1, "subtitles": 1, "previews": 1}
+WORKER_COUNTS = {"core": 1, "subtitles": 1}
 index_shutdown = threading.Event()
 
 
@@ -56,7 +56,6 @@ def ensure_queue_tables() -> None:
             CREATE TABLE IF NOT EXISTS index_queue_settings (job TEXT PRIMARY KEY,paused INTEGER NOT NULL DEFAULT 0,stop_requested INTEGER NOT NULL DEFAULT 0);
             INSERT OR IGNORE INTO index_queue_settings(job) VALUES('core');
             INSERT OR IGNORE INTO index_queue_settings(job) VALUES('subtitles');
-            INSERT OR IGNORE INTO index_queue_settings(job) VALUES('previews');
             CREATE TABLE IF NOT EXISTS deferred_language_detection (path TEXT PRIMARY KEY, requested_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, detection_json TEXT);
         """)
         if not column_exists(db, "index_task_queue", "group_id"):
@@ -76,8 +75,6 @@ def ensure_queue_tables() -> None:
             for table, columns in {
                 "movie_stream_index": ("modified", "size"),
                 "subtitle_extended_media": ("modified", "size"),
-                "preview_cache_index": ("modified", "size", "cache_bytes"),
-                "preview_cache_files": ("size",),
                 "media_stream_index_state": ("modified_ns", "size"),
                 "media_video_title": ("modified_ns", "size"),
                 "tv_stream_index_media": ("modified", "size"),
@@ -97,7 +94,7 @@ def ensure_queue_tables() -> None:
 def validate_jobs(names: list[str]) -> list[str]:
     result = list(dict.fromkeys(names))
     if not result or any(name not in JOBS for name in result):
-        raise HTTPException(400, "Indexes must contain core, subtitles, or previews")
+        raise HTTPException(400, "Indexes must contain core or subtitles")
     return result
 
 
@@ -110,8 +107,34 @@ def _inherited_expedite(path: str, group_id: str | None = None) -> str | None:
         return None
 
 
+def _indexed_fingerprint_current(db, job: str, path: str) -> bool:
+    """Return whether the persisted read model already covers this file."""
+    try:
+        stat = Path(path).stat()
+    except OSError:
+        return False
+    if job == "core":
+        row = db.execute(
+            "SELECT modified_ns,size FROM media_stream_index_state WHERE path=?",
+            (path,),
+        ).fetchone()
+        return bool(row and int(row["modified_ns"] or -1) == int(stat.st_mtime_ns)
+                    and int(row["size"] or -1) == int(stat.st_size))
+    if job == "subtitles":
+        row = db.execute(
+            "SELECT modified,size,markup_version FROM subtitle_extended_media WHERE path=?",
+            (path,),
+        ).fetchone()
+        return bool(row and int(row["modified"] or -1) == int(stat.st_mtime)
+                    and int(row["size"] or -1) == int(stat.st_size)
+                    and int(row["markup_version"] or 0) >= 2)
+    return False
+
+
 def enqueue(job: str, path: str, reason: str = "Media changed", detection: dict | None = None) -> bool:
     ensure_queue_tables()
+    from app.detection_policy import is_final
+    if job == 'subtitles' and is_final(path): return False
     with connection() as db:
         existing = db.execute(
             "SELECT id FROM index_task_queue WHERE job=? AND path=? AND status IN ('pending','running')",
@@ -119,34 +142,52 @@ def enqueue(job: str, path: str, reason: str = "Media changed", detection: dict 
         ).fetchone()
         if existing:
             return False
+        if not (job == 'subtitles' and detection and not detection.get('skip_detection')) and _indexed_fingerprint_current(db, job, path):
+            logger.info("index_queue=%s event=already_current file=%s reason=%s", job, path.replace("\n", "\\n"), reason.replace("\n", " ")[:200])
+            return False
         group_id = uuid.uuid4().hex
         expedite_until = _inherited_expedite(path, group_id)
         db.execute(
             "INSERT OR IGNORE INTO index_task_queue(job,path,reason,status,group_id,expedite_until,detection_json,created_at,updated_at) VALUES(?,?,?,'pending',?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
             (job, path, reason[:300], group_id, expedite_until, json.dumps(detection or {}, ensure_ascii=False, separators=(",", ":"))),
         )
+        if job == "subtitles":
+            db.execute("DELETE FROM subtitle_extended_index WHERE path=?", (path,))
+            db.execute("DELETE FROM subtitle_extended_media WHERE path=?", (path,))
         row = db.execute("SELECT id,group_id FROM index_task_queue WHERE job=? AND path=? AND status='pending' ORDER BY id DESC LIMIT 1", (job, path)).fetchone()
     if row:
         register_task_stage(row["group_id"], f"index:{job}", path, {"job": job, "reason": reason}, row["id"])
     logger.info("index_queue=%s event=added file=%s reason=%s", job, path.replace("\n", "\\n"), reason.replace("\n", " ")[:200])
     with conditions[job]:
         conditions[job].notify_all()
+    try:
+        start_index_queue_workers()
+    except Exception as exc:
+        logger.warning("index_queue=%s event=worker_wake_failed error=%s", job, str(exc).replace("\n", " ")[:300])
     return True
 
 
 def enqueue_many(job: str, items: list[dict], reason: str) -> int:
     ensure_queue_tables()
+    from app.detection_policy import final_paths
+    excluded = final_paths({str(item['path']) for item in items}) if job == 'subtitles' else set()
     rows = []
     # Avoid one database round-trip per media during full-catalog maintenance.
     # Expedite inheritance is only consulted when an active boost exists.
     with connection() as db:
         boost_active = bool(db.execute("SELECT 1 FROM task_queue_expedite LIMIT 1").fetchone())
-    for item in items:
-        item_path = str(item["path"])
-        gid = uuid.uuid4().hex
-        detection = item.get("detection") or {}
-        expedite = _inherited_expedite(item_path, gid) if boost_active else None
-        rows.append((job, item_path, reason[:300], gid, expedite, json.dumps(detection, ensure_ascii=False, separators=(",", ":")), job, item_path))
+        for item in items:
+            item_path = str(item["path"])
+            if item_path in excluded: continue
+            if not (job == 'subtitles' and item.get('detection') and not item['detection'].get('skip_detection')) and _indexed_fingerprint_current(db, job, item_path):
+                continue
+            gid = uuid.uuid4().hex
+            detection = item.get("detection") or {}
+            expedite = _inherited_expedite(item_path, gid) if boost_active else None
+            rows.append((job, item_path, reason[:300], gid, expedite, json.dumps(detection, ensure_ascii=False, separators=(",", ":")), job, item_path))
+    if not rows:
+        logger.info("index_queue=%s event=batch_already_current requested=%d reason=%s", job, len(items), reason)
+        return 0
     with connection() as db:
         before = db.total_changes
         db.executemany(
@@ -165,6 +206,10 @@ def enqueue_many(job: str, items: list[dict], reason: str) -> int:
     logger.info("index_queue=%s event=batch_added requested=%d added=%d reason=%s", job, len(items), added, reason)
     with conditions[job]:
         conditions[job].notify_all()
+    try:
+        start_index_queue_workers()
+    except Exception as exc:
+        logger.warning("index_queue=%s event=worker_wake_failed error=%s", job, str(exc).replace("\n", " ")[:300])
     return added
 
 
@@ -180,11 +225,6 @@ def clear_index(job: str) -> None:
             db.execute("DELETE FROM subtitle_extended_media")
             # Keep language-detection results when clearing the extended
             # subtitle index; they are the source for targeted rechecks.
-        else:
-            db.execute("DELETE FROM preview_cache_index")
-            db.execute("DELETE FROM preview_cache_files")
-            shutil.rmtree(legacy.CACHE_DIR, ignore_errors=True)
-            legacy.CACHE_DIR.mkdir(parents=True, exist_ok=True)
         db.execute("DELETE FROM external_sidecar_index_state WHERE job=?", (job,))
 
 
@@ -223,7 +263,7 @@ def pending_index_items(job: str) -> list[dict]:
     if job not in JOBS:
         return []
     import app.v79 as tv_index
-    table = {"core": "media_stream_index_state", "subtitles": "subtitle_extended_media", "previews": "preview_cache_index"}[job]
+    table = {"core": "media_stream_index_state", "subtitles": "subtitle_extended_media"}[job]
     markup_stale = " OR coalesce(cached.markup_version,0) != 2" if job == "subtitles" else ""
     signature_select = ", cached.content_signature AS content_signature" if job == "core" else ""
     if job == "core":
@@ -284,7 +324,6 @@ def prune_orphaned_index_entries() -> dict[str, int]:
             "media_stream_index", "media_stream_index_state",
             "media_video_title", "external_subtitle_index", "external_sidecar_index_state",
             "subtitle_extended_index", "subtitle_extended_media", "portuguese_language_detection", "portuguese_detection_state", "subtitle_detection_stream_state",
-            "preview_cache_index", "preview_cache_files",
         )
         removed = 0
         for table in tables:
@@ -323,7 +362,7 @@ def migrate_index_paths(changes: dict[str, str], reason: str = "Plex media path 
                     cursor = db.execute(
                         "UPDATE index_task_queue SET path=?,reason=?,status='pending',error=NULL,finished_at=NULL,updated_at=CURRENT_TIMESTAMP WHERE id=?",
                         (new, reason[:300], candidates[0]["id"]),
-                    ) if candidates else db.execute("SELECT 1 WHERE 0")
+                    ) if candidates else db.execute("SELECT 1 WHERE FALSE")
                     if len(candidates) > 1:
                         db.executemany(
                             "UPDATE index_task_queue SET status='cancelled',error=?,finished_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE id=?",
@@ -339,10 +378,6 @@ def migrate_index_paths(changes: dict[str, str], reason: str = "Plex media path 
             db.execute("DELETE FROM portuguese_language_detection WHERE path=?", (old,))
             db.execute("DELETE FROM portuguese_detection_state WHERE path=?", (old,))
             db.execute("DELETE FROM subtitle_detection_stream_state WHERE path=?", (old,))
-            db.execute("DELETE FROM preview_cache_index WHERE path=?", (old,))
-            db.execute("DELETE FROM preview_cache_files WHERE path=?", (old,))
-    for old, new in changes.items():
-        shutil.rmtree(legacy.cache_folder(old), ignore_errors=True)
         logger.info("index_queue event=path_migrated from=%s to=%s", old.replace("\n", "\\n"), new.replace("\n", "\\n"))
     for condition in conditions.values():
         with condition:
@@ -471,10 +506,6 @@ def prepare_index_rebuild(task_id: int, payload: dict) -> dict:
         batch_count = max(1, (len(items) + batch_size - 1) // batch_size)
         total_steps = batch_count + 1
         clear_index(job)
-        if job == "previews":
-            generic_queue.update_progress(task_id, 1, 1, "Cleared previews; preview segments remain on demand")
-            logger.info("task_queue event=index_cache_cleared id=%d index=%s mode=on_demand", task_id, job)
-            return {"job": job, "requested": 0, "queued": 0, "mode": "on_demand"}
         generic_queue.update_progress(task_id, 0, total_steps, f"Clearing {job} index")
         added = 0
         for batch_number, start in enumerate(range(0, len(items), batch_size), 1):
@@ -512,6 +543,8 @@ def detection_scope_for_edit(edit: dict, html_cleanups: list | None = None, remu
     can renumber after removal/reordering.
     """
     scope: dict[str, set[int] | str] = {}
+    if edit.get('audio_compatibility'):
+        scope['audio_indices'] = 'all'
     tracks = edit.get("tracks") or []
     for item in tracks:
         codec = item.get("codec_type") if isinstance(item, dict) else getattr(item, "codec_type", None)
@@ -543,6 +576,9 @@ def detection_scope_for_edit(edit: dict, html_cleanups: list | None = None, remu
     normalized = {}
     for key, value in scope.items():
         normalized[key] = value if value == "all" else sorted(int(item) for item in value)
+    if not remuxed and not removed and not html_cleanups and not edit.get('audio_compatibility') and not any(item.get('embed') for item in edit.get('external_subtitles') or []):
+        for family in ('subtitle', 'audio'):
+            if normalized.get(family + '_indices'): normalized[family + '_recompare'] = True
     return normalized
 
 
@@ -562,23 +598,28 @@ def media_indexes_for_edit(edit: dict, html_cleanups: list | None = None, remuxe
     result = {"core"}
     removed = edit.get("remove") or []
     subtitle_removed = any(str(item).startswith(("embedded:subtitle:", "external:")) for item in removed)
-    subtitle_metadata_changed = any(
-        getattr(item, "codec_type", item.get("codec_type") if isinstance(item, dict) else None) == "subtitle"
-        and (getattr(item, "language", None) is not None or getattr(item, "region", None) is not None)
-        for item in (edit.get("tracks") or [])
-    )
+    # Language/region metadata is refreshed by the core stream index. It does
+    # not alter subtitle text, markup, damage, or cue measurements, so avoid
+    # scheduling the much more expensive subtitle-content index for this edit.
     external_changes = edit.get("external_subtitles") or []
     subtitle_integrated = any(item.get("embed") for item in external_changes)
     # The editor sends a complete canonical order even for metadata-only edits.
     # Treat order as structural only once the operation actually remuxed.
     subtitle_reordered = bool(remuxed and (edit.get("order") or []))
-    if subtitle_removed or subtitle_metadata_changed or subtitle_integrated or subtitle_reordered or html_cleanups:
+    if edit.get('audio_compatibility'):
+        subtitle_order = [int(item.get('type_index', 0)) for item in edit.get('order', []) if item.get('codec_type') == 'subtitle' and item.get('source') == 'embedded']
+        subtitle_reordered = subtitle_order != sorted(subtitle_order)
+    if subtitle_removed or subtitle_integrated or subtitle_reordered or html_cleanups:
         result.add("subtitles")
     audio_removed = any(str(item).startswith("embedded:audio:") for item in removed)
     structural = audio_removed or subtitle_removed or subtitle_integrated or bool(html_cleanups) or remuxed
     if structural:
-        result.add("previews")
-    return [job for job in JOBS if job in result]
+        return [job for job in JOBS if job in result]
+    # Metadata-only edits still require the canonical core stream index.  The
+    # previous implementation fell through with None, causing post-edit
+    # reindex requests to fail and leaving filters on the old language/region.
+    return ["core"]
+
 
 def invalidate_language_detection(path: str, scope: dict | None = None) -> bool:
     """Remove only stale detector rows selected by an edit."""
@@ -586,7 +627,7 @@ def invalidate_language_detection(path: str, scope: dict | None = None) -> bool:
     removed = 0
     with connection() as db:
         subtitle = scope.get("subtitle_indices")
-        if subtitle:
+        if subtitle and not scope.get('subtitle_recompare'):
             if subtitle == "all":
                 removed += db.execute("DELETE FROM portuguese_language_detection WHERE path=?", (path,)).rowcount
                 db.execute("DELETE FROM subtitle_detection_stream_state WHERE path=?", (path,))
@@ -595,7 +636,7 @@ def invalidate_language_detection(path: str, scope: dict | None = None) -> bool:
                 removed += db.execute(f"DELETE FROM portuguese_language_detection WHERE path=? AND source='embedded' AND type_index IN ({marks})", [path, *subtitle]).rowcount
                 db.execute(f"DELETE FROM subtitle_detection_stream_state WHERE path=? AND source='embedded' AND type_index IN ({marks})", [path, *subtitle])
         audio = scope.get("audio_indices")
-        if audio:
+        if audio and not scope.get('audio_recompare'):
             if audio == "all":
                 removed += db.execute("DELETE FROM audio_language_detection WHERE path=?", (path,)).rowcount
             else:
@@ -615,26 +656,42 @@ def invalidate_language_detections(paths: list[str]) -> int:
     return sum(1 for path in dict.fromkeys(str(item) for item in paths if item) if invalidate_language_detection(path))
 
 
-def flush_deferred_language_detection(path: str) -> dict:
+def flush_deferred_language_detection(path: str, family: str | None = None) -> dict:
     ensure_queue_tables()
+    from app.detection_policy import is_final
+    if is_final(path):
+        with connection() as db:
+            db.execute('DELETE FROM deferred_language_detection WHERE path=?', (path,))
+        return {'path': path, 'queued': False, 'skipped': 'final_version'}
     with connection() as db:
         deferred = db.execute("SELECT detection_json FROM deferred_language_detection WHERE path=?", (path,)).fetchone()
-        removed = db.execute("DELETE FROM deferred_language_detection WHERE path=?", (path,)).rowcount
-    if not removed:
+    if not deferred:
         return {"queued": False, "path": path}
     try:
-        scope = json.loads(deferred["detection_json"] or "{}") if deferred else {}
+        scope = json.loads(deferred["detection_json"] or "{}")
     except (TypeError, ValueError, json.JSONDecodeError):
         scope = {}
+    all_subtitle_scope = {key: value for key, value in scope.items() if key.startswith("subtitle_")}
+    all_audio_scope = {key: value for key, value in scope.items() if key.startswith("audio_")}
+    subtitle_scope = all_subtitle_scope if family in (None, "subtitle") else {}
+    audio_scope = all_audio_scope if family in (None, "audio") else {}
     added = 0
-    subtitle_scope = {key: value for key, value in scope.items() if key.startswith("subtitle_")}
-    audio_scope = {key: value for key, value in scope.items() if key.startswith("audio_")}
     if subtitle_scope:
-        added += int(enqueue("subtitles", path, "Stream editor closed; targeted subtitle language detection", subtitle_scope))
+        added += int(enqueue("subtitles", path, "Scheduled targeted subtitle language detection", subtitle_scope))
     from app.v65 import enqueue as enqueue_task
     audio_payload = {"path": path, "stream_indices": audio_scope.get("audio_indices", "all")}
-    audio = enqueue_task("audio_language_detection", audio_payload, "Stream editor closed; targeted voice language detection", deduplicate=True) if audio_scope else {"id": None}
-    return {"queued": True, "path": path, "subtitle_added": added, "voice_task_id": audio.get("id")}
+    if audio_scope.get('audio_recompare'): audio_payload['recompare'] = True
+    audio = enqueue_task("audio_language_detection", audio_payload, "Scheduled targeted voice language detection", deduplicate=True) if audio_scope else {"id": None}
+    remaining = {}
+    if family == "subtitle": remaining.update(all_audio_scope)
+    elif family == "audio": remaining.update(all_subtitle_scope)
+    if remaining:
+        with connection() as db:
+            db.execute("UPDATE deferred_language_detection SET detection_json=?,requested_at=CURRENT_TIMESTAMP WHERE path=?", (json.dumps(remaining, ensure_ascii=False, separators=(",", ":")), path))
+    else:
+        with connection() as db:
+            db.execute("DELETE FROM deferred_language_detection WHERE path=?", (path,))
+    return {"queued": bool(subtitle_scope or audio_scope), "path": path, "subtitle_added": added, "voice_task_id": audio.get("id")}
 
 
 def _queue_index_dependents(path: str, completed_job: str, reason: str = "Index dependency") -> int:
@@ -651,13 +708,8 @@ def _queue_index_dependents(path: str, completed_job: str, reason: str = "Index 
             (path,),
         ).fetchone())
     added = 0
-    if completed_job == "core":
-        if has_subtitles:
-            added += int(enqueue("subtitles", path, f"{reason}; core dependency complete", {"skip_detection": False}))
-        else:
-            added += int(enqueue("previews", path, f"{reason}; no subtitle inspection required"))
-    elif completed_job == "subtitles":
-        added += int(enqueue("previews", path, f"{reason}; subtitle inspection complete"))
+    if completed_job == "core" and has_subtitles:
+        added += int(enqueue("subtitles", path, f"{reason}; core dependency complete", {"skip_detection": True}))
     if added:
         logger.info("index_queue event=dependent_stage_queued file=%s completed=%s added=%d", path.replace("\n", "\\n"), completed_job, added)
     return added
@@ -676,17 +728,6 @@ def request_media_indexes(path: str, names: list[str], reason: str, *, defer_det
             logger.debug("plex_sync internal scope registration skipped: %s", exc)
     if scope:
         invalidate_language_detection(path, scope)
-    if "subtitles" in requested:
-        with connection() as db:
-            db.execute("DELETE FROM subtitle_extended_index WHERE path=?", (path,))
-            db.execute("DELETE FROM subtitle_extended_media WHERE path=?", (path,))
-        logger.info("subtitle_index event=media_invalidated file=%s reason=%s", path.replace("\n", "\\n"), reason.replace("\n", " ")[:200])
-    if "previews" in requested:
-        shutil.rmtree(legacy.cache_folder(path), ignore_errors=True)
-        with connection() as db:
-            db.execute("DELETE FROM preview_cache_files WHERE path=?", (path,))
-            db.execute("DELETE FROM preview_cache_index WHERE path=?", (path,))
-        logger.info("preview_cache event=media_invalidated file=%s reason=%s", path.replace("\n", "\\n"), reason.replace("\n", " ")[:200])
     # Smart dependency planning prevents a single media request from starting
     # all three expensive stages at once. The next stage is queued when its
     # prerequisite completes; explicit preview-only requests remain allowed.
@@ -694,28 +735,20 @@ def request_media_indexes(path: str, names: list[str], reason: str, *, defer_det
     planned = list(requested)
     if "core" in planned:
         planned = ["core"]
-    elif "subtitles" in planned and "previews" in planned:
-        planned = ["subtitles"]
     for job in planned:
-        job_scope = ({"skip_detection": True} if defer_detection else scope) if job == "subtitles" else {}
+        # Subtitle indexing prepares stream/text data. Detection itself is
+        # scheduled separately, so ordinary edits never run it inline.
+        job_scope = {"skip_detection": True} if job == "subtitles" else {}
         if enqueue(job, path, reason, job_scope):
             added += 1
-    with connection() as db:
-        detection_row = db.execute("SELECT value FROM language_detection_settings WHERE key='incremental_detection_enabled'").fetchone()
-        if path and defer_detection and scope:
-            db.execute("INSERT OR REPLACE INTO deferred_language_detection(path,requested_at,detection_json) VALUES(?,CURRENT_TIMESTAMP,?)", (path, json.dumps(scope, ensure_ascii=False, separators=(",", ":"))))
-    if path and scope and not defer_detection and str(detection_row["value"] if detection_row else "1") == "1":
-        subtitle_scope = {key: value for key, value in scope.items() if key.startswith("subtitle_")}
-        audio_scope = {key: value for key, value in scope.items() if key.startswith("audio_")}
-        if subtitle_scope and "subtitles" not in requested:
-            if enqueue("subtitles", path, "Changed-media targeted subtitle language detection", subtitle_scope):
-                added += 1
-        if audio_scope:
-            from app.v65 import enqueue as enqueue_task
-            payload = {"path": path, "stream_indices": audio_scope.get("audio_indices", "all")}
-            audio_task = enqueue_task("audio_language_detection", payload, "Changed-media targeted voice language detection", deduplicate=True)
-            if audio_task.get("status") == "pending":
-                added += 1
+    # Detection is advisory and schedule-driven. Media changes invalidate only
+    # the affected rows and persist their narrow scope for the next scheduled
+    # detector run; they never enqueue expensive analysis in the edit request.
+    if path and scope:
+        with connection() as db:
+            setting = db.execute("SELECT value FROM language_detection_settings WHERE key='incremental_detection_enabled'").fetchone()
+            if str(setting["value"] if setting else "1") == "1":
+                db.execute("INSERT OR REPLACE INTO deferred_language_detection(path,requested_at,detection_json) VALUES(?,CURRENT_TIMESTAMP,?)", (path, json.dumps(scope, ensure_ascii=False, separators=(",", ":"))))
     logger.info("index_queue event=media_indexes_requested file=%s indexes=%s detection=%s added=%d reason=%s", path.replace("\n", "\\n"), ",".join(requested), json.dumps(scope, sort_keys=True), added, reason.replace("\n", " ")[:200])
     return added
 
@@ -725,20 +758,26 @@ def queue_state(job: str) -> dict:
         setting = db.execute("SELECT paused,stop_requested FROM index_queue_settings WHERE job=?", (job,)).fetchone()
         # Keep each status visible: a large pending backlog must not crowd all
         # completed entries out of the setup view.
-        items = []
-        for item_status in ("running", "pending", "failed", "succeeded"):
-            items.extend(dict(row) for row in db.execute(
-                "SELECT id,path,reason,status,attempts,error,created_at,started_at FROM index_task_queue WHERE job=? AND status=? ORDER BY id DESC LIMIT 40",
-                (job, item_status),
-            ))
-        items.sort(key=lambda row: (0 if row["status"] == "running" else 1 if row["status"] == "pending" else 2 if row["status"] == "failed" else 3, -row["id"]))
+        # Return one bounded, chronological window across all states. The UI
+        # rotates this window into expandable status groups, while keeping
+        # active work visible instead of hiding it behind the pending backlog.
+        # Keep a recent window for every state independently.  A large pending
+        # backlog must never hide recent failures or completed work.
+        items = [dict(row) for row in db.execute(
+            "SELECT id,path,reason,status,attempts,error,created_at,started_at,finished_at "
+            "FROM (SELECT id,path,reason,status,attempts,error,created_at,started_at,finished_at, "
+            "ROW_NUMBER() OVER (PARTITION BY status ORDER BY id DESC) AS state_rank "
+            "FROM index_task_queue WHERE job=?) recent WHERE state_rank<=250 ORDER BY id DESC",
+            (job,),
+        )]
+        status_rank = {"running": 0, "pending": 1, "failed": 2, "succeeded": 3, "cancelled": 4}; items.sort(key=lambda row: (status_rank.get(row["status"], 5), -row["id"]))
     # Keep status polling O(1) over the queue.  The legacy status routine
     # rescans the entire media catalog and filesystem on every refresh, which
     # made the setup screen appear frozen during large rebuilds.
-    running = counts.get("running", 0) > 0
+    running = counts.get("running", 0)
     # Keep the displayed indexed count cheap while preserving the setup UI
     # contract.  The unified core table covers both movies and episodes.
-    index_table = {"core": "media_stream_index_state", "subtitles": "subtitle_extended_media", "previews": "preview_cache_index"}[job]
+    index_table = {"core": "media_stream_index_state", "subtitles": "subtitle_extended_media"}[job]
     with connection() as db:
         indexed = int(db.execute(f"SELECT count(*) FROM {index_table}").fetchone()[0])
         recent = db.execute("SELECT started_at,finished_at FROM index_task_queue WHERE job=? AND status='succeeded' AND started_at IS NOT NULL AND finished_at IS NOT NULL ORDER BY id DESC LIMIT 200", (job,)).fetchall()
@@ -780,18 +819,28 @@ def subtitle_index_signature(path: str, job: str) -> tuple:
 
 
 def clear_reviewed_for_index_change(path: str) -> bool:
+    """Clear final/reviewed locks only when an external/indexed stream definition changed."""
+    from app.v86 import final_version_entity_for_path
     with connection() as db:
-        row = db.execute("SELECT kind,library_key,show_title FROM plex_media WHERE path=?", (path,)).fetchone()
-        if not row:
+        media = db.execute("SELECT kind,library_key,show_title FROM plex_media WHERE path=?", (path,)).fetchone()
+        if not media:
             return False
-        entity_type = "movie" if row["kind"] == "movie" else "tv"
-        entity_key = path if entity_type == "movie" else f"{row['library_key']}:{row['show_title'] or 'Unknown show'}"
-        note = db.execute("SELECT reviewed,note,final_version FROM media_notes WHERE entity_type=? AND entity_key=?", (entity_type, entity_key)).fetchone()
-        if not note or (not note["reviewed"] and not note["final_version"]):
-            return False
-        db.execute("UPDATE media_notes SET plex_sync_change=1,final_version=0,updated_at=CURRENT_TIMESTAMP WHERE entity_type=? AND entity_key=?", (entity_type, entity_key))
-    logger.info("change=review_status_cleared reason=stream_definition_changed type=%s key=%s", entity_type, entity_key.replace("\n", " ")[:300])
-    return True
+        entities = []
+        direct = final_version_entity_for_path(path)
+        if direct:
+            entities.append(direct)
+        if media["kind"] == "episode":
+            entities.append(("tv", f"{media['library_key']}:{media['show_title'] or 'Unknown show'}"))
+        changed = False
+        for entity_type, entity_key in entities:
+            note = db.execute("SELECT reviewed,note,final_version FROM media_notes WHERE entity_type=? AND entity_key=?", (entity_type, entity_key)).fetchone()
+            if not note or (not note["reviewed"] and not note["final_version"]):
+                continue
+            db.execute("UPDATE media_notes SET plex_sync_change=1,reviewed=0,final_version=0,updated_at=CURRENT_TIMESTAMP WHERE entity_type=? AND entity_key=?", (entity_type, entity_key))
+            changed = True
+    if changed:
+        logger.info("change=review_status_cleared reason=stream_definition_changed file=%s", path.replace("\n", " ")[:300])
+    return changed
 
 
 def worker(job: str) -> None:
@@ -806,7 +855,11 @@ def worker(job: str) -> None:
                 setting = {"paused": 1}
             foreground = db.execute("SELECT 1 FROM task_queue WHERE status='running' AND task_type='index_rebuild_prepare' LIMIT 1").fetchone() if job == "core" else None
             row = None if setting["paused"] or foreground else db.execute("SELECT * FROM index_task_queue WHERE job=? AND status='pending' ORDER BY CASE WHEN expedite_until > ? THEN 0 ELSE 1 END, id LIMIT 1", (job, datetime.now().astimezone().replace(tzinfo=None).isoformat())).fetchone()
-            claimed = db.execute("UPDATE index_task_queue SET status='running',started_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP,attempts=attempts+1 WHERE id=? AND status='pending'", (row["id"],)).rowcount if row else 0
+            # Claiming a row is not yet an execution attempt: workflow locks
+            # may temporarily defer it. Count attempts only after its stage
+            # has actually been acquired, otherwise a blocked item appears
+            # to retry hundreds of times while doing no media work.
+            claimed = db.execute("UPDATE index_task_queue SET status='running',started_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE id=? AND status='pending'", (row["id"],)).rowcount if row else 0
         if not row or not claimed:
             with conditions[job]: conditions[job].wait(timeout=5)
             continue
@@ -829,6 +882,10 @@ def worker(job: str) -> None:
                     conditions[job].wait(timeout=0.25)
                 continue
             stage_started = True
+            with connection() as db:
+                db.execute("UPDATE index_task_queue SET attempts=attempts+1,updated_at=CURRENT_TIMESTAMP WHERE id=?", (row["id"],))
+            row = dict(row)
+            row["attempts"] = int(row.get("attempts") or 0) + 1
             media = Path(path)
             if not media.is_file():
                 recovered = resolve_moved_plex_path(path)
@@ -988,9 +1045,9 @@ def inherit_existing_index_expedites() -> int:
     try:
         from app.v65 import _active_expedite_expiry
         with connection() as db:
-            if not db.execute("SELECT 1 FROM task_queue_expedite WHERE expires_at > ? LIMIT 1", (datetime.now().astimezone().replace(tzinfo=None).isoformat(),)).fetchone():
+            if not db.execute("SELECT 1 FROM task_queue_expedite WHERE expires_at > ? LIMIT 1", (datetime.now().astimezone().isoformat(),)).fetchone():
                 return 0
-            rows = db.execute("SELECT id,path,group_id FROM index_task_queue WHERE status='pending' AND (expedite_until IS NULL OR expedite_until <= CURRENT_TIMESTAMP)").fetchall()
+            rows = db.execute("SELECT id,path,group_id FROM index_task_queue WHERE status='pending' AND (expedite_until IS NULL OR NULLIF(expedite_until,'')::timestamptz <= CURRENT_TIMESTAMP)").fetchall()
             for row in rows:
                 expiry = _active_expedite_expiry(db, row["group_id"], row["path"])
                 if expiry:
@@ -1034,7 +1091,9 @@ def initialize_index_queues() -> None:
 
 
 def start_index_queue_workers() -> None:
-    index_shutdown.clear()
+    # Runtime health checks must never revive workers during app shutdown.
+    if index_shutdown.is_set():
+        return
     # Core indexing is dominated by one mkvmerge process per media file. Two
     # bounded workers improve throughput without turning the storage into an
     # uncontrolled process farm; the subtitle/preview jobs remain serialized.
@@ -1052,7 +1111,6 @@ def start_index_queue_workers() -> None:
         threads[job] = active
 
 
-@app.post("/api/v79/language-detection/flush")
 @app.on_event("shutdown")
 def shutdown_index_queue_workers() -> None:
     index_shutdown.set()
@@ -1065,6 +1123,7 @@ def shutdown_index_queue_workers() -> None:
     logger.info("index_queue event=worker_shutdown workers=%d alive=%d", len(workers), sum(thread.is_alive() for thread in workers))
 
 
+@app.post("/api/v79/language-detection/flush")
 def flush_language_detection(path: str) -> dict:
     from app.v80 import flush_deferred_language_detection
     return flush_deferred_language_detection(path)
@@ -1200,16 +1259,41 @@ def rebuild_index_queue(job: str) -> dict:
     return task
 
 
+@app.post("/api/v80/setup/index/{job}/retry/{task_id}")
+def retry_index_item(job: str, task_id: int) -> dict:
+    """Retry exactly one failed index item without touching sibling media."""
+    validate_jobs([job])
+    with connection() as db:
+        updated = db.execute(
+            "UPDATE index_task_queue SET status='pending',attempts=0,error=NULL,started_at=NULL,finished_at=NULL,updated_at=CURRENT_TIMESTAMP WHERE id=? AND job=? AND status='failed'",
+            (task_id, job),
+        ).rowcount
+    if not updated:
+        raise HTTPException(404, "Failed index item was not found or has already changed state")
+    with conditions[job]:
+        conditions[job].notify_all()
+    logger.info("index_queue=%s event=item_retry_requested task_id=%d", job, task_id)
+    return queue_state(job)
+
+
 @app.post("/api/v80/setup/index/{job}/{action}")
 def control_index_queue(job: str, action: str) -> dict:
     validate_jobs([job])
     if action not in {"pause", "resume", "stop", "retry", "delete-failed"}: raise HTTPException(404, "Unknown index queue action")
     with connection() as db:
+        if action == 'delete-failed':
+            from app.postgres_store import _lock_workflow_mutation, request_recovery_discard
+            _lock_workflow_mutation(db.raw)
+            for row in db.execute("SELECT group_id FROM index_task_queue WHERE job=? AND status='failed' FOR UPDATE", (job,)).fetchall():
+                request_recovery_discard(db.raw, row['group_id'])
         if action == "pause": db.execute("UPDATE index_queue_settings SET paused=1 WHERE job=?", (job,))
         elif action == "resume": db.execute("UPDATE index_queue_settings SET paused=0,stop_requested=0 WHERE job=?", (job,))
         elif action == "stop": db.execute("UPDATE index_queue_settings SET stop_requested=1 WHERE job=?", (job,))
         elif action == "delete-failed": db.execute("DELETE FROM index_task_queue WHERE job=? AND status='failed'", (job,))
         else: db.execute("UPDATE index_task_queue SET status='pending',attempts=0,error=NULL,started_at=NULL,finished_at=NULL,updated_at=CURRENT_TIMESTAMP WHERE job=? AND status='failed'", (job,))
+    if action == 'delete-failed':
+        from app.postgres_store import cleanup_retired_workflow_recovery
+        cleanup_retired_workflow_recovery()
     with conditions[job]: conditions[job].notify_all()
     logger.info("index_queue=%s event=%s", job, action); return queue_state(job)
 

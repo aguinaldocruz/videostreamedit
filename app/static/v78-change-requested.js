@@ -19,10 +19,12 @@
   const oldOpen=openEditor;openEditor=async function(path,label){
     state.selectedPath=path;
     $('#stream-dialog .dialog-title .change-requested-badge')?.remove();
-    let status={change_requested:requested(path),requests:requests(path)};try{status=await api(`/api/v78/change-requested?path=${encodeURIComponent(path)}`)}catch(_){}
-    if(status.change_requested&&!$('#stream-dialog')?.open)toast(`${statusLabel(status.requests)}: hover the notice for queued change details`,status.requests.some(item=>item.status==='failed'));
+    const statusRequest=api(`/api/v78/change-requested?path=${encodeURIComponent(path)}`).catch(()=>({change_requested:requested(path),requests:requests(path)}));
     const result=await oldOpen(path,label);
-    if(status.change_requested&&!$('#stream-dialog')?.open&&!$('#stream-content .change-requested-notice')){
+    const status=await statusRequest;
+    if(state.selectedPath!==path)return result;
+    if(status.change_requested&&!$('#stream-dialog')?.open)toast(`${statusLabel(status.requests)}: hover the notice for queued change details`,status.requests.some(item=>item.status==='failed'));
+    if(status.change_requested&&$('#stream-dialog')?.open&&!$('#stream-content .change-requested-notice')){
       const details=clue(status.requests);$('#stream-content').insertAdjacentHTML('afterbegin',`<p class="change-requested-notice" title="${attr(details)}"><strong>${esc(statusLabel(status.requests))}</strong> — this media has ${status.requests.length} queued, running, or failed request${status.requests.length===1?'':'s'}. Hover for details and review the task queue before applying conflicting edits.</p>`);
       const selected=$('#selected-file');if(selected&&!selected.parentElement.querySelector('.change-requested-badge'))selected.insertAdjacentHTML('afterend',`<span class="change-requested-badge" title="${attr(details)}">${esc(statusLabel(status.requests))}</span>`);
     }

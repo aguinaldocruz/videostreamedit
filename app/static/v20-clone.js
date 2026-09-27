@@ -72,7 +72,6 @@ function normalizeCloneState(state) {
   (value.rows || []).forEach(row => {
     const language = String(row.language || "").trim().toLowerCase();
     if (language === "por") row.language = "pt";
-    if (String(row.language || "").toLowerCase() === "pt" && !String(row.region || "").trim()) row.region = "PT";
     row.region = String(row.region || "").trim().toUpperCase();
   });
   return value;

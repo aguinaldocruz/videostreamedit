@@ -4,6 +4,12 @@ import hashlib
 import json
 import logging
 import re
+import time
+import uuid
+from contextvars import ContextVar
+from urllib.request import Request, urlopen
+from urllib.parse import urlsplit
+from datetime import datetime
 from pathlib import Path
 from typing import Literal
 
@@ -72,14 +78,241 @@ class SeasonStreamBulkEdit(BaseModel):
     mode: Literal["now", "queue"]
 
 
-def ensure_tv_stream_index() -> None:
-    """Legacy no-op retained only for old route call sites.
+class TvEditSessionOpen(BaseModel):
+    show_id: str = Field(min_length=1, max_length=512)
+    show_title: str = Field(default="", max_length=512)
 
-    TV stream filters now read the canonical media_stream_index tables.
+
+class TvEditOperationRequest(BaseModel):
+    path: str = Field(min_length=1, max_length=4096)
+    operation: dict
+
+
+tv_commit_owner = ContextVar('tv_commit_owner', default='')
+
+
+@app.on_event('startup')
+def _ensure_tv_edit_sessions() -> None:
+    """Create the lightweight TV-show draft store.
+
+    Drafts contain operations and fingerprints only; media files are never
+    copied while a show is being edited.
     """
-    return
+    with connection() as db:
+        db.execute("""CREATE TABLE IF NOT EXISTS tv_edit_sessions (
+            session_id TEXT PRIMARY KEY, show_id TEXT NOT NULL, show_title TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'open', created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+            committed_at TEXT, error TEXT)""")
+        db.execute("""CREATE TABLE IF NOT EXISTS tv_edit_operations (
+            operation_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, path TEXT NOT NULL,
+            operation_json TEXT NOT NULL, input_signature TEXT NOT NULL DEFAULT '{}',
+            sequence INTEGER NOT NULL, created_at TEXT NOT NULL,
+            FOREIGN KEY(session_id) REFERENCES tv_edit_sessions(session_id))""")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_tv_edit_operations_session ON tv_edit_operations(session_id, path, sequence)")
+        db.execute("ALTER TABLE tv_edit_sessions ADD COLUMN IF NOT EXISTS commit_task_id INTEGER")
 
 
+def _tv_edit_now() -> str:
+    return tasks.utc_now()
+
+
+def _tv_edit_signature(path: str) -> dict:
+    try:
+        stat = Path(path).stat()
+    except OSError:
+        return {"exists": False, "path": path}
+    return {"exists": True, "size": int(stat.st_size), "mtime_ns": int(stat.st_mtime_ns)}
+
+
+def _tv_edit_session(session_id: str):
+    with connection() as db:
+        row = db.execute("SELECT * FROM tv_edit_sessions WHERE session_id=?", (session_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, "TV-show edit session not found")
+    return dict(row)
+
+
+def tv_edit_save_status(session: dict) -> dict:
+    with connection() as db:
+        if session.get('commit_task_id'):
+            task = db.execute('SELECT id,status,progress_current,progress_total,progress_message,error FROM task_queue WHERE id=?', (session['commit_task_id'],)).fetchone()
+        else:
+            task = db.execute("SELECT id,status,progress_current,progress_total,progress_message,error FROM task_queue WHERE task_type='tv_edit_session_commit' AND payload_json LIKE ? ORDER BY id DESC LIMIT 1", ('%'+session['session_id']+'%',)).fetchone()
+        count = db.execute('SELECT count(DISTINCT path) AS n FROM tv_edit_operations WHERE session_id=?', (session['session_id'],)).fetchone()['n']
+    return {**session, 'task':dict(task) if task else None, 'task_id':task['id'] if task else None,
+            'operation_count':int(count), 'dirty':bool(count) and session['status']=='open'}
+
+
+@app.get('/api/v79/tv/edit-session-active')
+def active_tv_edit_session(show_id: str) -> dict:
+    with connection() as db:
+        row = db.execute("SELECT * FROM tv_edit_sessions WHERE show_id=? AND status IN ('open','committing') ORDER BY created_at DESC LIMIT 1", (show_id,)).fetchone()
+    return {'session':tv_edit_save_status(dict(row)) if row else None}
+
+
+@app.get('/api/v79/tv/edit-session/{session_id}/status')
+def tv_edit_session_status(session_id: str) -> dict:
+    return tv_edit_save_status(_tv_edit_session(session_id))
+
+
+@app.post("/api/v79/tv/edit-session/open")
+def open_tv_edit_session(request: TvEditSessionOpen) -> dict:
+    _ensure_tv_edit_sessions()
+    now = _tv_edit_now()
+    with connection() as db:
+        active = db.execute("SELECT * FROM tv_edit_sessions WHERE show_id=? AND status IN ('open','committing') ORDER BY created_at DESC LIMIT 1", (request.show_id,)).fetchone()
+        if active:
+            session = dict(active)
+        else:
+            session_id = uuid.uuid4().hex
+            db.execute("INSERT INTO tv_edit_sessions(session_id,show_id,show_title,status,created_at,updated_at) VALUES(?,?,?,'open',?,?)", (session_id, request.show_id, request.show_title, now, now))
+            session = {"session_id": session_id, "show_id": request.show_id, "show_title": request.show_title, "status": "open", "created_at": now, "updated_at": now}
+        count = db.execute("SELECT COUNT(*) AS n FROM tv_edit_operations WHERE session_id=?", (session["session_id"],)).fetchone()["n"]
+    session["operation_count"] = int(count or 0)
+    session["dirty"] = bool(count)
+    return tv_edit_save_status(session)
+
+
+@app.get("/api/v79/tv/edit-session/{session_id}")
+def get_tv_edit_session(session_id: str) -> dict:
+    session = _tv_edit_session(session_id)
+    with connection() as db:
+        rows = db.execute("SELECT operation_id,path,operation_json,input_signature,sequence,created_at FROM tv_edit_operations WHERE session_id=? ORDER BY sequence", (session_id,)).fetchall()
+    operations = []
+    for row in rows:
+        item = dict(row)
+        try: item["operation"] = json.loads(item.pop("operation_json") or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError): item["operation"] = {}
+        try: item["input_signature"] = json.loads(item.get("input_signature") or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError): item["input_signature"] = {}
+        operations.append(item)
+    session.update(operation_count=len(operations), dirty=bool(operations), operations=operations)
+    return session
+
+
+@app.get("/api/v79/tv/edit-session/{session_id}/projection")
+def get_tv_edit_projection(session_id: str, path: str) -> dict:
+    session = _tv_edit_session(session_id)
+    if session["status"] not in {"open", "committing"}:
+        return {"session_id": session_id, "path": path, "operations": []}
+    with connection() as db:
+        rows = db.execute("SELECT operation_json FROM tv_edit_operations WHERE session_id=? AND path=? ORDER BY sequence", (session_id, path)).fetchall()
+    operations = []
+    for row in rows:
+        try:
+            value = json.loads(row["operation_json"] or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if not value.get("_discard"):
+            operations.append(value)
+    return {"session_id": session_id, "path": path, "operations": operations}
+
+
+@app.post("/api/v79/tv/edit-session/{session_id}/operation")
+def add_tv_edit_operation(session_id: str, request: TvEditOperationRequest) -> dict:
+    session = _tv_edit_session(session_id)
+    if session["status"] != "open":
+        raise HTTPException(409, "This edit session is no longer open")
+    note_edit = request.operation.get("note_edit")
+    if note_edit is not None:
+        if set(request.operation) != {"note_edit"} or not isinstance(note_edit, dict) or not note_edit or set(note_edit) - {"note", "reviewed", "final_version"}:
+            raise HTTPException(400, "Invalid TV-show draft note change")
+        if "note" in note_edit and (not isinstance(note_edit["note"], str) or len(note_edit["note"]) > 10000):
+            raise HTTPException(400, "TV-show draft note is too long")
+        if any(not isinstance(note_edit[key], bool) for key in ("reviewed", "final_version") if key in note_edit):
+            raise HTTPException(400, "Reviewed and Final version must be true or false")
+        if request.path != f"@show:{session['show_id']}":
+            with connection() as db:
+                media = db.execute("SELECT library_key,show_title,kind FROM plex_media WHERE path=?", (request.path,)).fetchone()
+            if not media or media["kind"] != "episode" or f"{media['library_key']}:{media['show_title'] or 'Unknown show'}" != session["show_id"]:
+                raise HTTPException(400, "Episode does not belong to this TV-show draft")
+    now = _tv_edit_now()
+    signature = _tv_edit_signature(request.path)
+    with connection() as db:
+        locked = db.execute('SELECT status FROM tv_edit_sessions WHERE session_id=? FOR UPDATE', (session_id,)).fetchone()
+        if not locked or locked['status'] != 'open':
+            raise HTTPException(409, 'This draft has already been submitted for saving')
+        if bool(request.operation.get("_discard")):
+            db.execute("DELETE FROM tv_edit_operations WHERE session_id=? AND path=?", (session_id, request.path))
+            db.execute("UPDATE tv_edit_sessions SET updated_at=? WHERE session_id=?", (now, session_id))
+            return {"session_id": session_id, "path": request.path, "discarded": True, "dirty": False}
+        sequence = db.execute("SELECT COALESCE(MAX(sequence),0)+1 AS n FROM tv_edit_operations WHERE session_id=?", (session_id,)).fetchone()["n"]
+        operation_id = uuid.uuid4().hex
+        db.execute("INSERT INTO tv_edit_operations(operation_id,session_id,path,operation_json,input_signature,sequence,created_at) VALUES(?,?,?,?,?,?,?)", (operation_id, session_id, request.path, json.dumps(request.operation, ensure_ascii=False, separators=(",", ":")), json.dumps(signature, separators=(",", ":")), int(sequence), now))
+        db.execute("UPDATE tv_edit_sessions SET updated_at=? WHERE session_id=?", (now, session_id))
+    return {"session_id": session_id, "path": request.path, "operation_id": operation_id, "sequence": int(sequence), "dirty": True}
+
+
+@app.delete("/api/v79/tv/edit-session/{session_id}")
+def discard_tv_edit_session(session_id: str) -> dict:
+    session = _tv_edit_session(session_id)
+    if session["status"] == "committing":
+        raise HTTPException(409, "This edit session is currently being saved")
+    now = _tv_edit_now()
+    with connection() as db:
+        locked = db.execute('SELECT status FROM tv_edit_sessions WHERE session_id=? FOR UPDATE', (session_id,)).fetchone()
+        if not locked or locked['status']=='committing':
+            raise HTTPException(409, 'This draft has already been submitted; it cannot be discarded while saving')
+        db.execute("DELETE FROM tv_edit_operations WHERE session_id=?", (session_id,))
+        db.execute("UPDATE tv_edit_sessions SET status='discarded',updated_at=? WHERE session_id=?", (now, session_id))
+    from app.review_audio import release_draft_audio
+    release_draft_audio(session_id)
+    return {"session_id": session_id, "status": "discarded", "dirty": False}
+
+
+@app.post("/api/v79/tv/edit-session/{session_id}/save")
+def save_tv_edit_session(session_id: str) -> dict:
+    # The durable journal already contains the whole draft. Submit only its
+    # reference; consolidation, validation and file work belong to the worker.
+    with connection() as db:
+        row = db.execute('SELECT * FROM tv_edit_sessions WHERE session_id=? FOR UPDATE', (session_id,)).fetchone()
+        if not row: raise HTTPException(404, 'TV-show edit session not found')
+        session = dict(row)
+        if session['status'] in ('committing','committed'):
+            return {**tv_edit_save_status(session), 'queued':session['status']=='committing'}
+        if session['status'] != 'open': raise HTTPException(409, 'This edit session is not open')
+        count = int(db.execute('SELECT count(DISTINCT path) AS n FROM tv_edit_operations WHERE session_id=?', (session_id,)).fetchone()['n'])
+        now = _tv_edit_now()
+        if not count:
+            db.execute("UPDATE tv_edit_sessions SET status='committed',updated_at=?,committed_at=? WHERE session_id=?", (now,now,session_id))
+            return {'session_id':session_id,'status':'committed','queued':False,'operation_count':0}
+        task = tasks.enqueue('tv_edit_session_commit', {'session_id':session_id,'show_id':session['show_id'],'journal_reference':True,'_queue_group':session_id}, f"Save TV show edit · {session.get('show_title') or session['show_id']}", deduplicate=True)
+        db.execute("UPDATE tv_edit_sessions SET status='committing',commit_task_id=?,updated_at=?,error=NULL WHERE session_id=?", (task['id'],now,session_id))
+    return {'session_id':session_id,'status':'committing','queued':True,'task_id':task['id'],'operation_count':count}
+
+
+def load_tv_commit_journal(session_id: str) -> list[dict]:
+    with connection() as db:
+        rows = db.execute('SELECT path,operation_json,input_signature,sequence FROM tv_edit_operations WHERE session_id=? ORDER BY sequence', (session_id,)).fetchall()
+    consolidated = {}
+    for row in rows:
+        try: operation = json.loads(row["operation_json"] or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ValueError('A stored TV draft operation is invalid; the draft was retained') from exc
+        try:
+            signature = json.loads(row["input_signature"] or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            signature = {}
+        entry = consolidated.setdefault(str(row["path"]), {"path": str(row["path"]), "journal": [], "_media_signature": signature})
+        entry["journal"].append(operation)
+    return sorted(consolidated.values(), key=lambda item:item['path'].startswith('@show:'))
+
+
+
+
+@app.get("/api/v79/language-detection/settings")
+def get_language_detection_settings() -> dict:
+    with connection() as db:
+        row = db.execute("SELECT value FROM language_detection_settings WHERE key='common_languages'").fetchone()
+    try:
+        values = json.loads(row["value"]) if row else []
+    except (TypeError, ValueError, json.JSONDecodeError):
+        values = []
+    values = [str(value).strip() for value in values if str(value).strip()]
+    return {"common_languages": values}
+
+
+@app.put("/api/v79/language-detection/settings")
 def update_language_detection_settings(request: LanguageDetectionSettings) -> dict:
     values = []
     for value in request.common_languages:
@@ -157,6 +390,23 @@ def get_voice_detection_settings() -> dict:
     return voice_detection_settings()
 
 
+@app.get("/api/v79/audio-language-detection/health")
+def voice_detection_health() -> dict:
+    settings = voice_detection_settings()
+    if not settings["enabled"]:
+        return {"status": "disabled", "message": "Voice detection is disabled"}
+    if urlsplit(settings["service_url"]).scheme not in {"http", "https"}:
+        return {"status": "unavailable", "message": "Service URL must use HTTP or HTTPS"}
+    try:
+        request = Request(settings["service_url"].rstrip("/") + "/healthz", headers={"Accept": "application/json"})
+        with urlopen(request, timeout=3) as response:
+            if response.status != 200:
+                raise RuntimeError(f"Service returned HTTP {response.status}")
+        return {"status": "healthy", "message": "Voice detection service is reachable"}
+    except Exception as exc:
+        return {"status": "unavailable", "message": str(exc)[:300]}
+
+
 @app.get("/api/v79/language-detection/queue-settings")
 def get_detection_queue_settings() -> dict:
     with connection() as db:
@@ -219,19 +469,11 @@ class StreamLanguageDetectionRequest(BaseModel):
 
 @app.post("/api/v79/language-detection/reset-media")
 def reset_media_language_detection(request: AudioLanguageDetectionRequest) -> dict:
-    """Clear media-level subtitle detection markers after an interactive review.
-
-    The editor keeps the just-computed result in its local view, while listing
-    dots are intentionally cleared so a completed manual check cannot leave a
-    stale aggregate warning beside the movie or episode.
-    """
+    """Acknowledge older browser refresh requests without deleting evidence."""
     path = str(Path(request.path).resolve())
-    with connection() as db:
-        removed = db.execute("DELETE FROM portuguese_language_detection WHERE path=?", (path,)).rowcount
-        removed += db.execute("DELETE FROM subtitle_detection_stream_state WHERE path=?", (path,)).rowcount
-        db.execute("DELETE FROM portuguese_detection_state WHERE path=?", (path,))
-    logger.info("language_detection event=interactive_media_reset file=%s rows=%d", path.replace("\n", "\\n"), removed)
-    return {"path": path, "reset": True, "removed": removed}
+    # Older open browser tabs still call this after checking one stream.
+    # Evidence is retained; listing aggregates read the updated results.
+    return {"path": path, "reset": False, "removed": 0, "refreshed": True}
 
 
 @app.post("/api/v79/language-detection/stream")
@@ -243,16 +485,21 @@ def detect_stream_language(request: StreamLanguageDetectionRequest) -> dict:
         raise HTTPException(404, "Media is not an accessible synchronized Plex item")
     from app.v86 import assert_media_editable
     assert_media_editable(path)
+    from app.detection_policy import source_stamp, is_final
+    initial_stamp = source_stamp(path)
     if request.codec_type == "audio":
         try:
-            result = tasks.process_audio_language_detection(0, {"path": path})
+            result = tasks.process_audio_language_detection(0, {"path": path, "stream_indices": [request.type_index]})
         except Exception as exc:
             raise HTTPException(422, f"Audio language detection failed: {exc}") from exc
         selected = next((item for item in result.get("results", []) if int(item.get("type_index", -1)) == request.type_index), None)
         return {"status": "completed", "codec_type": "audio", **(selected or {"type_index": request.type_index, "detected_language": "", "confidence": 0})}
     source = "external" if request.external else "embedded"
     with connection() as db:
-        row = db.execute("SELECT external_path FROM media_stream_index WHERE path=? AND stream_type='subtitle' AND source=? AND type_index=?", (path, source, request.type_index)).fetchone()
+        row = db.execute("SELECT external_path,codec FROM media_stream_index WHERE path=? AND stream_type IN ('subtitle','external') AND source=? AND type_index=?", (path, source, request.type_index)).fetchone()
+    if source == 'embedded' and row and str(row['codec'] or '').lower() in {'hdmv_pgs_subtitle','dvd_subtitle','dvb_subtitle','pgs','vobsub'}:
+        raise HTTPException(422, 'Graphical subtitle language detection is unsupported; no discrepancy warning was created')
+    external_stamp = source_stamp(row['external_path']) if source == 'external' and row and row['external_path'] else None
     try:
         if source == "external":
             if not row or not row["external_path"]:
@@ -269,6 +516,8 @@ def detect_stream_language(request: StreamLanguageDetectionRequest) -> dict:
     # Persist it so a correct manual result does not reappear as a stale
     # no-confidence marker when the editor or report is reopened.
     confidence = float(confidence or 0.0)
+    if is_final(path) or source_stamp(path) != initial_stamp or (external_stamp and source_stamp(row['external_path']) != external_stamp):
+        raise HTTPException(409, 'Media changed or became Final Version during detection; result discarded')
     with connection() as db:
         metadata = db.execute(
             "SELECT language,region,codec,external_path FROM media_stream_index "
@@ -278,21 +527,11 @@ def detect_stream_language(request: StreamLanguageDetectionRequest) -> dict:
         metadata_language = str(metadata["language"] if metadata else "")
         metadata_region = str(metadata["region"] if metadata else "")
         external_path = str(metadata["external_path"] if metadata else "")
-        if not detected or confidence <= 0.60:
-            status, reason = "no_confidence", "No confident common language detected"
-        else:
-            expected = (
-                "pt-BR" if metadata_language == "pt" and metadata_region.upper() == "BR"
-                else "pt-PT" if metadata_language == "pt"
-                else "en" if metadata_language == "en"
-                else "und"
-            )
-            detected_base = detected.casefold().split("-", 1)[0]
-            metadata_base = metadata_language.casefold().split("-", 1)[0]
-            agrees = bool(metadata_language) and (detected.casefold() == expected.casefold() or (detected_base == metadata_base and detected in {"pt", "en"}))
-            status = "complete" if agrees else "mismatch"
-            reason = ("Detected base language agrees; regional variant not distinguishable" if detected == "pt" and metadata_base == "pt" else "Detected language agrees with metadata") if status == "complete" else (evidence or "Detected language differs from metadata")
-        signature = hashlib.sha256(json.dumps([path, source, request.type_index, external_path, text], ensure_ascii=False).encode()).hexdigest()
+        from app.detection_policy import subtitle_assessment
+        detected, confidence, evidence, assessment = subtitle_assessment(text, metadata['codec'] if metadata else '', metadata_language, metadata_region, allowed)
+        # The same assessment is used by scheduled inspection and Evaluate.
+        status, reason = assessment, evidence
+        signature = _subtitle_analysis_signature(path, {'source': source, 'type_index': request.type_index, 'external_path': external_path, 'codec': metadata['codec'] if metadata else '', 'language': metadata_language, 'region': metadata_region}, common_detection_languages(), Path(path).stat())
         db.execute(
             "DELETE FROM portuguese_language_detection WHERE path=? AND source=? AND type_index=? AND external_path=?",
             (path, source, request.type_index, external_path),
@@ -308,6 +547,10 @@ def detect_stream_language(request: StreamLanguageDetectionRequest) -> dict:
             "(path,source,type_index,external_path,signature,status,reason,checked_at) VALUES(?,?,?,?,?,?,?,CURRENT_TIMESTAMP)",
             (path, source, request.type_index, external_path, signature, status, reason),
         )
+        metrics = _subtitle_metrics(text)
+        sdh_label, sdh_confidence, sdh_evidence = analyze_sdh(text)
+        db.execute('UPDATE portuguese_language_detection SET cue_count=?,text_chars=?,text_coverage=?,markup_count=?,damage=?,evidence_sample=?,sdh_label=?,sdh_confidence=?,sdh_evidence=? WHERE path=? AND source=? AND type_index=? AND external_path=?',
+                   (metrics['cue_count'], metrics['text_chars'], metrics['text_coverage'], metrics['markup_count'], metrics['damage'], normalized_evidence_sample(text), sdh_label, sdh_confidence, sdh_evidence, path, source, request.type_index, external_path))
     return {"status": "completed", "codec_type": "subtitle", "detected_language": detected, "confidence": confidence, "evidence": evidence, "analysis_status": status, "analysis_reason": reason}
 
 
@@ -325,13 +568,23 @@ def queue_audio_language_detection(request: AudioLanguageDetectionRequest) -> di
 
 @app.get("/api/v79/reports/audio-language")
 def audio_language_report() -> dict:
+    # Final Version media stay browseable but are excluded from actionable reports.
+    from app.v19 import report_blocked_paths
+    blocked_paths = report_blocked_paths()
     with connection() as db:
         rows = db.execute("""SELECT d.path,d.type_index,d.metadata_language,d.metadata_region,
-            d.detected_language,d.confidence,d.samples_json,p.kind,p.title
+            d.detected_language,d.confidence,d.samples_json,p.kind,p.title,s.language AS current_language,s.region AS current_region
             FROM audio_language_detection d JOIN plex_media p ON p.path=d.path
+            JOIN media_stream_index s ON s.path=d.path AND s.stream_type='audio' AND s.source='embedded' AND s.type_index=d.type_index
             WHERE d.mismatch=1 ORDER BY p.title COLLATE NOCASE,d.path,d.type_index""").fetchall()
     items=[]
+    from app.v19 import audio_detection_by_path
+    valid_paths = audio_detection_by_path({str(row['path']) for row in rows})
     for row in rows:
+        if str(row["path"]) in blocked_paths or str(row['path']) not in valid_paths:
+            continue
+        from app.detection_policy import language_matches
+        if language_matches(row['detected_language'], row['current_language'], row['current_region']): continue
         item=dict(row)
         try: item["samples"]=json.loads(item.pop("samples_json") or "[]")
         except (TypeError,ValueError,json.JSONDecodeError): item["samples"]=[]
@@ -354,22 +607,6 @@ def common_detection_languages() -> list[str]:
     return [str(value).strip() for value in values if str(value).strip()]
 
 
-def initialize_tv_stream_index() -> None:
-    ensure_tv_stream_index()
-    with connection() as db:
-        version = db.execute("SELECT value FROM tv_stream_index_settings WHERE key='format_version'").fetchone()
-        if not version or version["value"] != "2":
-            db.execute("DELETE FROM tv_stream_index_value")
-            db.execute("DELETE FROM tv_stream_index_media")
-            db.execute("INSERT OR REPLACE INTO tv_stream_index_settings(key,value) VALUES('format_version','2')")
-            logger.info("tv_season_index event=format_upgraded version=2 external_subtitles=enabled")
-        db.execute("DELETE FROM tv_stream_index_value WHERE path NOT IN (SELECT path FROM plex_media WHERE kind='episode')")
-        db.execute("DELETE FROM tv_stream_index_media WHERE path NOT IN (SELECT path FROM plex_media WHERE kind='episode')")
-        db.execute("DELETE FROM external_subtitle_index WHERE media_path NOT IN (SELECT path FROM plex_media)")
-        db.execute("DELETE FROM external_sidecar_index_state WHERE path NOT IN (SELECT path FROM plex_media)")
-        db.execute("DELETE FROM portuguese_language_detection WHERE path NOT IN (SELECT path FROM plex_media)")
-        db.execute("DELETE FROM portuguese_detection_state WHERE path NOT IN (SELECT path FROM plex_media)")
-        db.execute("DELETE FROM subtitle_detection_stream_state WHERE path NOT IN (SELECT path FROM plex_media)")
 
 
 def external_sidecar_data(path: str, candidates: list[Path] | None = None) -> tuple[list[dict], str]:
@@ -424,7 +661,6 @@ def persist_external_sidecars(job: str, path: str) -> None:
 
 
 def pending_external_sidecars(job: str) -> list[dict]:
-    ensure_tv_stream_index()
     with connection() as db:
         rows = [dict(row) for row in db.execute("""
             SELECT media.path,media.modified,media.size,media.title,state.signature
@@ -469,7 +705,6 @@ def pending_external_sidecars(job: str) -> list[dict]:
 
 def pending_episode_rows() -> list[dict]:
     """Return stale episodes from canonical filesystem freshness state."""
-    ensure_tv_stream_index()
     with connection() as db:
         rows = [dict(row) for row in db.execute("""
             SELECT media.path,media.title,state.modified_ns,state.size
@@ -504,33 +739,6 @@ def inspect_embedded_streams(path: str) -> list[tuple[str, str, str, str]]:
         for stream in details.get("external_subtitles", [])
     ]
     return embedded + external
-
-
-def index_episode(item: dict) -> None:
-    ensure_tv_stream_index()
-    path = str(item["path"])
-    values = inspect_embedded_streams(path)
-    with connection() as db:
-        db.execute("DELETE FROM tv_stream_index_value WHERE path=?", (path,))
-        db.executemany(
-            "INSERT INTO tv_stream_index_value(path,stream_type,language,region,track_name) VALUES(?,?,?,?,?)",
-            [(path, *value) for value in values],
-        )
-        db.execute(
-            "INSERT OR REPLACE INTO tv_stream_index_media(path,modified,size,indexed_at) VALUES(?,?,?,datetime('now'))",
-            (path, int(item["modified"]), int(item["size"])),
-        )
-    persist_external_sidecars("core", path)
-
-
-def core_index_with_tv(item: dict) -> None:
-    with connection() as db:
-        row = db.execute("SELECT kind FROM plex_media WHERE path=?", (item["path"],)).fetchone()
-    if row and row["kind"] == "episode":
-        index_episode(item)
-    else:
-        _legacy_processors["core"](item)
-        persist_external_sidecars("core", str(item["path"]))
 
 
 _PT_VARIANT_RESOURCE = Path(__file__).with_name("data") / "pt_variant_lexicon.json"
@@ -584,12 +792,12 @@ def detect_common_variant(text: str, allowed_languages: set[str] | None = None) 
     elif portuguese >= 6 and portuguese >= en * 1.20 and (pt >= 2 or br >= 2):
         # Ambiguous Portuguese is deliberately ignored instead of producing a
         # misleading PT-BR/PT-PT mismatch report.
-        if br >= 2 and br > pt:
+        if br >= 3 and br >= pt + 2 and br >= pt * 1.5:
             detected, score, total = "pt-BR", portuguese, portuguese + en
-        elif pt >= 2 and pt > br:
+        elif pt >= 3 and pt >= br + 2 and pt >= br * 1.5:
             detected, score, total = "pt-PT", portuguese, portuguese + en
         else:
-            return "", 0.0, ""
+            return "pt", .80, "Portuguese identified; insufficient independent evidence for a regional variant"
     else:
         # A subtitle containing substantial evidence for both Portuguese and
         # English is often a bilingual/dual-language track or an OCR/credit
@@ -671,7 +879,7 @@ def _subtitle_analysis_signature(path: str, stream: dict, configured: list[str],
             external_state = (item.st_size, item.st_mtime_ns)
         except OSError:
             external_state = ("missing",)
-    payload = [detector_version, str(path), stream.get("source"), int(stream.get("type_index") or -1),
+    payload = [detector_version, str(path), stream.get("source"), int(stream['type_index']) if stream.get('type_index') is not None else -1,
                external, str(stream.get("codec") or ""), str(stream.get("language") or ""),
                str(stream.get("region") or ""), stat.st_size, stat.st_mtime_ns, external_state, configured]
     return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
@@ -703,6 +911,8 @@ def _subtitle_metrics(text: str) -> dict:
 
 
 def inspect_portuguese_language(path: str, detection_scope: dict | None = None, text_cache: dict | None = None) -> None:
+    from app.detection_policy import is_final, source_stamp, subtitle_assessment, language_key
+    if is_final(path): return
     media = Path(path)
     if not media.is_file():
         return
@@ -710,6 +920,7 @@ def inspect_portuguese_language(path: str, detection_scope: dict | None = None, 
     requested = detection_scope.get("subtitle_indices")
     force_targeted = bool(requested)
     stat = media.stat()
+    initial_stamp = source_stamp(path)
     configured = common_detection_languages()
     bases = {value.casefold().split("-", 1)[0].split("_", 1)[0] for value in configured}
     with connection() as db:
@@ -718,15 +929,16 @@ def inspect_portuguese_language(path: str, detection_scope: dict | None = None, 
             "WHERE path=? AND stream_type IN ('subtitle','external')", (path,)
         ).fetchall()
         existing = {
-            (str(row["source"]), int(row["type_index"]), str(row["external_path"] or "")): dict(row)
+            (str(row["source"]), (int(row["type_index"]) if row["type_index"] is not None else -1), str(row["external_path"] or "")): dict(row)
             for row in db.execute("SELECT * FROM portuguese_language_detection WHERE path=?", (path,)).fetchall()
         }
         states = {
-            (str(row["source"]), int(row["type_index"]), str(row["external_path"] or "")): dict(row)
+            (str(row["source"]), (int(row["type_index"]) if row["type_index"] is not None else -1), str(row["external_path"] or "")): dict(row)
             for row in db.execute("SELECT * FROM subtitle_detection_stream_state WHERE path=?", (path,)).fetchall()
         }
     wanted = {int(item) for item in requested} if requested and requested != "all" else None
     streams = [dict(row) for row in stream_rows]
+    external_stamps = {str(s['external_path']): source_stamp(s['external_path']) for s in streams if s['source'] == 'external' and s['external_path'] and Path(s['external_path']).is_file()}
     if wanted is not None:
         streams = [stream for stream in streams if stream["source"] == "embedded" and int(stream["type_index"]) in wanted]
     cache = text_cache if text_cache is not None else {}
@@ -736,10 +948,18 @@ def inspect_portuguese_language(path: str, detection_scope: dict | None = None, 
         stream_signature = _subtitle_analysis_signature(path, stream, configured, stat)
         prior_state = states.get(key)
         prior_row = existing.get(key)
+        if detection_scope.get('subtitle_recompare') and prior_row and prior_row.get('analysis_status') in {'complete', 'mismatch'} and prior_row.get('detector_version') == SUBTITLE_DETECTOR_VERSION:
+            from app.detection_policy import language_matches
+            reused = dict(prior_row)
+            agrees = language_matches(reused['detected_language'], stream['language'], stream['region'])
+            reused.update(metadata_language=stream['language'], metadata_region=stream['region'], analysis_signature=stream_signature,
+                          analysis_status='complete' if agrees else 'mismatch', analysis_reason='Existing content evidence compared with updated metadata')
+            results.append(reused)
+            continue
         if prior_state and prior_row and prior_state.get("signature") == stream_signature and not force_targeted:
             results.append(prior_row)
             continue
-        metadata_language = str(stream["language"] or "").strip().casefold()
+        metadata_language = language_key(stream["language"])[0]
         base = {
             "path": path, "source": key[0], "type_index": key[1], "external_path": key[2],
             "metadata_language": str(stream["language"] or ""), "metadata_region": str(stream["region"] or ""),
@@ -748,10 +968,8 @@ def inspect_portuguese_language(path: str, detection_scope: dict | None = None, 
             "analysis_reason": "", "analysis_signature": stream_signature, "detector_version": SUBTITLE_DETECTOR_VERSION,
             "cue_count": 0, "text_chars": 0, "text_coverage": 0.0, "markup_count": 0, "damage": "",
         }
-        if metadata_language and metadata_language not in bases and metadata_language != "und":
-            base.update(analysis_status="skipped_non_common", analysis_reason="Metadata language is outside configured common languages")
-            results.append(base)
-            continue
+        # Check all subtitles for common-language evidence, even when their
+        # current metadata claims a different language.
         try:
             codec = str(stream.get("codec") or "").casefold()
             if stream["source"] == "external":
@@ -774,48 +992,18 @@ def inspect_portuguese_language(path: str, detection_scope: dict | None = None, 
                 base.update(analysis_status="no_confidence", analysis_reason=f"Unsupported graphical subtitle codec: {codec or 'unknown'}")
             base.update(_subtitle_metrics(text))
             base["evidence_sample"] = normalized_evidence_sample(text)
-            detected, confidence, evidence = detect_common_variant(text, bases)
-            confidence = calibrate_subtitle_confidence(confidence, int(base.get("cue_count") or 0), int(base.get("text_chars") or 0), float(base.get("text_coverage") or 0.0))
             sdh_label, sdh_confidence, sdh_evidence = analyze_sdh(text)
-            base.update(detected_language=detected, confidence=confidence, evidence=evidence,
-                        sdh_label=sdh_label, sdh_confidence=sdh_confidence, sdh_evidence=sdh_evidence)
-            # Quality problems take precedence over language confidence. A
-            # subtitle can contain enough Portuguese/English vocabulary to
-            # score highly while still being unusable (OCR gibberish,
-            # mojibake, malformed timing, or an advertising payload). These
-            # findings must remain actionable instead of being reported as a
-            # healthy match or a language mismatch.
-            quality_issue = subtitle_quality_issue(text, str(base.get("damage") or ""))
-            if quality_issue:
-                base.update(analysis_status="no_confidence", analysis_reason=quality_issue)
-            elif not detected or confidence <= 0.60:
-                # Keep the reason specific enough for a user to act on. In
-                # particular, an unsupported graphical stream must not be
-                # overwritten by the generic language-scoring message.
-                if str(base.get("analysis_reason") or "").startswith("Unsupported graphical"):
-                    reason = str(base["analysis_reason"])
-                elif int(base.get("cue_count") or 0) == 0 or int(base.get("text_chars") or 0) == 0:
-                    reason = "No readable subtitle cues"
-                elif int(base.get("text_chars") or 0) < 40:
-                    reason = "Too little subtitle text for reliable language detection"
-                else:
-                    reason = evidence or "No confident common language detected"
-                base.update(analysis_status="no_confidence", analysis_reason=reason)
-            else:
-                expected = "pt-BR" if metadata_language == "pt" and str(stream["region"] or "").upper() == "BR" else "pt-PT" if metadata_language == "pt" else "en" if metadata_language == "en" else "und"
-                detected_base = detected.casefold().split("-", 1)[0]
-                metadata_base = metadata_language.casefold().split("-", 1)[0]
-                agrees = metadata_language not in {"", "und"} and (detected.casefold() == expected.casefold() or (detected_base == metadata_base and detected in {"pt", "en"}))
-                if metadata_language in {"", "und"} or not agrees:
-                    base.update(analysis_status="mismatch", analysis_reason=evidence or "Detected language differs from metadata")
-                else:
-                    reason = "Detected base language agrees; regional variant not distinguishable" if detected == "pt" and metadata_base == "pt" else "Detected language agrees with metadata"
-                    base.update(analysis_status="complete", analysis_reason=reason)
+            base.update(sdh_label=sdh_label, sdh_confidence=sdh_confidence, sdh_evidence=sdh_evidence)
+            detected, confidence, evidence, assessment = subtitle_assessment(text, codec, stream['language'], stream['region'], bases)
+            base.update(detected_language=detected, confidence=confidence, evidence=evidence, analysis_status=assessment, analysis_reason=evidence)
         except (OSError, ValueError, TypeError) as exc:
             base.update(analysis_status="unreadable", analysis_reason=f"Subtitle text could not be read: {str(exc)[:240]}")
         results.append(base)
     columns = ["path", "source", "type_index", "external_path", "metadata_language", "metadata_region", "detected_language", "confidence", "evidence", "sdh_label", "sdh_confidence", "sdh_evidence", "evidence_sample", "analysis_status", "analysis_reason", "analysis_signature", "detector_version", "cue_count", "text_chars", "text_coverage", "markup_count", "damage"]
     placeholders = ",".join("?" for _ in columns)
+    if is_final(path) or source_stamp(path) != initial_stamp or any(not Path(p).is_file() or source_stamp(p) != stamp for p, stamp in external_stamps.items()):
+        logger.info('language_detection event=discarded_stale_or_final file=%s', path)
+        return
     with connection() as db:
         if wanted is not None:
             marks = ",".join("?" for _ in wanted)
@@ -835,8 +1023,12 @@ def _is_final_version(path: str) -> bool:
         media = db.execute("SELECT kind,library_key,show_title FROM plex_media WHERE path=?", (str(path),)).fetchone()
         if not media:
             return False
-        entity = ("movie", str(path)) if media["kind"] == "movie" else ("tv", f"{media['library_key']}:{media['show_title'] or 'Unknown show'}")
-        row = db.execute("SELECT final_version FROM media_notes WHERE entity_type=? AND entity_key=?", entity).fetchone()
+        from app.v86 import final_version_entity_for_path
+        entity = final_version_entity_for_path(path)
+        row = db.execute("SELECT final_version FROM media_notes WHERE entity_type=? AND entity_key=?", entity).fetchone() if entity else None
+        if not (row and row["final_version"]) and media["kind"] == "episode":
+            parent = ("tv", f"{media['library_key']}:{media['show_title'] or 'Unknown show'}")
+            row = db.execute("SELECT final_version FROM media_notes WHERE entity_type=? AND entity_key=?", parent).fetchone()
     return bool(row and row["final_version"])
 
 
@@ -855,20 +1047,54 @@ def subtitle_index_with_sidecars(item: dict) -> None:
         inspect_portuguese_language(path, scope, text_cache)
 
 
-def preview_index_with_sidecars(item: dict) -> None:
-    path = str(item["path"])
-    if _is_final_version(path):
-        logger.info("preview_cache event=skipped_final_version file=%s", path.replace("\n", "\\n"))
-        return
-    _legacy_processors["previews"](item)
-    persist_external_sidecars("previews", str(item["path"]))
-
-
-indexes.processors["core"] = core_index_with_tv
 indexes.processors["subtitles"] = subtitle_index_with_sidecars
-indexes.processors["previews"] = preview_index_with_sidecars
 
 
+
+def indexed_effective_target_paths(paths: list[str], request: SeasonStreamBulkEdit, targets: dict[str, list[str]]) -> list[str]:
+    """Reduce tag-only bulk edits using indexed default/forced state."""
+    changed = set(request.changed_fields)
+    candidates = [path for path in paths if targets.get(path)]
+    if not candidates or not changed or not changed.issubset({"default", "forced"}):
+        return candidates
+    by_path: dict[str, list[dict]] = {path: [] for path in candidates}
+    with connection() as db:
+        for start in range(0, len(candidates), 800):
+            group = candidates[start:start + 800]
+            rows = db.execute(
+                f"SELECT path,stream_type,type_index,is_default,is_forced FROM media_stream_index WHERE path IN ({', '.join('?' for _ in group)})",
+                group,
+            ).fetchall()
+            for row in rows:
+                by_path[str(row["path"])].append(dict(row))
+    stream_type = request.filters.stream_type if request.filters.stream_type in {"audio", "subtitle"} else None
+    if stream_type is None:
+        return candidates
+    effective: list[str] = []
+    for path, rows in by_path.items():
+        keys = set(targets[path])
+        typed = [row for row in rows if not stream_type or str(row.get("stream_type")) == stream_type]
+        matching = [row for row in typed if f"embedded:{row.get('stream_type')}:{row.get('type_index')}" in keys]
+        matching.sort(key=lambda row: int(row.get("type_index") or 0))
+        if not matching:
+            continue
+        needs_change = False
+        for field, action in (("default", request.default_action), ("forced", request.forced_action)):
+            if field not in changed or action == "unchanged":
+                continue
+            if action == 'clear':
+                if any(str(row.get('is_'+field)).lower() in {'1','true','t','yes'} for row in matching):
+                    needs_change = True
+                    break
+                continue
+            desired = None if action == "clear" else f"embedded:{matching[-1].get('stream_type')}:{matching[-1].get('type_index')}"
+            current = {f"embedded:{row.get('stream_type')}:{row.get('type_index')}" for row in typed if str(row.get("is_default" if field == "default" else "is_forced")).lower() in {"1", "true", "t", "yes"}}
+            if current != {desired}:
+                needs_change = True
+                break
+        if needs_change:
+            effective.append(path)
+    return effective
 def selected_episode_rows(paths: list[str]) -> list[dict]:
     unique = list(dict.fromkeys(paths))
     found = []
@@ -883,26 +1109,62 @@ def selected_episode_rows(paths: list[str]) -> list[dict]:
             found.extend(dict(row) for row in rows)
     if {item["path"] for item in found} != set(unique):
         raise HTTPException(409, "The selected season changed. Refresh TV Shows and try again")
-    from app.v86 import assert_media_editable
-    for item in found:
-        assert_media_editable(item["path"])
+    # This is a read-only path used to populate filter options.  Do not run
+    # per-episode Final-version editability checks here: they add several DB
+    # queries per episode and unnecessarily delay opening filters.  Edit and
+    # queue endpoints enforce the Final-version lock before mutating media.
     return found
 
 
 def _queue_recoverable_stale_indexes(paths: set[str]) -> set[str]:
-    """Queue accessible stale files without retrying terminal failures forever."""
+    """Queue accessible stale files without racing a just-finished index.
+
+    TV status/filter refreshes can run while a core worker is committing its
+    read model.  During that small visibility window the file looks stale and
+    a second reconciliation request used to be created.  Suppress only that
+    short race window; if the filesystem mtime is newer than the successful
+    index, the request remains eligible immediately.
+    """
     if not paths:
         return set()
     from app.v80 import enqueue
+    placeholders = ",".join("?" for _ in paths)
+    ordered_paths = list(paths)
     with connection() as db:
         active = {row["path"] for row in db.execute("SELECT path FROM index_task_queue WHERE job=\'core\' AND status IN (\'pending\',\'running\')").fetchall()}
         failed = {row["path"] for row in db.execute("SELECT path FROM index_task_queue WHERE job=\'core\' AND status=\'failed\'").fetchall()}
+        recent_rows = db.execute(
+            f"SELECT path,finished_at FROM index_task_queue WHERE job='core' AND status='succeeded' AND path IN ({placeholders}) AND finished_at IS NOT NULL ORDER BY id DESC",
+            ordered_paths,
+        ).fetchall()
+    recent_success: dict[str, float] = {}
+    for row in recent_rows:
+        if row["path"] in recent_success:
+            continue
+        try:
+            recent_success[row["path"]] = datetime.fromisoformat(str(row["finished_at"])).timestamp()
+        except (TypeError, ValueError, OSError):
+            continue
     queued = set()
+    suppressed = 0
     for path in paths:
         if path in active or path in failed or not Path(path).is_file():
             continue
+        finished = recent_success.get(path)
+        if finished is not None:
+            try:
+                # Only suppress a reconciliation caused by the same file
+                # state. A write after the successful index is always allowed
+                # through, even if it happened inside the cooldown window.
+                if Path(path).stat().st_mtime <= finished + 1.0:
+                    suppressed += 1
+                    continue
+            except OSError:
+                continue
         if enqueue("core", path, "Automatic stale fingerprint reconciliation"):
             queued.add(path)
+    if suppressed:
+        logger.info("index_queue=core event=stale_reconciliation_coalesced items=%d", suppressed)
     return queued
 
 @app.post("/api/v79/tv/show-status")
@@ -915,8 +1177,10 @@ def tv_show_status(request: TvShowStatusRequest) -> dict:
         change_paths = {row["path"] for row in db.execute(
             f"SELECT marker.path FROM media_change_request marker JOIN task_queue task ON task.id=marker.task_id WHERE marker.path IN ({placeholders}) AND task.status IN ('pending','running') AND task.task_type NOT IN ('audio_language_detection')", paths
         ).fetchall()}
+        # Failed historical rows are diagnostics, not currently blocking work.
+        # Only pending/running rows can make cached filter values unsafe.
         index_paths = {row["path"] for row in db.execute(
-            f"SELECT DISTINCT path FROM index_task_queue WHERE path IN ({placeholders}) AND status IN ('pending','running','failed') AND job <> 'subtitles'", paths
+            f"SELECT DISTINCT path FROM index_task_queue WHERE path IN ({placeholders}) AND status IN ('pending','running') AND job <> 'subtitles'", paths
         ).fetchall()}
         indexed = {row["path"]: (row["modified_ns"], row["size"]) for row in db.execute(
             f"SELECT path,modified_ns,size FROM media_stream_index_state WHERE path IN ({placeholders})", paths
@@ -932,17 +1196,26 @@ def tv_show_status(request: TvShowStatusRequest) -> dict:
             stale_paths.add(path)
     auto_queued = _queue_recoverable_stale_indexes(stale_paths)
     if auto_queued:
-        index_paths.update(auto_queued)
+        # Re-read the durable queue: a short reconciliation may finish before
+        # this request returns, which must not leave the UI falsely locked.
+        with connection() as db:
+            index_paths = {row["path"] for row in db.execute(
+                f"SELECT DISTINCT path FROM index_task_queue WHERE path IN ({placeholders}) AND status IN ('pending','running') AND job <> 'subtitles'", paths
+            ).fetchall()}
+    # Queued media edits are safe to leave in the background: LUW/signature
+    # protection isolates them and users may continue working on other media.
+    # Index freshness is the only blocking condition because TV filters depend
+    # on it to select the correct episodes.
     reasons = []
-    if change_paths: reasons.append("changes queued or processing")
     if index_paths: reasons.append("index update queued or processing")
-    if stale_paths: reasons.append("index needs updating")
-    return {"active": bool(reasons), "reasons": reasons, "changes": len(change_paths), "indexing": len(index_paths), "stale": len(stale_paths)}
+    # Stale files are reconciled in the background.  They remain visible in
+    # diagnostics, but do not lock editing once no index work is active.
+    if stale_paths and not index_paths: reasons.append("index refresh requested")
+    return {"active": bool(index_paths), "reasons": reasons, "changes": len(change_paths), "indexing": len(index_paths), "stale": len(stale_paths)}
 
 
 @app.post("/api/v79/tv/season-stream-values")
 def season_stream_values(request: SeasonStreamRequest) -> dict:
-    ensure_tv_stream_index()
     items = selected_episode_rows(request.paths)
     pending = []
     # Use the unified index fingerprint (filesystem mtime/size).  The legacy
@@ -985,7 +1258,7 @@ def season_stream_values(request: SeasonStreamRequest) -> dict:
         for start in range(0, len(paths), 800):
             group = paths[start:start + 800]
             rows = db.execute(
-                f"SELECT path,stream_type,language,region,track_name,filename_tags FROM media_stream_index WHERE path IN ({','.join('?' for _ in group)})",
+                f"SELECT path,source,stream_type,type_index,external_path,language,region,track_name,is_default,is_forced,filename_tags FROM media_stream_index WHERE path IN ({','.join('?' for _ in group)})",
                 group,
             ).fetchall()
             for row in rows:
@@ -1075,7 +1348,10 @@ def episode_bulk_edit(path: str, request: SeasonStreamBulkEdit) -> tuple[dict, i
             update["region"] = request.region if "region" in changed else str(stream.get("region") or "")
         if "track_name" in changed:
             update["title"] = request.track_name
-        if any(update.get(field) != str(stream.get(source) or "") for field, source in (("language", "language"), ("region", "region"), ("title", "title")) if field in update):
+        for flag, action in (("default", request.default_action), ("forced", request.forced_action)):
+            if action == 'clear' and stream.get(flag):
+                update[flag] = False
+        if any(flag in update for flag in ('default','forced')) or any(update.get(field) != str(stream.get(source) or "") for field, source in (("language", "language"), ("region", "region"), ("title", "title")) if field in update):
             tracks.append(update)
         matches += 1
     for stream in details.get("external_subtitles", []):
@@ -1107,19 +1383,21 @@ def episode_bulk_edit(path: str, request: SeasonStreamBulkEdit) -> tuple[dict, i
         matches += 1
     # For set/clear requests, the last matching stream of each type wins,
     # matching the stream-edit ordering rule.
-    if request.default_action != "unchanged":
+    if request.default_action == "set":
         for stream_type in ("audio", "subtitle"):
             matches_for_type = [key for key in matched_keys if key.startswith(f"embedded:{stream_type}:")]
+            if not matches_for_type: continue
             desired = f"embedded:{stream_type}:{matches_for_type[-1].rsplit(":", 1)[-1]}" if request.default_action == "set" and matches_for_type else None
-            if current_tags[f"default_{stream_type}"] != desired:
+            if any(bool(s.get('default')) != (f"embedded:{stream_type}:{s['type_index']}" == desired) for s in details['streams'] if s['codec_type']==stream_type):
                 tags[f"default_{stream_type}"] = desired
         if request.filters.stream_type in {"audio", "subtitle"}:
             tags[f"default_{"subtitle" if request.filters.stream_type == "audio" else "audio"}"] = "__preserve__"
-    if request.forced_action != "unchanged":
+    if request.forced_action == "set":
         for stream_type in ("audio", "subtitle"):
             matches_for_type = [key for key in matched_keys if key.startswith(f"embedded:{stream_type}:")]
+            if not matches_for_type: continue
             desired = f"embedded:{stream_type}:{matches_for_type[-1].rsplit(":", 1)[-1]}" if request.forced_action == "set" and matches_for_type else None
-            if current_tags[f"forced_{stream_type}"] != desired:
+            if any(bool(s.get('forced')) != (f"embedded:{stream_type}:{s['type_index']}" == desired) for s in details['streams'] if s['codec_type']==stream_type):
                 tags[f"forced_{stream_type}"] = desired
         if request.filters.stream_type in {"audio", "subtitle"}:
             tags[f"forced_{"subtitle" if request.filters.stream_type == "audio" else "audio"}"] = "__preserve__"
@@ -1133,6 +1411,11 @@ def edit_has_effective_changes(edit: dict) -> bool:
 def process_tv_filtered_stream_edit(task_id: int, payload: dict) -> dict:
     path = str(payload["path"])
     request_data = dict(payload["request"])
+    # Preserve the user's selected execution mode before normalizing the
+    # per-media request model.  Immediate edits must publish their refreshed
+    # canonical stream snapshot before the task is reported complete; queued
+    # edits continue to use the background index dependency.
+    requested_mode = str(request_data.get("mode") or "queue")
     request_data["paths"] = [path]
     request_data["mode"] = "now"
     request = SeasonStreamBulkEdit.model_validate(request_data)
@@ -1148,10 +1431,28 @@ def process_tv_filtered_stream_edit(task_id: int, payload: dict) -> dict:
         return {"path": path, "streams": matched, "skipped": True, "reason": "Media already has the requested values"}
     tasks.update_progress(task_id, 1, 2, prefix + f"Applying changes to {matched} matching stream(s)")
     result = optimized_media_edit(ReorderEditRequest.model_validate(edit))
-    from app.v80 import request_media_indexes
-    reindex = ["core", "previews"] if request.filters.stream_type == "external" or request.remove else ["core"]
-    request_media_indexes(path, reindex, "Queued TV filtered stream edit completed")
-    tasks.update_progress(task_id, 2, 2, prefix + "Stream changes applied")
+    if requested_mode == "now":
+        # Publish the affected episode's stream snapshot synchronously.  This
+        # is intentionally limited to the edited media; language detection and
+        # subtitle inspection remain scheduled/dependent work.  It prevents a
+        # completed Apply-now operation from immediately reappearing as the
+        # old filter value on the next bulk edit.
+        try:
+            stat = Path(path).stat()
+            indexes.processors["core"]({"path": path, "modified": int(stat.st_mtime), "size": int(stat.st_size)})
+            # optimized_media_edit may have registered a core dependency before
+            # this synchronous publish. Retire only pending duplicates for this
+            # media; a running worker is left untouched and remains idempotent.
+            with connection() as db:
+                db.execute("UPDATE index_task_queue SET status='cancelled', finished_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP, error='Published synchronously by Apply now' WHERE job='core' AND path=? AND status='pending'", (path,))
+            _queue_index_dependents(path, "core", "Immediate TV filtered stream edit completed")
+        except Exception as exc:
+            logger.warning("tv_filtered_edit event=immediate_index_refresh_failed path=%s error=%s", path.replace("\n", " ")[-300:], str(exc).replace("\n", " ")[-300:])
+            raise
+    else:
+        from app.v80 import request_media_indexes
+        request_media_indexes(path, ["core"], "Queued TV filtered stream edit completed")
+    tasks.update_progress(task_id, 2, 2, prefix + "Stream changes applied and indexed")
     return {**result, "path": path, "streams": matched}
 
 
@@ -1214,7 +1515,12 @@ def preflight_tv_bulk_item(payload: dict, fingerprint: dict) -> dict:
     request_data["mode"] = "now"
     try:
         request = SeasonStreamBulkEdit.model_validate(request_data)
-        targets = indexed_target_keys([path], request.filters).get(path, [])
+        # The bulk endpoint already performed the indexed candidate pass.  Reuse
+        # those keys during preflight instead of issuing one more database query
+        # per media item.  The fallback keeps individual/legacy callers safe.
+        targets = request_data.get("target_keys")
+        if targets is None:
+            targets = indexed_target_keys([path], request.filters).get(path, [])
         if not targets:
             return {"decision": "skipped", "reason": "No current stream matches the selected filter", "path": path}
         per_media = {**request.model_dump(exclude={"paths", "mode"}), "target_keys": targets}
@@ -1228,15 +1534,347 @@ def preflight_tv_bulk_item(payload: dict, fingerprint: dict) -> dict:
 
 def approve_tv_bulk(payload: dict, result: dict) -> dict:
     task_ids = []
+    batch_items = []
     for item in payload.get("_bulk_items") or []:
         plan = dict((item.get("_preflight_result") or {}).get("request") or {})
         if not plan:
             continue
-        mode = str((item.get("request") or {}).get("mode") or "queue")
-        task_type = "tv_filtered_stream_edit_now" if mode == "now" else "tv_filtered_stream_edit"
-        child = tasks.enqueue(task_type, {"path": item.get("path"), "request": plan}, f"TV filtered stream edit · {Path(str(item.get('path') or '')).name}", deduplicate=True)
-        task_ids.append(child["id"])
-    return {"task_ids": task_ids, "queued": len(task_ids), "task_type": "tv_filtered_stream_edit"}
+        batch_items.append({"path": str(item.get("path") or ""), "request": plan, "_media_signature": item.get("_preflight_fingerprint") or {}})
+    if not batch_items:
+        return {"task_ids": [], "queued": 0, "task_type": "tv_filtered_stream_edit_batch"}
+    mode = str(((payload.get("_bulk_items") or [{}])[0].get("request") or {}).get("mode") or "queue")
+    batch = tasks.enqueue("tv_filtered_stream_edit_batch", {"items": batch_items, "mode": mode}, f"TV filtered stream edit batch · {len(batch_items)} media", deduplicate=True)
+    task_ids.append(batch["id"])
+    return {"task_ids": task_ids, "queued": len(batch_items), "task_type": "tv_filtered_stream_edit_batch", "batch_task_id": batch["id"]}
+
+
+def _batch_signature_matches(path: str, expected: dict) -> bool:
+    try:
+        stat = Path(path).stat()
+    except OSError:
+        return False
+    return (not expected or expected.get("size") is None or int(expected["size"]) == stat.st_size) and (not expected or expected.get("mtime_ns") is None or int(expected["mtime_ns"]) == stat.st_mtime_ns)
+
+
+def process_tv_filtered_stream_edit_batch(task_id: int, payload: dict) -> dict:
+    """Run metadata-only edits under one scheduler task with per-media LUWs."""
+    items = list(payload.get("items") or [])
+    total = len(items)
+    results = []
+    for index, item in enumerate(items, 1):
+        path = str(item.get("path") or "")
+        try:
+            tasks.update_progress(task_id, index - 1, total, f"Editing media {index}/{total}")
+            expected = item.get("_media_signature") or {}
+            if not _batch_signature_matches(path, expected):
+                results.append({"path": path, "status": "stale", "reason": "Media changed between validation and execution"})
+                continue
+            raw_request = dict(item.get("request") or {})
+            direct_edit = raw_request.get("direct_edit")
+            if direct_edit:
+                optimized_media_edit(ReorderEditRequest.model_validate(direct_edit))
+                try:
+                    from app.v80 import request_media_indexes
+                    request_media_indexes(path, ["core", "subtitles"], "TV-show edit session committed")
+                except Exception:
+                    logger.exception("tv_edit_session event=index_request_failed path=%s", path)
+                results.append({"path": path, "status": "succeeded"})
+                continue
+            request_data = raw_request
+            request_data.update(paths=[path], mode="now")
+            request = SeasonStreamBulkEdit.model_validate(request_data)
+            edit, matched = episode_bulk_edit(path, request)
+            if not matched or not edit_has_effective_changes(edit):
+                results.append({"path": path, "status": "skipped", "streams": matched, "reason": "Already compliant or no matching stream"})
+                continue
+            luw_mode = "immediate" if str(payload.get("mode") or "queue") == "now" else "queued"
+            luw_id = tasks.create_luw(resource_key=path, operation_type="tv_filtered_stream_edit_batch", mode=luw_mode, payload={"task_id": task_id, "path": path, "edit": edit, "batch_item": index}, input_signature=expected, idempotency_key=f"task:{task_id}:media:{index}", priority_class="user")
+            try:
+                if luw_id:
+                    tasks.transition_luw(luw_id, "preflighted", "preflight", "Batch media signature accepted")
+                    while not tasks.acquire_luw_lock(luw_id, path):
+                        time.sleep(0.25)
+                    tasks.transition_luw(luw_id, "applying", "apply", "Applying metadata-only edit")
+                applied = optimized_media_edit(ReorderEditRequest.model_validate(edit))
+                if luw_id:
+                    tasks.transition_luw(luw_id, "verifying", "verify", "Metadata edit completed")
+                    tasks.commit_luw(luw_id, tasks.media_configuration_signature(path))
+                results.append({"path": path, "status": "succeeded", "streams": matched, "result": applied})
+            except Exception:
+                if luw_id:
+                    try:
+                        tasks.release_luw_lock(luw_id, path)
+                        tasks.transition_luw(luw_id, "failed", "error", "Batch media edit failed")
+                    except Exception:
+                        logger.exception("batch_luw event=failure_persist_failed path=%s", path)
+                raise
+        except Exception as exc:
+            results.append({"path": path, "status": "failed", "reason": str(exc)})
+            logger.exception("tv_stream_bulk_batch event=media_failed path=%s", path)
+    tasks.update_progress(task_id, total, total, f"Completed {total}/{total} media edits")
+    return {"batch": True, "requested": total, "succeeded": sum(item["status"] == "succeeded" for item in results), "skipped": sum(item["status"] == "skipped" for item in results), "stale": sum(item["status"] == "stale" for item in results), "failed": sum(item["status"] == "failed" for item in results), "items": results}
+
+
+def consolidated_tv_edit(path: str, journal: list[dict]) -> tuple[dict, int]:
+    """Turn a virtual episode journal into one edit against its original stream IDs."""
+    details = media_details_with_ietf(path)
+    streams: dict[str, dict] = {}
+    order: list[str] = []
+    original_tags = {name: None for name in ("default_audio", "forced_audio", "default_subtitle", "forced_subtitle")}
+    for stream in details["streams"]:
+        kind, index = str(stream["codec_type"]), int(stream["type_index"])
+        key = f"embedded:{kind}:{index}"
+        streams[key] = {"codec_type": kind, "type_index": index, "language": str(stream.get("language") or ""), "region": str(stream.get("region") or ""), "title": str(stream.get("title") or ""), "source": "embedded"}
+        streams[key].update({flag: bool(stream.get(flag)) for flag in ('default','forced')})
+        order.append(key)
+        for tag in ("default", "forced"):
+            if stream.get(tag): original_tags[f"{tag}_{kind}"] = key
+    for stream in details.get("external_subtitles", []):
+        external_path = str(stream["path"])
+        key = f"external:{external_path}"
+        streams[key] = {"codec_type": "external", "path": external_path, "language": str(stream.get("language") or ""), "region": str(stream.get("region") or ""), "title": str(stream.get("title") or ""), "forced": bool(stream.get("forced")), "embed": False, "source": "external"}
+        order.append(key)
+    original = {key: value.copy() for key, value in streams.items()}
+    original_order = order[:]
+    tags = original_tags.copy()
+    removed: set[str] = set()
+    final_version = None
+    audio_compatibility = []
+    matched_total = 0
+    for operation in journal:
+        if operation.get('audio_compatibility'):
+            audio_compatibility.extend(operation['audio_compatibility'])
+            matched_total += len(operation['audio_compatibility'])
+            continue
+        direct = operation.get("direct_edit")
+        if direct:
+            for change in direct.get("tracks") or []:
+                key = f"embedded:{change.get('codec_type')}:{change.get('type_index')}"
+                if key in streams:
+                    for field in ("language", "region", "title"):
+                        if field in change: streams[key][field] = str(change[field] or "")
+            for change in direct.get("external_subtitles") or []:
+                key = f"external:{change.get('path')}"
+                if key in streams:
+                    for field in ("language", "region", "title"):
+                        if field in change: streams[key][field] = str(change[field] or "")
+                    if "embed" in change: streams[key]["embed"] = bool(change["embed"])
+            requested_order = [f"external:{item.get('path')}" if item.get("source") == "external" else f"embedded:{item.get('codec_type')}:{item.get('type_index')}" for item in direct.get("order") or []]
+            if requested_order: order = list(dict.fromkeys([key for key in requested_order if key in streams] + [key for key in order if key not in requested_order]))
+            removed = {str(key) for key in direct.get("remove") or [] if str(key) in streams}
+            for name in tags:
+                if name in direct and direct[name] != "__preserve__":
+                    tags[name] = direct[name]
+                    flag, kind = name.split('_', 1)
+                    for key, stream in streams.items():
+                        if stream['source']=='embedded' and stream['codec_type']==kind:
+                            stream[flag] = key == direct[name]
+            if direct.get("final_version") is not None: final_version = bool(direct["final_version"])
+            matched_total += len(direct.get("tracks") or []) + len(direct.get("external_subtitles") or [])
+            continue
+        request = SeasonStreamBulkEdit.model_validate({**operation, "paths": [path], "mode": "now"})
+        filters = request.filters
+        targets = set(request.target_keys) if request.target_keys is not None else None
+        matches = []
+        for key, stream in streams.items():
+            if key in removed: continue
+            comparable = {**stream, "codec_type": stream["codec_type"], "filename_tags": []}
+            if (targets is not None and key in targets) or (targets is None and filter_matches(comparable, filters)):
+                matches.append(key)
+        matched_total += len(matches)
+        for key in matches:
+            if request.remove:
+                removed.add(key)
+                continue
+            stream = streams[key]
+            if "language" in request.changed_fields: stream["language"] = request.language
+            if "region" in request.changed_fields: stream["region"] = request.region
+            if "track_name" in request.changed_fields: stream["title"] = request.track_name
+            if stream["source"] == "external" and request.integrate: stream["embed"] = True
+        for action, tag in ((request.default_action, "default"), (request.forced_action, "forced")):
+            if action == "unchanged": continue
+            for kind in ("audio", "subtitle"):
+                eligible = [key for key in matches if key.startswith(f"embedded:{kind}:")]
+                if not eligible: continue
+                if action == 'set':
+                    for key, stream in streams.items():
+                        if stream['source']=='embedded' and stream['codec_type']==kind:
+                            stream[tag] = key == eligible[-1]
+                else:
+                    for key in eligible: streams[key][tag] = False
+    track_changes = [{field: stream[field] for field in ("codec_type", "type_index", "language", "region", "title")} for key, stream in streams.items() if stream["source"] == "embedded" and key not in removed and any(stream[field] != original[key][field] for field in ("language", "region", "title"))]
+    for key, stream in streams.items():
+        if stream['source']!='embedded' or key in removed: continue
+        flags = {flag:stream[flag] for flag in ('default','forced') if stream[flag]!=original[key][flag] or tags[f'{flag}_{stream["codec_type"]}']!=original_tags[f'{flag}_{stream["codec_type"]}']}
+        if not flags: continue
+        change = next((item for item in track_changes if item['codec_type']==stream['codec_type'] and item['type_index']==stream['type_index']), None)
+        if change is None:
+            change = {'codec_type':stream['codec_type'],'type_index':stream['type_index']}
+            track_changes.append(change)
+        change.update(flags)
+    external_changes = [{field: stream[field] for field in ("path", "embed", "language", "region", "title", "forced")} for key, stream in streams.items() if stream["source"] == "external" and (key in removed or any(stream[field] != original[key][field] for field in ("embed", "language", "region", "title")))]
+    ordered = [{"source": streams[key]["source"], "codec_type": "subtitle" if streams[key]["source"] == "external" else streams[key]["codec_type"], **({"path": streams[key]["path"]} if streams[key]["source"] == "external" else {"type_index": streams[key]["type_index"]})} for key in order]
+    changed_tags = {name: tags[name] if tags[name] != original_tags[name] else "__preserve__" for name in tags}
+    edit = {"path": path, "tracks": track_changes, "external_subtitles": external_changes, "order": ordered, **changed_tags, "remove": sorted(removed), "final_version": final_version}
+    if audio_compatibility:
+        edit['audio_compatibility'] = audio_compatibility
+    structural = removed or order != original_order or any(item["embed"] for item in external_changes)
+    if not (audio_compatibility or track_changes or external_changes or structural or any(value != "__preserve__" for value in changed_tags.values()) or final_version is not None):
+        return {}, matched_total
+    return edit, matched_total
+
+
+def _commit_tv_note_changes(show_id: str, path: str, changes: dict) -> None:
+    """Apply journaled notes only after that episode's media edit succeeds."""
+    show_key = f"@show:{show_id}"
+    is_show = path == show_key
+    if not is_show and not Path(path).is_file():
+        raise FileNotFoundError(path)
+    with connection() as db:
+        if is_show:
+            library_key, show_title = show_id.split(":", 1)
+            episodes = db.execute(
+                "SELECT path FROM plex_media WHERE kind='episode' AND library_key=? AND show_title=?",
+                (library_key, show_title),
+            ).fetchall()
+            if not episodes:
+                raise ValueError("TV show no longer has indexed episodes")
+        else:
+            media = db.execute("SELECT library_key,show_title,kind FROM plex_media WHERE path=?", (path,)).fetchone()
+            if not media or media["kind"] != "episode" or f"{media['library_key']}:{media['show_title'] or 'Unknown show'}" != show_id:
+                raise ValueError("Episode no longer belongs to this TV show")
+        entity_key = show_id if is_show else f"episode:{path}"
+        current = db.execute(
+            "SELECT note,reviewed,plex_sync_change,final_version FROM media_notes WHERE entity_type='tv' AND entity_key=?",
+            (entity_key,),
+        ).fetchone()
+        note = str(changes.get("note", current["note"] if current else "") or "").strip()
+        reviewed = bool(changes.get("reviewed", current["reviewed"] if current else False))
+        plex_change = bool(current["plex_sync_change"]) if current else False
+        final = bool(changes.get("final_version", current["final_version"] if current else False))
+        reviewed = reviewed or final
+        db.execute(
+            "INSERT INTO media_notes(entity_type,entity_key,note,reviewed,plex_sync_change,final_version,updated_at) "
+            "VALUES('tv',?,?,?,?,?,CURRENT_TIMESTAMP) ON CONFLICT(entity_type,entity_key) "
+            "DO UPDATE SET note=excluded.note,reviewed=excluded.reviewed,plex_sync_change=excluded.plex_sync_change,"
+            "final_version=excluded.final_version,updated_at=CURRENT_TIMESTAMP",
+            (entity_key, note, int(reviewed), int(plex_change), int(final)),
+        )
+        if is_show and "final_version" in changes:
+            for episode in episodes:
+                episode_key = f"episode:{episode['path']}"
+                db.execute(
+                    "INSERT INTO media_notes(entity_type,entity_key,note,reviewed,plex_sync_change,final_version,updated_at) "
+                    "VALUES('tv',?,'',?,?,?,CURRENT_TIMESTAMP) ON CONFLICT(entity_type,entity_key) "
+                    "DO UPDATE SET reviewed=CASE WHEN excluded.final_version=1 THEN 1 ELSE media_notes.reviewed END,"
+                    "final_version=excluded.final_version,updated_at=CURRENT_TIMESTAMP",
+                    (episode_key, int(final), 0, int(final)),
+                )
+        elif not is_show and "final_version" in changes:
+            total = int(db.execute("SELECT count(*) AS n FROM plex_media WHERE kind='episode' AND library_key=? AND show_title=?", (media["library_key"], media["show_title"])).fetchone()["n"] or 0)
+            final_count = int(db.execute(
+                "SELECT count(*) AS n FROM media_notes n JOIN plex_media p ON p.path=substr(n.entity_key,9) "
+                "WHERE n.entity_type='tv' AND n.final_version=1 AND p.kind='episode' AND p.library_key=? AND p.show_title=?",
+                (media["library_key"], media["show_title"]),
+            ).fetchone()["n"] or 0)
+            parent_final = total > 0 and final_count >= total
+            db.execute(
+                "INSERT INTO media_notes(entity_type,entity_key,note,reviewed,plex_sync_change,final_version,updated_at) "
+                "VALUES('tv',?,'',?,?,?,CURRENT_TIMESTAMP) ON CONFLICT(entity_type,entity_key) "
+                "DO UPDATE SET reviewed=CASE WHEN excluded.final_version=1 THEN 1 ELSE media_notes.reviewed END,"
+                "final_version=excluded.final_version,updated_at=CURRENT_TIMESTAMP",
+                (show_id, int(parent_final), 0, int(parent_final)),
+            )
+        if final:
+            from app.detection_policy import retire_final_detection
+            retire_final_detection(db)
+
+
+def process_tv_edit_session_commit(task_id: int, payload: dict) -> dict:
+    _ensure_tv_edit_sessions()
+    session_id = str(payload.get('session_id') or '')
+    token = tv_commit_owner.set(session_id)
+    try:
+        with connection() as db:
+            db.execute("UPDATE tv_edit_sessions SET status='committing',commit_task_id=?,updated_at=? WHERE session_id=?", (task_id,_tv_edit_now(),session_id))
+        return _process_tv_edit_session_commit(task_id,payload)
+    except Exception as exc:
+        with connection() as db:
+            db.execute("UPDATE tv_edit_sessions SET status='open',updated_at=?,error=? WHERE session_id=?", (_tv_edit_now(),str(exc)[:2000],session_id))
+        raise
+    finally:
+        tv_commit_owner.reset(token)
+
+
+def _process_tv_edit_session_commit(task_id: int, payload: dict) -> dict:
+    """Commit a TV-show draft as consolidated, per-episode LUWs."""
+    session_id = str(payload.get("session_id") or "")
+    tasks.update_progress(task_id, 0, 0, 'Loading saved TV-show draft; preparing episode changes')
+    items = load_tv_commit_journal(session_id) if payload.get('journal_reference') else list(payload.get("items") or [])
+    show_id = str(payload.get("show_id") or "")
+    show_final_changes = [
+        operation["note_edit"]["final_version"]
+        for entry in items if entry.get("path") == f"@show:{show_id}"
+        for operation in entry.get("journal") or []
+        if isinstance(operation.get("note_edit"), dict) and "final_version" in operation["note_edit"]
+    ]
+    show_unfreeze = bool(show_final_changes) and show_final_changes[-1] is False
+    results = []
+    total = len(items)
+    for index, item in enumerate(items, 1):
+        path = str(item.get("path") or "")
+        try:
+            tasks.update_progress(task_id, index - 1, total, f"Saving TV-show edit {index}/{total}")
+            if path == f"@show:{show_id}" and any(item["status"] in {"failed", "stale"} for item in results):
+                results.append({"path": path, "status": "stale", "reason": "Show status was not saved because an episode change failed"})
+                continue
+            expected = item.get("_media_signature") or {}
+            if path != f"@show:{show_id}" and not _batch_signature_matches(path, expected):
+                results.append({"path": path, "status": "stale", "reason": "Media changed while the TV-show draft was open"})
+                continue
+            journal = list(item.get("journal") or []) or [dict(item.get("request") or {})]
+            note_changes = {}
+            media_journal = []
+            for operation in journal:
+                if isinstance(operation.get("note_edit"), dict):
+                    note_changes.update(operation["note_edit"])
+                else:
+                    media_journal.append(operation)
+            if path == f"@show:{show_id}" and media_journal:
+                raise ValueError("A TV-show status entry cannot edit a media file")
+            edit, matched_total = consolidated_tv_edit(path, media_journal) if media_journal else ({}, 0)
+            if edit:
+                if show_unfreeze or note_changes.get("final_version") is False:
+                    edit["final_version"] = False
+                optimized_media_edit(ReorderEditRequest.model_validate(edit))
+                try:
+                    from app.v80 import request_media_indexes
+                    request_media_indexes(path, ["core", "subtitles"] if edit["remove"] or edit["external_subtitles"] or any(order_item["source"] == "external" for order_item in edit["order"]) else ["core"], "TV-show edit session committed")
+                except Exception:
+                    logger.exception("tv_edit_session event=index_request_failed path=%s", path)
+            if note_changes:
+                _commit_tv_note_changes(show_id, path, note_changes)
+            results.append({"path": path, "status": "succeeded" if edit or note_changes else "skipped", "streams": matched_total})
+            if payload.get('journal_reference'):
+                with connection() as db:
+                    db.execute('DELETE FROM tv_edit_operations WHERE session_id=? AND path=?', (session_id,path))
+        except Exception as exc:
+            logger.exception("tv_edit_session event=media_failed path=%s", path)
+            results.append({"path": path, "status": "failed", "reason": str(exc)})
+    # A stale signature is not a successful commit: keep the draft journal so
+    # the user can inspect the changed media and explicitly retry or discard
+    # it.  Treating stale entries as committed used to unlock the show while
+    # silently deleting the only recovery plan.
+    failed = [item for item in results if item["status"] in {"failed", "stale"}]
+    now = _tv_edit_now()
+    with connection() as db:
+        if failed:
+            db.execute("UPDATE tv_edit_sessions SET status='open',updated_at=?,error=? WHERE session_id=?", (now, f"{len(failed)} media failed during save", session_id))
+        else:
+            db.execute("UPDATE tv_edit_sessions SET status='committed',committed_at=?,updated_at=?,error=NULL WHERE session_id=?", (now, now, session_id))
+            db.execute("DELETE FROM tv_edit_operations WHERE session_id=?", (session_id,))
+    tasks.update_progress(task_id, total, total, f"TV-show edit saved · {total - len(failed)}/{total} media complete")
+    return {"session_id": session_id, "requested": total, "succeeded": sum(item["status"] == "succeeded" for item in results), "skipped": sum(item["status"] == "skipped" for item in results), "stale": sum(item["status"] == "stale" for item in results), "failed": len(failed), "items": results}
 
 
 register_handler("tv_stream_edit_bulk", preflight_tv_bulk_item)
@@ -1244,6 +1882,8 @@ register_approval_handler("tv_stream_edit_bulk", approve_tv_bulk)
 
 tasks.TASK_HANDLERS["tv_filtered_stream_edit"] = process_tv_filtered_stream_edit
 tasks.TASK_HANDLERS["tv_filtered_stream_edit_now"] = process_tv_filtered_stream_edit
+tasks.TASK_HANDLERS["tv_filtered_stream_edit_batch"] = process_tv_filtered_stream_edit_batch
+tasks.TASK_HANDLERS["tv_edit_session_commit"] = process_tv_edit_session_commit
 
 @app.post("/api/v79/tv/season-stream-bulk-edit")
 def season_stream_bulk_edit(request: SeasonStreamBulkEdit) -> dict:
@@ -1263,9 +1903,28 @@ def season_stream_bulk_edit(request: SeasonStreamBulkEdit) -> dict:
         raise HTTPException(400, "Remove cannot be combined with metadata changes")
     if "track_name" in changed and request.filters.language is None and not request.filters.language_regions:
         raise HTTPException(400, "Select a language and region before changing track names in bulk")
-    # Both modes use an asynchronous preflight. Signature capture and current
-    # stream verification can be expensive for large shows; keeping them in the
-    # queue makes the response immediate and gives the user a real progress view.
-    items = [{"path": path, "request": request.model_dump(exclude={"paths"})} for path in request.paths]
+    # Use the current stream index as a cheap candidate pass before queuing the
+    # detailed preflight. The preflight still re-reads the media and verifies
+    # its signature, but it no longer probes every episode in a whole show when
+    # only a small subset can match the selected filters.
+    indexed_targets = indexed_target_keys(request.paths, request.filters)
+    candidate_paths = indexed_effective_target_paths(request.paths, request, indexed_targets)
+    if not candidate_paths:
+        reason = "No indexed streams match the selected filter"
+        if any(indexed_targets.values()):
+            reason = "All matching streams already have the requested values"
+        logger.info(
+            "tv_stream_bulk_edit event=noop requested_media=%d indexed_candidates=%d reason=%s",
+            len(request.paths), sum(bool(value) for value in indexed_targets.values()), reason,
+        )
+        return {"mode": request.mode, "queued": 0, "candidates": 0, "requested_media": len(request.paths), "preflight": False, "preflight_id": None, "task_ids": [], "applied": 0, "streams": 0, "skipped": [{"reason": reason, "media": len(request.paths)}], "failed": []}
+    request_payload = request.model_dump(exclude={"paths"})
+    items = [
+        {
+            "path": path,
+            "request": {**request_payload, "target_keys": indexed_targets.get(path, [])},
+        }
+        for path in candidate_paths
+    ]
     preflight = enqueue_bulk_preflight("tv_stream_edit_bulk", items, mode="immediate" if request.mode == "now" else "queued", priority=80, deduplicate=True)
-    return {"mode": request.mode, "queued": len(items), "preflight": True, "preflight_id": preflight["id"], "task_ids": [], "applied": 0, "streams": 0, "skipped": [], "failed": []}
+    return {"mode": request.mode, "queued": len(items), "candidates": len(candidate_paths), "requested_media": len(request.paths), "preflight": True, "preflight_id": preflight["id"], "task_ids": [], "applied": 0, "streams": 0, "skipped": [], "failed": []}

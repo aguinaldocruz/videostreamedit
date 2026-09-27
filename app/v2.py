@@ -4,7 +4,7 @@ import json
 import logging
 import os
 import re
-import sqlite3
+import psycopg
 import subprocess
 from pathlib import Path
 from typing import Literal
@@ -14,11 +14,15 @@ from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
-from app.pg_compat import connect as postgres_connect
+from app import db_bootstrap
+from app.pg_compat import Connection, Row, connect as postgres_connect
+
+# db_bootstrap must run before any connection helper is used.  It loads the
+# encrypted application URL, or leaves a new installation in wizard-only mode
+# without an operational database until setup completes and the app restarts.
 
 CONFIG_DIR = Path(os.getenv("CONFIG_DIR", "/config"))
 DATA_DIR = Path(os.getenv("DATA_DIR", "/data"))
-DB_PATH = CONFIG_DIR / "videostreamedit.db"
 STATIC_DIR = Path(__file__).parent / "static"
 MEDIA_EXTENSIONS = {".mkv", ".mp4", ".m4v", ".avi", ".mov", ".webm", ".ts", ".m2ts"}
 BLOCKED_PATHS = {Path("/proc"), Path("/sys"), Path("/dev"), CONFIG_DIR.resolve()}
@@ -29,6 +33,73 @@ logger = logging.getLogger("uvicorn.error")
 
 app = FastAPI(title="VideoStreamEdit", version="0.2.0")
 app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=5)
+
+
+class DatabaseBootstrapRequest(BaseModel):
+    server_url: str = Field(min_length=1, max_length=1000)
+    admin_user: str = Field(min_length=1, max_length=128)
+    admin_password: str = Field(default="", max_length=1000)
+    maintenance_database: str = Field(default="postgres", min_length=1, max_length=128)
+    target_database: str = Field(default="videostreamedit", min_length=1, max_length=128, pattern=r"^[A-Za-z_][A-Za-z0-9_]*$")
+    app_user: str = Field(default="videostreamedit", min_length=1, max_length=128, pattern=r"^[A-Za-z_][A-Za-z0-9_]*$")
+    app_password: str = Field(min_length=1, max_length=1000)
+    mode: Literal["new", "restore"] = "new"
+    backup_path: str = Field(default="", max_length=2000)
+
+
+@app.get("/api/bootstrap/status")
+def database_bootstrap_status() -> dict:
+    return {
+        "configured": db_bootstrap.configured(),
+        "bootstrap": not db_bootstrap.configured(),
+        "backend": os.getenv("DATABASE_BACKEND", "postgres"),
+        "restart_required": False,
+        "connection_file": str(db_bootstrap.CONNECTION_PATH),
+    }
+
+
+@app.post("/api/bootstrap/configure")
+def configure_database(request: DatabaseBootstrapRequest) -> dict:
+    """Create the target role/database and persist only the app URL.
+
+    This endpoint intentionally does not accept or persist a reusable admin
+    credential.  The admin connection exists only for this request.
+    """
+    import psycopg
+    from psycopg import sql
+
+    if db_bootstrap.configured() and os.getenv("DATABASE_BACKEND", "").lower() == "postgres":
+        raise HTTPException(409, "PostgreSQL is already configured")
+    try:
+        maintenance = db_bootstrap.maintenance_url(request.server_url, request.admin_user, request.admin_password, request.maintenance_database)
+        app_url = db_bootstrap.target_url(request.server_url, request.app_user, request.app_password, request.target_database)
+        with psycopg.connect(maintenance, autocommit=True) as db:
+            role = db.execute("SELECT 1 FROM pg_roles WHERE rolname=%s", (request.app_user,)).fetchone()
+            if role:
+                db.execute(sql.SQL("ALTER ROLE {} LOGIN PASSWORD {}").format(sql.Identifier(request.app_user), sql.Literal(request.app_password)))
+            else:
+                db.execute(sql.SQL("CREATE ROLE {} LOGIN PASSWORD {}").format(sql.Identifier(request.app_user), sql.Literal(request.app_password)))
+            exists = db.execute("SELECT 1 FROM pg_database WHERE datname=%s", (request.target_database,)).fetchone()
+            if not exists:
+                db.execute(sql.SQL("CREATE DATABASE {} OWNER {}").format(sql.Identifier(request.target_database), sql.Identifier(request.app_user)))
+            else:
+                db.execute(sql.SQL("ALTER DATABASE {} OWNER TO {}").format(sql.Identifier(request.target_database), sql.Identifier(request.app_user)))
+        # Verify the exact application credentials before writing the config.
+        with psycopg.connect(app_url, connect_timeout=10):
+            pass
+        db_bootstrap.save_url(app_url)
+        return {
+            "configured": True,
+            "restart_required": True,
+            "mode": request.mode,
+            "backup_path": request.backup_path.strip() if request.mode == "restore" else "",
+            "message": "Database and application user are ready. Restart VideoStreamEdit to activate the connection." if request.mode == "new" else "Database is ready. Restart, then restore the selected backup from Setup → Tasks → Backup.",
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("database_bootstrap event=failed")
+        raise HTTPException(400, f"PostgreSQL setup failed: {str(exc)[:1000]}") from exc
 
 
 class RootCreate(BaseModel):
@@ -54,20 +125,13 @@ class EditRequest(BaseModel):
     streams: list[StreamUpdate] = Field(min_length=1)
 
 
-def connection() -> sqlite3.Connection:
-    if os.getenv('DATABASE_BACKEND', 'sqlite').lower() == 'postgres':
-        return postgres_connect()  # type: ignore[return-value]
-    db = sqlite3.connect(DB_PATH, timeout=30)
-    db.row_factory = sqlite3.Row
-    db.execute("PRAGMA busy_timeout=30000")
-    return db
+def connection() -> Connection:
+    return postgres_connect()
 
 
 def initialize() -> None:
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     with connection() as db:
-        db.execute("PRAGMA journal_mode=WAL")
-        db.execute("PRAGMA synchronous=NORMAL")
         db.execute("""
             CREATE TABLE IF NOT EXISTS library_roots (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -95,7 +159,7 @@ def is_blocked(path: Path) -> bool:
     return any(path == blocked or blocked in path.parents for blocked in BLOCKED_PATHS)
 
 
-def roots(kind: str | None = None) -> list[sqlite3.Row]:
+def roots(kind: str | None = None) -> list[Row]:
     query = "SELECT id, kind, path, name FROM library_roots"
     parameters: tuple = ()
     if kind:
@@ -214,7 +278,7 @@ def add_root(item: RootCreate) -> dict:
         with connection() as db:
             cursor = db.execute("INSERT INTO library_roots(kind, path, name) VALUES (?, ?, ?)", (item.kind, str(directory), name))
             root_id = cursor.lastrowid
-    except sqlite3.IntegrityError as exc:
+    except psycopg.errors.UniqueViolation as exc:
         raise HTTPException(409, "That directory is already in this library") from exc
     return {"id": root_id, "kind": item.kind, "path": str(directory), "name": name}
 

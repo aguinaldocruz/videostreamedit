@@ -122,7 +122,8 @@ def rows_for_items(library: dict, items: list[dict]) -> tuple[list[tuple], list[
                     size, modified = stat.st_size, int(stat.st_mtime)
                 except OSError:
                     size, modified = int(part.get("size") or 0), int(item.get("updatedAt") or 0)
-                records.append((path_value, kind, str(item.get("ratingKey", "")), library["library_key"], library["title"], displayed or path.stem, item.get("grandparentTitle"), item.get("parentIndex"), item.get("index"), size, modified, int(item.get("addedAt") or 0), int(item.get("updatedAt") or 0)))
+                imdb_id, tmdb_id, year = plex.plex_external_ids(item)
+                records.append((path_value, kind, str(item.get("ratingKey", "")), library["library_key"], library["title"], displayed or path.stem, item.get("grandparentTitle"), item.get("parentIndex"), item.get("index"), size, modified, int(item.get("addedAt") or 0), int(item.get("updatedAt") or 0), imdb_id, tmdb_id, year))
                 aliases.append((path_value, json.dumps(alternatives, ensure_ascii=False)))
     return records, aliases
 
@@ -184,7 +185,7 @@ def register_internal_change_scope(path: str, scope: dict | None, reason: str = 
         return
     now = int(time.time())
     with plex.connection() as db:
-        db.execute("INSERT OR REPLACE INTO plex_internal_change_scope(path,expected_size,expected_modified,scope_json,reason,created_at,expires_at) VALUES(?,?,?,?,?,?,?)", (value, int(stat.st_size), int(stat.st_mtime), json.dumps(scope or {}, ensure_ascii=False, separators=(",", ":")), str(reason or ""), now, now + 6 * 60 * 60))
+        db.execute("INSERT OR REPLACE INTO plex_internal_change_scope(path,expected_size,expected_modified,scope_json,reason,created_at,expires_at) VALUES(?,?,?,?,?,?,?)", (value, int(stat.st_size), int(stat.st_mtime), json.dumps(scope or {}, ensure_ascii=False, separators=(",", ":")), str(reason or ""), now, now + 7 * 24 * 60 * 60))
 
 def consume_internal_change_scope(path: str, size: int, modified: int) -> tuple[dict, str] | None:
     """Consume a matching intentional-write marker during Plex sync."""
@@ -203,17 +204,27 @@ def consume_internal_change_scope(path: str, size: int, modified: int) -> tuple[
     return (scope if isinstance(scope, dict) else {}, str(row[3] or ""))
 
 def structurally_changed_records(records: list[tuple], previous: dict[str, tuple[int, int]]) -> list[tuple]:
-    """Return changes that are strong evidence of a replacement/new media.
+    """Return changes confirmed by the local file, not stale Plex metadata.
 
-    A modified timestamp alone is not structural: mkvpropedit and other
-    metadata-only edits update mtime without adding/removing media. A new path
-    or a size change is retained here; stream add/remove detection is handled
-    separately by the index worker after it compares stream identities.
+    Plex can report a refreshed Part size while the mounted file is unchanged
+    (especially after metadata scans or remuxes). That must not clear a show's
+    Final Version state. A new path is structural; an existing path is
+    structural only when the actual local file size differs from the previous
+    fingerprint. Stream add/remove changes are handled by the core index
+    comparison after this check.
     """
     result = []
     for record in records:
-        old = previous.get(str(record[0]))
-        if old is None or int(old[0] or 0) != int(record[9] or 0):
+        path = str(record[0])
+        old = previous.get(path)
+        if old is None:
+            result.append(record)
+            continue
+        try:
+            local_size = Path(path).stat().st_size
+        except OSError:
+            continue
+        if int(old[0] or 0) != int(local_size):
             result.append(record)
     return result
 
@@ -252,7 +263,7 @@ def persist_library(library: dict, records: list[tuple], aliases: list[tuple], w
                 (library["library_key"], *rating_keys),
             )
             db.executemany("DELETE FROM plex_title_aliases WHERE path=?", [(path,) for path in stale_paths])
-        db.executemany("INSERT OR REPLACE INTO plex_media(path,kind,rating_key,library_key,library_name,title,show_title,season_number,episode_number,size,modified,plex_added_at,plex_updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", records)
+        db.executemany("INSERT OR REPLACE INTO plex_media(path,kind,rating_key,library_key,library_name,title,show_title,season_number,episode_number,size,modified,plex_added_at,plex_updated_at,plex_imdb_id,plex_tmdb_id,plex_year) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", records)
         db.executemany("INSERT OR REPLACE INTO plex_title_aliases(path,alternatives) VALUES(?,?)", aliases)
         if current_paths is not None:
             # Incremental timestamp queries do not return deleted Plex items.
@@ -294,14 +305,15 @@ def clear_reviewed_for_removed_media(library_key: str, current_paths: set[str]) 
     return cleared
 
 
-def clear_reviewed_for_changed_records(records: list[tuple]) -> int:
-    """Clear collection review flags when Plex reports new or changed media.
+def mark_plex_sync_changes(records: list[tuple], previous: dict[str, tuple[int, int]]) -> int:
+    """Mark new Plex media and reviewed media with structural changes.
 
     Movie notes are keyed by their file path; episode notes are keyed by the
     synthesized Plex show key used by the TV listing. Notes themselves remain.
     """
-    cleared = 0
+    marked = 0
     with plex.connection() as db:
+        seen: set[tuple[str, str]] = set()
         for record in records:
             kind = str(record[1] or "")
             if kind == "movie":
@@ -310,14 +322,28 @@ def clear_reviewed_for_changed_records(records: list[tuple]) -> int:
                 entity_type, entity_key = "tv", f"{record[3]}:{record[6] or 'Unknown show'}"
             else:
                 continue
+            entity = (entity_type, entity_key)
+            if entity in seen:
+                continue
+            if str(record[0]) not in previous:
+                db.execute(
+                    "INSERT INTO media_notes(entity_type,entity_key,note,reviewed,plex_sync_change,final_version,updated_at) "
+                    "VALUES(?,?,'',0,1,0,CURRENT_TIMESTAMP) "
+                    "ON CONFLICT(entity_type,entity_key) DO UPDATE SET plex_sync_change=1,updated_at=CURRENT_TIMESTAMP",
+                    entity,
+                )
+                seen.add(entity)
+                marked += 1
+                continue
             row = db.execute("SELECT reviewed,note FROM media_notes WHERE entity_type=? AND entity_key=?", (entity_type, entity_key)).fetchone()
             if not row or not row["reviewed"]:
                 continue
             db.execute("UPDATE media_notes SET plex_sync_change=1,updated_at=CURRENT_TIMESTAMP WHERE entity_type=? AND entity_key=?", (entity_type, entity_key))
-            cleared += 1
-    if cleared:
-        logger.info("plex_sync event=review_status_cleared changed_media=%d", cleared)
-    return cleared
+            seen.add(entity)
+            marked += 1
+    if marked:
+        logger.info("plex_sync event=media_tagged changed_or_added_entities=%d", marked)
+    return marked
 
 
 def process_plex_sync(task_id: int, payload: dict) -> dict:
@@ -337,7 +363,40 @@ def process_plex_sync(task_id: int, payload: dict) -> dict:
             # A full, metadata-only catalog pass is required to detect Plex
             # removals; stream/file processing remains incremental below.
             all_items = paged_library(library["library_key"], library["kind"])
-            items = all_items if rebuild or not since else changed_library_items(library, since)
+            if rebuild or not since:
+                items = all_items
+            else:
+                # Incremental timestamps do not emit rows whose local index
+                # was lost or whose path was removed during an interrupted
+                # reconciliation. Re-admit those items even when Plex has not
+                # changed their metadata timestamps.
+                changed_items = changed_library_items(library, since)
+                with plex.connection() as db:
+                    known_rows = db.execute(
+                        "SELECT rating_key,path FROM plex_media WHERE library_key=?",
+                        (library["library_key"],),
+                    ).fetchall()
+                known_keys = {str(row["rating_key"] or "") for row in known_rows}
+                known_paths = {str(row["path"] or "") for row in known_rows}
+                missing_items = []
+                for item in all_items:
+                    rating_key = str(item.get("ratingKey") or item.get("key") or "")
+                    part_paths = {
+                        str(part.get("file"))
+                        for media in item.get("Media", [])
+                        for part in media.get("Part", [])
+                        if part.get("file")
+                    }
+                    if (rating_key and rating_key not in known_keys) or part_paths.isdisjoint(known_paths):
+                        missing_items.append(item)
+                merged = {str(item.get("ratingKey") or item.get("key")): item for item in changed_items}
+                merged.update({str(item.get("ratingKey") or item.get("key")): item for item in missing_items})
+                items = list(merged.values())
+                if missing_items:
+                    logger.info(
+                        "plex_sync event=missing_catalog_rows_requeued library=%s items=%d",
+                        library["title"].replace("\n", " "), len(missing_items),
+                    )
             records, aliases = rows_for_items(library, items)
             previous = existing_file_fingerprints(library["library_key"])
             changed_records = file_changed_records(records, previous)
@@ -362,7 +421,7 @@ def process_plex_sync(task_id: int, payload: dict) -> dict:
                 record for record in structurally_changed_records(records, previous)
                 if str(record[0]) not in internal_scopes
             ]
-            clear_reviewed_for_changed_records(structural_records)
+            mark_plex_sync_changes(structural_records, previous)
             clear_reviewed_for_removed_media(library["library_key"], catalog_paths(all_items))
             persist_library(library, records, aliases, started, rebuild, catalog_paths(all_items))
             if changed_records:
@@ -388,16 +447,43 @@ def process_plex_sync(task_id: int, payload: dict) -> dict:
 
 
 def process_subtitle_html(task_id: int, payload: dict) -> dict:
-    tasks.update_progress(task_id, 0, 2, "Removing subtitle HTML tags")
-    result = apply_subtitle_cleanup(SubtitleCleanup.model_validate(payload), operation_id=f"task-{task_id}")
-    tasks.update_progress(task_id, 1, 2, "Queueing subtitle indexes")
+    # A bulk report request can contain several HTML streams from one media.
+    # They must be one media-level task: each remux changes the file signature,
+    # so separate child tasks would make every later stream fail its safety
+    # check even though the requested changes are compatible.
+    cleanups = payload.get("cleanups") or []
+    total = len(cleanups) or 1
+    from app.job_safety import receipt, record, verify_output
+    saved = receipt(task_id, 'html')
+    if saved:
+        verify_output(saved)
+    def checkpoint(result, count):
+        record(task_id, 'html', {'result': result, 'count': count,
+                                'signature': tasks.media_configuration_signature(result['path'])})
+    tasks.update_progress(task_id, 0, total + 1, "Removing subtitle HTML tags")
+    if cleanups:
+        result = saved['result'] if saved else {"changed": False, "path": str(payload.get("path") or ""), "cleaned": 0}
+        for position, cleanup in enumerate(cleanups, 1):
+            if saved and position <= saved['count']:
+                continue
+            request = SubtitleCleanup(path=result["path"], type_index=cleanup.get("type_index"), external_path=cleanup.get("external_path"))
+            item_result = apply_subtitle_cleanup(request, operation_id=f"task-{task_id}-{position}")
+            result["changed"] = result["changed"] or bool(item_result.get("changed"))
+            result["cleaned"] += 1
+            checkpoint(result, position)
+            tasks.update_progress(task_id, position, total + 1, f"Cleaning subtitle {position} of {total}")
+    else:
+        result = saved['result'] if saved else apply_subtitle_cleanup(SubtitleCleanup.model_validate(payload), operation_id=f"task-{task_id}")
+        checkpoint(result, 1)
+        tasks.update_progress(task_id, 1, total + 1, "Subtitle cleanup completed")
+    tasks.update_progress(task_id, total, total + 1, "Queueing subtitle indexes")
     from app.v80 import request_media_indexes
     # HTML/ASS markup cleanup changes presentation only.  Preserve existing
     # subtitle language detection; subtitle indexing still refreshes HTML,
     # damage and preview metadata.
     register_internal_change_scope(result["path"], {"subtitle_indices": "all"}, "Subtitle HTML removed")
-    request_media_indexes(result["path"], ["subtitles", "previews"], "Subtitle HTML removed")
-    tasks.update_progress(task_id, 2, 2, "Subtitle cleanup completed")
+    request_media_indexes(result["path"], ["subtitles"], "Subtitle HTML removed")
+    tasks.update_progress(task_id, total + 1, total + 1, "Subtitle cleanup completed")
     return result
 
 
@@ -406,7 +492,16 @@ def preflight_html_cleanup(payload: dict, fingerprint: dict) -> dict:
     request_payload = dict(payload)
     request_payload.pop("_preflight_fingerprint", None)
     request_payload.pop("_preflight_result", None)
+    request_payload.pop("_report_html_verified", None)
     request = SubtitleCleanup.model_validate(request_payload)
+    # Report entries have already been inspected by the subtitle indexer. For
+    # embedded streams, a matching media fingerprint makes that cached finding
+    # a safe validation result; changed files still take the full extraction
+    # path below. External subtitle files intentionally keep full validation,
+    # because the media fingerprint does not cover the sidecar file.
+    expected = payload.get("_preflight_fingerprint") or {}
+    if payload.get("_report_html_verified") and not request.external_path and expected == fingerprint and fingerprint.get("exists"):
+        return {"decision": "approved", "reason": "Cached subtitle inspection confirms removable markup", "cache_hit": True}
     if not fingerprint.get("exists"):
         return {"decision": "invalid", "reason": "Media file is not accessible"}
     if request.external_path:
@@ -442,14 +537,24 @@ def approve_html_cleanup(payload: dict, result: dict) -> dict:
     # executable child task (bulk and single-media paths).
     items = payload.get("_bulk_items")
     if items is not None:
-        task_ids = []
+        # Group all validated subtitle targets by media path. One media-level
+        # task owns the complete compatible change set and therefore takes one
+        # signature, one workflow lock, and one dependent index refresh.
+        grouped = {}
         for item in items:
-            request = dict(item)
-            request.pop("_preflight_fingerprint", None)
-            request.pop("_preflight_result", None)
+            path = str(item.get("path") or "")
+            if not path:
+                continue
+            grouped.setdefault(path, []).append({
+                "type_index": item.get("type_index"),
+                "external_path": item.get("external_path"),
+            })
+        task_ids = []
+        for path, cleanups in grouped.items():
+            request = {"path": path, "cleanups": cleanups}
             child = tasks.enqueue("subtitle_html_cleanup", request, "Remove subtitle HTML tags", deduplicate=True)
             task_ids.append(child["id"])
-        return {"task_ids": task_ids, "queued": len(task_ids), "task_type": "subtitle_html_cleanup"}
+        return {"task_ids": task_ids, "queued": len(task_ids), "streams": len(items), "task_type": "subtitle_html_cleanup"}
     request = dict(payload)
     request.pop("_preflight_fingerprint", None)
     request.pop("_preflight_result", None)
@@ -472,7 +577,7 @@ def _ensure_ocr_stage_table() -> None:
         db.execute("""CREATE TABLE IF NOT EXISTS ocr_staged_backups (
             id INTEGER PRIMARY KEY AUTOINCREMENT, original_path TEXT NOT NULL, staged_path TEXT NOT NULL UNIQUE,
             title TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'staged', task_id INTEGER,
-            size_bytes INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            size_bytes BIGINT NOT NULL DEFAULT 0, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             converted_at TEXT, restored_at TEXT, approved_at TEXT
         )""")
         if not plex.column_exists(db, "ocr_staged_backups", "media_kind"):
@@ -480,6 +585,9 @@ def _ensure_ocr_stage_table() -> None:
         db.execute("CREATE INDEX IF NOT EXISTS ocr_staged_status ON ocr_staged_backups(status, id)")
         if not plex.column_exists(db, "ocr_staged_backups", "converted_path"):
             db.execute("ALTER TABLE ocr_staged_backups ADD COLUMN converted_path TEXT")
+        for column in ('original_checksum', 'converted_signature'):
+            if not plex.column_exists(db, 'ocr_staged_backups', column):
+                db.execute(f'ALTER TABLE ocr_staged_backups ADD COLUMN {column} TEXT')
 
 def stage_ocr_original(path: Path, task_id: int) -> int:
     _ensure_ocr_stage_table()
@@ -489,11 +597,12 @@ def stage_ocr_original(path: Path, task_id: int) -> int:
     digest = hashlib.sha256(str(path).encode("utf-8", "surrogateescape")).hexdigest()[:20]
     staged = OCR_STAGE_ROOT / f"{digest}-{path.name}"
     with plex.connection() as db:
-        existing = db.execute("SELECT id,staged_path,status FROM ocr_staged_backups WHERE original_path=? AND status IN ('staged','converted') ORDER BY id DESC LIMIT 1", (str(path),)).fetchone()
+        existing = db.execute("SELECT id,staged_path,status,original_checksum FROM ocr_staged_backups WHERE original_path=? AND status IN ('staged','converted') ORDER BY id DESC LIMIT 1", (str(path),)).fetchone()
         if existing and Path(existing["staged_path"]).is_file():
+            from app.postgres_store import _file_digest
+            if not existing['original_checksum'] or _file_digest(Path(existing['staged_path'])) != existing['original_checksum']:
+                raise RuntimeError('OCR recovery original is unverified or corrupt; review staging before conversion')
             return int(existing["id"])
-    if not staged.exists():
-        shutil.copy2(path, staged)
     media_kind = "unknown"
     with plex.connection() as db:
         media_row = db.execute("SELECT kind FROM plex_media WHERE path=? LIMIT 1", (str(path),)).fetchone()
@@ -503,10 +612,10 @@ def stage_ocr_original(path: Path, task_id: int) -> int:
         # request at nearly the same time.  The path is intentionally unique,
         # so make the insert idempotent instead of allowing that race to fail
         # the OCR job.
-        size_bytes = staged.stat().st_size
+        size_bytes = path.stat().st_size
         db.execute(
             "INSERT OR IGNORE INTO ocr_staged_backups(original_path,staged_path,title,media_kind,status,task_id,size_bytes) VALUES(?,?,?,?,?,?,?)",
-            (str(path), str(staged), path.name, media_kind, "staged", task_id, size_bytes),
+            (str(path), str(staged), path.name, media_kind, "copying", task_id, size_bytes),
         )
         row = db.execute(
             "SELECT id,status FROM ocr_staged_backups WHERE staged_path=? LIMIT 1",
@@ -517,12 +626,23 @@ def stage_ocr_original(path: Path, task_id: int) -> int:
         # A previously approved/restored backup may legitimately be reused
         # for a later conversion; reactivate its record rather than inserting
         # a duplicate row with the same staged_path.
-        if str(row["status"]) not in {"staged", "converted"}:
-            db.execute(
-                "UPDATE ocr_staged_backups SET original_path=?,title=?,media_kind=?,status='staged',task_id=?,size_bytes=?,restored_at=NULL,approved_at=NULL WHERE id=?",
-                (str(path), path.name, media_kind, task_id, size_bytes, int(row["id"])),
-            )
-        return int(row["id"])
+        db.execute(
+            "UPDATE ocr_staged_backups SET original_path=?,title=?,media_kind=?,status='copying',task_id=?,size_bytes=?,restored_at=NULL,approved_at=NULL WHERE id=?",
+            (str(path), path.name, media_kind, task_id, size_bytes, int(row["id"])),
+        )
+        stage_id = int(row['id'])
+    from app.job_safety import output_space, stamp, copy_recovery
+    before = stamp(path)
+    with output_space(staged.parent, before['size']):
+        copy_recovery(path, staged)
+        with staged.open('rb') as saved:
+            os.fsync(saved.fileno())
+        if stamp(path) != before or staged.stat().st_size != before['size']:
+            raise RuntimeError('Media changed during OCR backup; conversion refused')
+    with plex.connection() as db:
+        from app.postgres_store import _file_digest
+        db.execute("UPDATE ocr_staged_backups SET status='staged',original_checksum=? WHERE id=?", (_file_digest(staged), stage_id))
+    return stage_id
 
 def _ocr_stage_update(stage_id: int, status: str) -> None:
     _ensure_ocr_stage_table()
@@ -757,8 +877,37 @@ def _resolve_ocr_language(payload: dict) -> tuple[str, float, str]:
     raise RuntimeError("Image subtitle language could not be determined with at least 80% confidence; conversion was not started")
 
 
+def validate_ocr_runtime(payload: dict) -> None:
+    """Fail unsupported/missing OCR prerequisites before allocating a backup."""
+    from app.v2 import probe
+    _resolve_ocr_language(payload)
+    media = Path(str(payload.get('path') or '')).resolve()
+    subtitles = [s for s in probe(media).get('streams', []) if s.get('codec_type') == 'subtitle']
+    index = int(payload.get('type_index', -1))
+    if index < 0 or index >= len(subtitles):
+        raise RuntimeError('OCR subtitle stream was not found')
+    family = _image_codec_family(str(subtitles[index].get('codec_name') or ''))
+    required = {'vobsub': ['mkvextract', 'vobsub2srt'],
+                'pgs': ['mkvextract', 'java', 'tesseract'],
+                'dvb': ['ccextractor']}.get(family)
+    if required is None:
+        raise RuntimeError(f'No supported OCR routine for {family}; original retained')
+    missing = [tool for tool in ['ffmpeg', 'ffprobe', *required] if not shutil.which(tool)]
+    if family == 'pgs' and not Path('/opt/bdsup2sub.jar').is_file():
+        missing.append('BDSup2Sub')
+    if missing:
+        raise RuntimeError('OCR conversion unavailable; install ' + ', '.join(missing) + '. No media or backup was changed')
+
+
 def process_image_subtitle_convert(task_id: int, payload: dict) -> dict:
     media = Path(str(payload.get("path") or "")).resolve()
+    from app.job_safety import stamp, output_space, replace_prepared, run_write_command
+    original_stamp = stamp(media)
+    # Final Version is a hard user lock, including queued OCR/remux work.
+    # Plex reconciliation remains allowed, but user-requested destructive
+    # subtitle conversion must be rejected before staging or touching media.
+    from app.v86 import assert_media_editable
+    assert_media_editable(str(media))
     if not media.is_file():
         raise RuntimeError(f"Media is not accessible: {media}")
     language, language_confidence, language_source = _resolve_ocr_language(payload)
@@ -787,11 +936,13 @@ def process_image_subtitle_convert(task_id: int, payload: dict) -> dict:
             subtitle_output += 1
     command += ["-map_metadata", "0", "-map_chapters", "0", "-c", "copy", f"-metadata:s:s:{int(payload.get('type_index', 0))}", f"language={language}", str(temporary)]
     try:
-        subprocess.run(command, capture_output=True, text=True, timeout=3600, check=True)
-        os.chmod(temporary, media.stat().st_mode); os.replace(temporary, media)
+        with output_space(media.parent, int(original_stamp['size'] * 1.1) + 64 * 1024**2):
+            run_write_command(command, media.parent)
+            os.chmod(temporary, media.stat().st_mode)
+            replace_prepared(temporary, media, original_stamp)
         _ocr_stage_update(stage_id, "converted")
         with plex.connection() as db:
-            db.execute("UPDATE ocr_staged_backups SET converted_path=? WHERE id=?", (str(media), stage_id))
+            db.execute("UPDATE ocr_staged_backups SET converted_path=?,converted_signature=? WHERE id=?", (str(media), json.dumps(stamp(media)), stage_id))
     finally:
         subtitle.unlink(missing_ok=True); temporary.unlink(missing_ok=True)
         if subtitle.parent.name.startswith("vse-ccx-"):
@@ -848,7 +999,10 @@ register_approval_handler("image_subtitle_convert_bulk", approve_image_convert_b
 @app.get("/api/v68/ocr/staged")
 def list_ocr_staged() -> dict:
     _ensure_ocr_stage_table()
-    reconcile_startup_artifacts()
+    # Media libraries may be slow or temporarily unavailable after a power
+    # loss. Run artifact reconciliation outside the critical startup path so
+    # one remote mount cannot delay or prevent the web service from starting.
+    threading.Thread(target=reconcile_startup_artifacts, name="vse-startup-recovery", daemon=True).start()
     with plex.connection() as db:
         rows = db.execute("SELECT * FROM ocr_staged_backups WHERE status IN ('staged','converted','restored') ORDER BY id DESC").fetchall()
     return {"stage_root": str(OCR_STAGE_ROOT), "items": [dict(row) for row in rows]}
@@ -908,18 +1062,21 @@ def finalize_ocr_converted(stage_id: int) -> dict:
         raise HTTPException(404, "Preserved converted candidate is missing")
     temporary = original.with_name(f".{original.name}.vse-finalize")
     try:
-        shutil.copyfile(artifact, temporary)
-        os.chmod(temporary, original.stat().st_mode if original.exists() else staged.stat().st_mode)
-        os.replace(temporary, original)
+        from app.job_safety import stamp, output_space, copy_recovery, replace_prepared
+        before = stamp(original)
+        with output_space(original.parent, artifact.stat().st_size):
+            copy_recovery(artifact, temporary)
+            os.chmod(temporary, original.stat().st_mode)
+            replace_prepared(temporary, original, before)
     finally:
         temporary.unlink(missing_ok=True)
     # The candidate now lives at its final media path. Keep only the original
     # rollback copy in staging; approval will remove that copy and its record.
     artifact.unlink()
     with plex.connection() as db:
-        db.execute("UPDATE ocr_staged_backups SET status='converted',converted_path=?,size_bytes=? WHERE id=?", (str(original), staged.stat().st_size, stage_id))
+        db.execute("UPDATE ocr_staged_backups SET status='converted',converted_path=?,size_bytes=?,converted_signature=? WHERE id=?", (str(original), staged.stat().st_size, json.dumps(stamp(original)), stage_id))
     from app.v80 import detection_scope_for_operation, request_media_indexes
-    request_media_indexes(str(original), ["subtitles", "core", "previews"], "OCR converted candidate moved to final media path", detection_scope=detection_scope_for_operation("subtitle_conversion"))
+    request_media_indexes(str(original), ["subtitles", "core"], "OCR converted candidate moved to final media path", detection_scope=detection_scope_for_operation("subtitle_conversion"))
     logger.info("ocr_staging event=converted_finalized id=%d original=%s", stage_id, original)
     return {"id": stage_id, "status": "converted", "path": str(original)}
 
@@ -936,24 +1093,35 @@ def perform_ocr_rollback(stage_id: int, task_id: int | None = None) -> dict:
         raise RuntimeError("Original media folder is unavailable")
     if str(row["status"]) == "restored" and original.is_file():
         return {"id": stage_id, "status": "restored", "path": str(original), "already_restored": True}
+    from app.job_safety import stamp, output_space, copy_recovery, replace_prepared
+    from app.postgres_store import _file_digest
+    expected = json.loads(row['converted_signature'] or '{}')
+    if not expected or stamp(original) != expected:
+        raise RuntimeError('Media changed since OCR conversion or has no verified output signature; rollback refused')
+    if not row['original_checksum'] or _file_digest(staged) != row['original_checksum']:
+        raise RuntimeError('OCR original checksum missing or invalid; rollback refused')
     converted_snapshot = Path(str(row["converted_path"] or "")) if row["converted_path"] else OCR_STAGE_ROOT / f"{stage_id}-converted-{original.name}"
     if converted_snapshot.parent != OCR_STAGE_ROOT.resolve():
         converted_snapshot = OCR_STAGE_ROOT / f"{stage_id}-converted-{original.name}"
     if original.is_file() and converted_snapshot != original and not converted_snapshot.exists():
-        shutil.copy2(original, converted_snapshot)
+        with output_space(converted_snapshot.parent, original.stat().st_size):
+            copy_recovery(original, converted_snapshot)
     token = str(task_id or uuid.uuid4().hex)
     temporary = original.with_name(f".{original.name}.vse-rollback-{token}")
     try:
-        shutil.copyfile(staged, temporary)
-        os.chmod(temporary, original.stat().st_mode if original.exists() else staged.stat().st_mode)
-        os.replace(temporary, original)
+        with output_space(original.parent, staged.stat().st_size):
+            copy_recovery(staged, temporary)
+            if _file_digest(temporary) != row['original_checksum']:
+                raise RuntimeError('OCR rollback copy failed verification')
+            os.chmod(temporary, original.stat().st_mode)
+            replace_prepared(temporary, original, expected)
     finally:
         temporary.unlink(missing_ok=True)
     _ocr_stage_update(stage_id, "restored")
     with plex.connection() as db:
         db.execute("UPDATE ocr_staged_backups SET converted_path=? WHERE id=?", (str(converted_snapshot), stage_id))
     from app.v80 import detection_scope_for_operation, request_media_indexes
-    request_media_indexes(str(original), ["subtitles", "core", "previews"], "OCR original restored", detection_scope=detection_scope_for_operation("ocr_restore"))
+    request_media_indexes(str(original), ["subtitles", "core"], "OCR original restored", detection_scope=detection_scope_for_operation("ocr_restore"))
     logger.info("ocr_staging event=rollback id=%d original=%s", stage_id, original)
     return {"id": stage_id, "status": "restored", "path": str(original)}
 
@@ -1042,15 +1210,40 @@ def reconcile_startup_artifacts() -> None:
     cutoff = time.time() - 600
     for directory in parent_dirs:
         folder = Path(directory)
-        if not folder.is_dir():
+        try:
+            accessible = folder.is_dir()
+        except OSError as exc:
+            # Plex libraries may be remote mounts. An unavailable mount must
+            # not abort application startup; leave its artifacts untouched and
+            # let the next recovery pass inspect it when accessible again.
+            logger.warning("startup_recovery event=media_path_unavailable path=%s error=%s", folder, str(exc).replace("\n", " ")[-300:])
+            continue
+        if not accessible:
             continue
         for pattern in patterns:
-            for artifact in folder.glob(pattern):
+            try:
+                artifacts = folder.glob(pattern)
+            except OSError as exc:
+                logger.warning("startup_recovery event=directory_scan_failed path=%s error=%s", folder, str(exc).replace("\n", " ")[-300:])
+                continue
+            try:
+                iterator = iter(artifacts)
+            except OSError as exc:
+                logger.warning("startup_recovery event=directory_scan_failed path=%s error=%s", folder, str(exc).replace("\n", " ")[-300:])
+                continue
+            while True:
+                try:
+                    artifact = next(iterator)
+                except StopIteration:
+                    break
+                except OSError as exc:
+                    logger.warning("startup_recovery event=directory_scan_failed path=%s error=%s", folder, str(exc).replace("\n", " ")[-300:])
+                    break
                 try:
                     if artifact.is_file() and artifact.stat().st_mtime < cutoff and str(artifact) not in active_payload:
                         artifact.unlink(); removed += 1
                 except OSError as exc:
-                    logger.warning("startup_recovery event=temporary_cleanup_failed path=%s error=%s", artifact, str(exc).replace("\\n", " ")[-300:])
+                    logger.warning("startup_recovery event=temporary_cleanup_failed path=%s error=%s", artifact, str(exc).replace("\n", " ")[-300:])
     unresolved = ",".join(f"{row['status']}={row['n']}" for row in stages) or "none"
     logger.info("startup_recovery event=checked unresolved_ocr_staging=%s stale_temp_removed=%d", unresolved, removed)
 
@@ -1064,15 +1257,8 @@ def initialize_incremental_plex_sync() -> None:
         for column, statement in (("plex_added_at", "ALTER TABLE plex_media ADD COLUMN plex_added_at INTEGER NOT NULL DEFAULT 0"), ("plex_updated_at", "ALTER TABLE plex_media ADD COLUMN plex_updated_at INTEGER NOT NULL DEFAULT 0")):
             if not plex.column_exists(db, "plex_media", column):
                 db.execute(statement)
-        # PostgreSQL INTEGER is 32-bit; media byte sizes and Plex timestamps
-        # can exceed that range. Widen catalog fingerprint columns before the
-        # next incremental sync. SQLite keeps its existing compatibility path.
-        if os.getenv("DATABASE_BACKEND", "sqlite").lower() == "postgres":
-            for column in ("size", "modified", "plex_added_at", "plex_updated_at"):
-                try:
-                    db.execute(f"ALTER TABLE plex_media ALTER COLUMN {column} TYPE BIGINT")
-                except Exception as exc:
-                    logger.warning("plex_sync event=column_width_migration_failed column=%s error=%s", column, str(exc).replace("\n", " ")[-300:])
+        from app.job_safety import widen_media_columns
+        widen_media_columns(db.raw)
         db.executescript("""
             CREATE TABLE IF NOT EXISTS plex_sync_state (
                 library_key TEXT PRIMARY KEY, watermark INTEGER NOT NULL DEFAULT 0,

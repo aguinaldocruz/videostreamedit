@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import json
 import os
 import re
 import subprocess
@@ -25,6 +26,8 @@ class TrackChange(BaseModel):
     language: str | None = None
     region: str | None = None
     title: str | None = None
+    default: bool | None = None
+    forced: bool | None = None
 
 
 class OrderItem(BaseModel):
@@ -34,8 +37,14 @@ class OrderItem(BaseModel):
     path: str | None = None
 
 
+class AudioCompatibility(BaseModel):
+    stage_id: str = Field(pattern=r'^[a-f0-9]{32}$')
+    action: Literal['add', 'replace'] = 'add'
+
+
 class ReorderEditRequest(BaseModel):
     path: str
+    clear_video_titles: bool = False
     tracks: list[TrackChange] = []
     external_subtitles: list[ExternalSubtitleChange] = []
     order: list[OrderItem] = []
@@ -43,28 +52,10 @@ class ReorderEditRequest(BaseModel):
     forced_audio: str | None = None
     default_subtitle: str | None = None
     forced_subtitle: str | None = None
+    final_version: bool | None = None
     remove: list[str] = []
     defer_language_detection: bool = False
-
-
-def asset(content: str, media_type: str) -> Response:
-    return Response(content, media_type=media_type, headers={"Cache-Control": "no-store, max-age=0"})
-
-
-@app.middleware("http")
-async def v7_assets(request: Request, call_next):
-    if request.method == "GET" and request.url.path == "/":
-        html = (STATIC_DIR / "v5.html").read_text().replace('href="/app.css"', 'href="/assets/v7.css"').replace('src="/app.js"', 'src="/assets/v7.js"')
-        return HTMLResponse(html, headers={"Cache-Control": "no-store, max-age=0"})
-    if request.method == "GET" and request.url.path == "/assets/v7.css":
-        css = "\n".join((STATIC_DIR / name).read_text() for name in ("v3.css", "v4.css", "v5.css", "v7-addon.css"))
-        css = css.replace("@import url('/base.css');", "").replace("@import url('/previous.css');", "")
-        return asset(css, "text/css")
-    if request.method == "GET" and request.url.path == "/assets/v7.js":
-        javascript = (STATIC_DIR / "v5.js").read_text().replace("'/api/tv'", "'/api/v7/tv'")
-        javascript += "\n" + (STATIC_DIR / "v7-addon.js").read_text()
-        return asset(javascript, "text/javascript")
-    return await call_next(request)
+    audio_compatibility: list[AudioCompatibility] = []
 
 
 def episode_key(episode: dict) -> tuple:
@@ -125,6 +116,16 @@ def persist_remux_language_tags(
                 update = requested.get((codec_type, identity))
                 if update is not None and (update.language is not None or update.region is not None):
                     language, region = update.language, update.region
+            elif source_kind == 'compatibility':
+                from app.v13 import matroska_tracks
+                originals = matroska_tracks(Path(request.path)).get('audio', [])
+                properties = originals[int(identity)] if int(identity) < len(originals) else {}
+                raw = str(properties.get('language_ietf') or properties.get('language') or 'und')
+                parts = raw.split('-', 1)
+                language, region = parts[0], parts[1] if len(parts) > 1 else ''
+                update = requested.get(('audio', identity))
+                if update is not None and (update.language is not None or update.region is not None):
+                    language, region = update.language, update.region
             elif codec_type == "subtitle":
                 external = external_by_path[str(identity)][0]
                 # Unknown/missing filename tags must be imported as Plex's
@@ -152,6 +153,10 @@ def _reorder_edit_impl(request: ReorderEditRequest) -> dict:
     assert_media_editable(request.path)
     source = authorized_file(request.path)
     original = source.stat()
+    from app.job_safety import output_space, stamp, replace_prepared, run_write_command
+    original_stamp = stamp(source)
+    from app.review_audio import resolve_integrations
+    audio_integrations = resolve_integrations(source, request.audio_compatibility)
     data = probe(source)
     typed = {"audio": [], "subtitle": []}
     for stream in data.get("streams", []):
@@ -190,16 +195,34 @@ def _reorder_edit_impl(request: ReorderEditRequest) -> dict:
         if identifier not in seen and identifier not in removed:
             ordered["subtitle"].append(("external", path, None))
     external_inputs = list(external_by_path.items())
+    replacements = {}
+    compatibility_inputs = {}
+    for position, (change, audio_path, stage) in enumerate(audio_integrations):
+        identity = stage['audio_index']
+        if f'embedded:audio:{identity}' in removed or identity >= len(typed['audio']):
+            raise HTTPException(409, 'Approved AAC source was removed in this draft; discard the audio approval before saving')
+        input_number = len(external_inputs) + position + 1
+        if change.action == 'replace':
+            replacements[identity] = input_number
+        else:
+            ordered['audio'].append(('compatibility', identity, typed['audio'][identity]))
+            compatibility_inputs[identity] = input_number
     input_index = {path: index + 1 for index, (path, _) in enumerate(external_inputs)}
     temporary = source.with_name(f".{source.stem}.{uuid.uuid4().hex}.vse{source.suffix}")
     command = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-i", str(source)]
     for _, (_, path) in external_inputs:
         command += ["-i", str(path)]
+    for _, audio_path, stage in audio_integrations:
+        start_offset = float(json.loads(stage['metadata_json']).get('start_time') or 0)
+        command += ['-itsoffset', str(start_offset), '-i', str(audio_path)]
     command += ["-map", "0:v?"]
     for codec_type in ("audio", "subtitle"):
         short = "a" if codec_type == "audio" else "s"
         for source_kind, identity, _ in ordered[codec_type]:
-            command += ["-map", f"0:{short}:{identity}" if source_kind == "embedded" else f"{input_index[identity]}:0"]
+            if codec_type == 'audio' and (source_kind == 'compatibility' or identity in replacements):
+                command += ['-map', f"{compatibility_inputs[identity] if source_kind == 'compatibility' else replacements[identity]}:a:0"]
+            else:
+                command += ["-map", f"0:{short}:{identity}" if source_kind == "embedded" else f"{input_index[identity]}:0"]
     command += ["-map", "0:t?", "-map", "0:d?", "-map_metadata", "0", "-map_chapters", "0", "-c", "copy"]
     # Preserve effective Matroska metadata for every manually mapped stream.
     try:
@@ -210,7 +233,7 @@ def _reorder_edit_impl(request: ReorderEditRequest) -> dict:
     for codec_type in ("audio", "subtitle"):
         short = "a" if codec_type == "audio" else "s"
         for output_index, (source_kind, identity, stream) in enumerate(ordered[codec_type]):
-            if source_kind != "embedded":
+            if source_kind not in ("embedded", "compatibility"):
                 continue
             properties = matroska[codec_type][identity] if identity < len(matroska[codec_type]) else {}
             tags = (stream or {}).get("tags") or {}
@@ -220,6 +243,11 @@ def _reorder_edit_impl(request: ReorderEditRequest) -> dict:
                 command += [f"-metadata:s:{short}:{output_index}", f"language={language}"]
             if title is not None:
                 command += [f"-metadata:s:{short}:{output_index}", f"title={str(title).strip()}"]
+            if source_kind == 'compatibility':
+                update = next((item for item in request.tracks if item.codec_type == 'audio' and item.type_index == identity), None)
+                if update is not None and update.title is not None:
+                    title = update.title
+                command += [f'-metadata:s:a:{output_index}', f'title={str(title or "").strip()} · AAC stereo'.strip(' ·')]
     new_index = {(kind, identity): index for codec_type in ordered for index, (kind, identity, _) in enumerate(ordered[codec_type])}
     for update in request.tracks:
         output_index = new_index.get(("embedded", update.type_index)) if update.codec_type in ordered else None
@@ -241,23 +269,104 @@ def _reorder_edit_impl(request: ReorderEditRequest) -> dict:
         default_key, forced_key = selections[codec_type]
         for index, (kind, identity, stream) in enumerate(ordered[codec_type]):
             identifier = f"embedded:{codec_type}:{identity}" if kind == "embedded" else f"external:{identity}"
-            command += [f"-disposition:{short}:{index}", disposition_flags(stream or {}, identifier == default_key, identifier == forced_key)]
+            current = (stream or {}).get("disposition") or {}
+            update = next((item for item in request.tracks if kind == 'embedded' and item.codec_type == codec_type and item.type_index == identity), None)
+            flags = []
+            for flag, selection in (("default", default_key), ("forced", forced_key)):
+                override = getattr(update, flag, None)
+                flags.append(override if override is not None else bool(current.get(flag)) if selection == '__preserve__' else identifier == selection)
+            command += [f"-disposition:{short}:{index}", disposition_flags(stream or {}, *flags)]
+            if kind == 'compatibility':
+                command += [f'-disposition:a:{index}', '0']
             if kind == "external":
                 item = external_by_path[identity][0]
                 command += [f"-metadata:s:s:{index}", f"language={make_language(item.language, item.region)}", f"-metadata:s:s:{index}", f"title={item.title.strip()}"]
     command.append(str(temporary))
+    # Admission covers the entire output write, not just a racy free-space check.
+    disk_admission = output_space(source.parent, int(original.st_size * 1.1) + sum(audio.stat().st_size for _, audio, _ in audio_integrations) + 64 * 1024**2)
+    disk_admission.__enter__()
     try:
-        subprocess.run(command, capture_output=True, text=True, timeout=3600, check=True)
+        if audio_integrations:
+            import shutil
+            required = original.st_size + sum(audio.stat().st_size for _, audio, _ in audio_integrations) + 512 * 1024**2
+            if shutil.disk_usage(source.parent).free < required:
+                raise HTTPException(507, 'Insufficient space for the atomic container rewrite and safety reserve')
+        if audio_integrations:
+            import tempfile
+            import time
+            from app.review_audio import integration_building
+            integration_building(request.audio_compatibility, temporary)
+            process = None
+            with tempfile.TemporaryFile(mode='w+t') as errors:
+                try:
+                    process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=errors)
+                    started = time.monotonic()
+                    while process.poll() is None:
+                        if time.monotonic() - started > 3600 or shutil.disk_usage(source.parent).free < 512 * 1024**2:
+                            raise HTTPException(507, 'Container rewrite stopped at the time/disk safety limit; original retained')
+                        time.sleep(.5)
+                    if process.returncode:
+                        errors.seek(0)
+                        raise HTTPException(422, errors.read()[-2000:] or 'AAC integration remux failed; original retained')
+                finally:
+                    if process and process.poll() is None:
+                        process.kill()
+                        process.wait(timeout=10)
+        else:
+            run_write_command(command, source.parent)
         persist_remux_language_tags(temporary, request, ordered, external_by_path)
+        if audio_integrations:
+            output = probe(temporary)
+            audio_streams = [s for s in output.get('streams', []) if s.get('codec_type') == 'audio']
+            if len(audio_streams) != len(ordered['audio']):
+                raise HTTPException(422, 'AAC integration failed stream-count verification; original retained')
+            for index, (kind, identity, _) in enumerate(ordered['audio']):
+                if kind == 'compatibility' or identity in replacements:
+                    if audio_streams[index].get('codec_name') != 'aac' or audio_streams[index].get('channels') != 2:
+                        raise HTTPException(422, 'AAC integration failed codec verification; original retained')
+            from app.review_audio import fingerprint
+            if any(fingerprint(source) != json.loads(stage['fingerprint_json']) for _, _, stage in audio_integrations):
+                raise HTTPException(409, 'Media changed during AAC integration; original retained')
         os.chmod(temporary, original.st_mode)
         os.utime(temporary, ns=(original.st_atime_ns, original.st_mtime_ns))
-        os.replace(temporary, source)
+        if audio_integrations:
+            from app.review_audio import integration_intent
+            with temporary.open('rb') as prepared:
+                os.fsync(prepared.fileno())
+            integration_intent(request.audio_compatibility, temporary)
+        replace_prepared(temporary, source, original_stamp)
+        if audio_integrations:
+            from app.review_audio import integration_complete
+            try:
+                parent_fd = os.open(source.parent, os.O_RDONLY)
+                try:
+                    os.fsync(parent_fd)
+                finally:
+                    os.close(parent_fd)
+                integration_complete(request.audio_compatibility)
+            except Exception:
+                logger.exception('AAC integration committed; stage finalization will recover on startup')
     except HTTPException:
         temporary.unlink(missing_ok=True)
+        if audio_integrations:
+            from app.review_audio import integration_failed
+            integration_failed(request.audio_compatibility)
         raise
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
         temporary.unlink(missing_ok=True)
+        if audio_integrations:
+            from app.review_audio import integration_failed
+            integration_failed(request.audio_compatibility)
         raise HTTPException(422, (getattr(exc, "stderr", None) or "Media edit failed")[-2000:]) from exc
+    except OSError:
+        temporary.unlink(missing_ok=True)
+        if audio_integrations:
+            from app.review_audio import integration_failed
+            integration_failed(request.audio_compatibility)
+        raise
+    finally:
+        temporary.unlink(missing_ok=True)
+        disk_admission.__exit__(None, None, None)
     warnings = []
     deleted_external = {path for _, path in external_by_path.values()} | set(external_remove.values())
     for subtitle in deleted_external:
