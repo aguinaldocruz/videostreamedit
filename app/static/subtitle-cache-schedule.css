@@ -1,0 +1,46 @@
+.subtitle-cache-card{display:grid;gap:.7rem;padding:1rem;border:1px solid var(--vse-border,#34404c);border-radius:.8rem;margin-top:1rem;background:var(--vse-surface,#1a222b)}
+.subtitle-cache-heading{display:grid;gap:.2rem}.subtitle-cache-heading small,.subtitle-cache-card small{color:var(--muted,#9ca8b4)}
+.subtitle-cache-controls{display:flex;flex-wrap:wrap;align-items:end;gap:.6rem}.subtitle-cache-controls label{display:grid;gap:.2rem;font-size:.82rem;min-width:7rem}.subtitle-cache-controls input,.subtitle-cache-controls select{max-width:10rem;min-height:2.3rem}.subtitle-cache-controls input[type=number]{max-width:6rem}.subtitle-cache-controls button{min-height:2.3rem;white-space:nowrap}
+.subtitle-cache-card [data-cache-status],.subtitle-cache-card [data-cache-progress]{margin:0;overflow-wrap:anywhere}
+.subtitle-cache-progress-row{display:flex;align-items:center;justify-content:space-between;gap:.75rem;flex-wrap:wrap}
+.subtitle-cache-progress-row [data-cache-progress]{flex:1 1 32rem}
+.subtitle-cache-card [data-cache-current]{display:block;overflow-wrap:anywhere}
+.subtitle-cache-card [data-cache-current][hidden]{display:none}
+.subtitle-cache-failure-dialog{width:min(62rem,calc(100vw - 2rem));max-height:min(80vh,55rem);padding:1.2rem;border:1px solid var(--vse-border,#34404c);border-radius:.8rem;background:var(--vse-surface,#1a222b);color:inherit}
+.subtitle-cache-failure-dialog::backdrop{background:rgba(0,0,0,.65)}
+.subtitle-cache-failure-dialog header{display:flex;align-items:center;justify-content:space-between;gap:1rem}
+.subtitle-cache-failure-dialog h3{margin:0}
+.subtitle-cache-failure-dialog [data-failure-list]{display:grid;gap:.6rem;max-height:55vh;overflow:auto}
+.subtitle-cache-failure{padding:.7rem;border:1px solid var(--vse-border,#34404c);border-radius:.5rem}
+.subtitle-cache-failure button{display:block;text-align:left}
+.subtitle-cache-failure small{display:block;overflow-wrap:anywhere;color:var(--muted,#9ca8b4)}
+.subtitle-cache-failure p{margin:.4rem 0 0;overflow-wrap:anywhere}
+
+/* One readable schedule per card; the controls retain their original handlers. */
+[data-tasks-panel="schedules"] .scheduled-tasks-panel{max-width:74rem;margin-inline:auto;padding:clamp(.7rem,2vw,1.3rem)}
+[data-tasks-panel="schedules"] .scheduled-tasks-panel>.detector-section-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:1rem;margin-bottom:1rem}
+[data-tasks-panel="schedules"] .scheduled-tasks-panel>.detector-section-heading h3{margin:0 0 .3rem}
+[data-tasks-panel="schedules"] .scheduled-tasks-panel>.detector-section-heading p{margin:0;max-width:58rem;color:var(--vse-muted,#9ca8b4);line-height:1.5}
+[data-tasks-panel="schedules"] #scheduled-task-cards{display:grid;grid-template-columns:minmax(0,1fr);gap:.85rem}
+[data-tasks-panel="schedules"] #scheduled-task-cards>.scheduled-task-card{box-sizing:border-box;min-width:0;margin:0;padding:1rem 1.1rem;display:grid;gap:.8rem;border:1px solid var(--vse-border,#34404c);border-radius:.8rem;background:var(--vse-surface,#1a222b);box-shadow:0 2px 9px rgba(0,0,0,.08)}
+[data-tasks-panel="schedules"] #scheduled-task-cards>.scheduled-task-card:hover{border-color:color-mix(in srgb,var(--vse-accent,#62b0ff) 35%,var(--vse-border,#34404c))}
+[data-tasks-panel="schedules"] .schedule-card-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:1rem;min-width:0}
+[data-tasks-panel="schedules"] .schedule-card-heading>div,[data-tasks-panel="schedules"] .setup-schedule-extra>div:first-child{display:grid;gap:.2rem;min-width:0}
+[data-tasks-panel="schedules"] .schedule-card-heading strong,[data-tasks-panel="schedules"] .setup-schedule-extra>div:first-child strong,[data-tasks-panel="schedules"] .subtitle-cache-heading strong{font-size:1rem;line-height:1.3;color:var(--vse-text,#e7edf5)}
+[data-tasks-panel="schedules"] .schedule-card-heading small,[data-tasks-panel="schedules"] .setup-schedule-extra>div:first-child small,[data-tasks-panel="schedules"] .subtitle-cache-heading small{font-size:.83rem;line-height:1.4;color:var(--vse-muted,#9ca8b4)}
+[data-tasks-panel="schedules"] .schedule-card-controls,[data-tasks-panel="schedules"] .schedule-discovery-card .index-schedule,[data-tasks-panel="schedules"] .schedule-discovery-card .plex-sync-schedule>div,[data-tasks-panel="schedules"] .setup-schedule-extra .backup-schedule{display:grid;grid-template-columns:minmax(11rem,1.5fr) minmax(9rem,1fr) auto;gap:.7rem;align-items:end;min-width:0;margin:0;padding:0;border:0}
+[data-tasks-panel="schedules"] .schedule-discovery-card .plex-sync-schedule{min-width:0;margin:0;padding:0;border:0}
+[data-tasks-panel="schedules"] .schedule-discovery-card .plex-sync-schedule h4,[data-tasks-panel="schedules"] .schedule-discovery-card .index-action-label,[data-tasks-panel="schedules"] .setup-schedule-extra .backup-schedule>strong{display:none}
+[data-tasks-panel="schedules"] .schedule-discovery-card .plex-sync-schedule>div{grid-template-columns:minmax(11rem,1.5fr) minmax(7rem,.8fr) minmax(9rem,1fr) auto}
+[data-tasks-panel="schedules"] .setup-schedule-extra .backup-schedule{grid-template-columns:minmax(11rem,1.5fr) minmax(9rem,1fr) auto}
+[data-tasks-panel="schedules"] .schedule-card-controls label,[data-tasks-panel="schedules"] .schedule-discovery-card label,[data-tasks-panel="schedules"] .setup-schedule-extra label{display:grid;gap:.3rem;min-width:0;margin:0;font-size:.78rem;color:var(--vse-muted,#9ca8b4)}
+[data-tasks-panel="schedules"] .schedule-card-controls select,[data-tasks-panel="schedules"] .schedule-card-controls input,[data-tasks-panel="schedules"] .schedule-discovery-card select,[data-tasks-panel="schedules"] .schedule-discovery-card input,[data-tasks-panel="schedules"] .setup-schedule-extra select,[data-tasks-panel="schedules"] .setup-schedule-extra input[type=number]{box-sizing:border-box;width:100%;max-width:100%;min-width:0;min-height:2.4rem}
+[data-tasks-panel="schedules"] .schedule-card-controls button,[data-tasks-panel="schedules"] .schedule-discovery-card button,[data-tasks-panel="schedules"] .setup-schedule-extra button{min-height:2.4rem;white-space:nowrap;justify-self:start}
+[data-tasks-panel="schedules"] .schedule-card-status,[data-tasks-panel="schedules"] .schedule-discovery-card .index-schedule small,[data-tasks-panel="schedules"] .schedule-discovery-card .plex-sync-schedule>small,[data-tasks-panel="schedules"] .setup-schedule-extra [data-backup-next]{display:block;min-width:0;margin:0;padding-top:.55rem;border-top:1px solid var(--vse-border,#34404c);color:var(--vse-muted,#9ca8b4);font-size:.82rem;line-height:1.4;overflow-wrap:anywhere}
+[data-tasks-panel="schedules"] .schedule-discovery-card .index-schedule small{grid-column:1/-1}
+[data-tasks-panel="schedules"] .setup-schedule-extra .backup-schedule [data-backup-next]{grid-column:1/-1}
+[data-tasks-panel="schedules"] .setup-schedule-extra .schedule-card-controls>label:has([data-dispatcher-enabled]){display:flex;align-items:center;gap:.5rem;align-self:end;min-height:2.4rem}
+[data-tasks-panel="schedules"] .setup-schedule-extra .schedule-card-controls>label:has([data-dispatcher-enabled]) input{width:auto;min-height:0}
+[data-tasks-panel="schedules"] #scheduled-task-status:empty{display:none}
+@media(max-width:800px){[data-tasks-panel="schedules"] .schedule-card-controls,[data-tasks-panel="schedules"] .schedule-discovery-card .index-schedule,[data-tasks-panel="schedules"] .schedule-discovery-card .plex-sync-schedule>div,[data-tasks-panel="schedules"] .setup-schedule-extra .backup-schedule{grid-template-columns:repeat(2,minmax(0,1fr))}[data-tasks-panel="schedules"] .schedule-card-controls button,[data-tasks-panel="schedules"] .schedule-discovery-card button,[data-tasks-panel="schedules"] .setup-schedule-extra .backup-schedule button{grid-column:1/-1}}
+@media(max-width:520px){[data-tasks-panel="schedules"] .scheduled-tasks-panel>.detector-section-heading{display:grid}[data-tasks-panel="schedules"] .schedule-card-controls,[data-tasks-panel="schedules"] .schedule-discovery-card .index-schedule,[data-tasks-panel="schedules"] .schedule-discovery-card .plex-sync-schedule>div,[data-tasks-panel="schedules"] .setup-schedule-extra .backup-schedule{grid-template-columns:minmax(0,1fr)}[data-tasks-panel="schedules"] .schedule-card-controls button,[data-tasks-panel="schedules"] .schedule-discovery-card button,[data-tasks-panel="schedules"] .setup-schedule-extra .backup-schedule button{grid-column:1}[data-tasks-panel="schedules"] #scheduled-task-cards>.scheduled-task-card{padding:.85rem}}

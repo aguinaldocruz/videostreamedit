@@ -28,7 +28,7 @@ from app.v7 import ReorderEditRequest
 from app.v11 import connection
 from app.v13 import media_details_with_ietf
 from app.v43 import optimized_media_edit
-from app.v51 import damage_kind, decode_external, extracted_text
+from app.v51 import cached_subtitle_text, damage_kind, decode_external, extracted_text
 from app.v78 import app
 from app.preflight_dispatcher import enqueue_bulk_preflight, register_approval_handler, register_handler
 
@@ -504,9 +504,13 @@ def detect_stream_language(request: StreamLanguageDetectionRequest) -> dict:
         if source == "external":
             if not row or not row["external_path"]:
                 raise ValueError("External subtitle is not indexed")
-            text, _ = decode_external(Path(row["external_path"]).read_bytes()[:2_000_000])
+            text = cached_subtitle_text(Path(path), "external", -1, str(row["external_path"]))
+            if text is None:
+                text, _ = decode_external(Path(row["external_path"]).read_bytes()[:2_000_000])
         else:
-            text = extracted_text(Path(path), f"0:s:{request.type_index}")
+            text = cached_subtitle_text(Path(path), "embedded", request.type_index)
+            if text is None:
+                text = extracted_text(Path(path), f"0:s:{request.type_index}")
         allowed = {value.casefold().split("-", 1)[0].split("_", 1)[0] for value in common_detection_languages()}
         detected, confidence, evidence = detect_common_variant(text, allowed)
     except (OSError, ValueError, TypeError) as exc:
@@ -658,6 +662,47 @@ def persist_external_sidecars(job: str, path: str) -> None:
                 [(path, item["path"], str(item.get("codec") or ""), str(item.get("language") or ""), str(item.get("region") or ""), str(item.get("title") or ""), int(bool(item.get("forced"))), json.dumps(item.get("filename_tags") or [], ensure_ascii=False), item["size"], item["modified_ns"]) for item in values],
             )
         db.execute("INSERT OR REPLACE INTO external_sidecar_index_state(job,path,signature,indexed_at) VALUES(?,?,?,CURRENT_TIMESTAMP)", (job, path, signature))
+
+
+def prune_missing_external_sidecars(paths: set[str]) -> int:
+    """Drop vanished sidecars from the read model without probing video files.
+
+    The regular incremental index still handles new or modified sidecars. Only
+    remove rows when the media and its parent directory remain accessible.
+    """
+    removed = 0
+    ordered_paths = sorted(paths)
+    directory_entries: dict[Path, set[str] | None] = {}
+    with connection() as db:
+        for start in range(0, len(ordered_paths), 800):
+            batch = ordered_paths[start:start + 800]
+            if not batch:
+                continue
+            rows = db.execute(
+                f"SELECT path,external_path FROM media_stream_index WHERE source='external' "
+                f"AND path IN ({','.join('?' for _ in batch)})", batch,
+            ).fetchall()
+            for row in rows:
+                media = Path(row['path'])
+                sidecar = Path(row['external_path'])
+                if media.parent not in directory_entries:
+                    try:
+                        directory_entries[media.parent] = {item.name for item in media.parent.iterdir()}
+                    except OSError:
+                        directory_entries[media.parent] = None
+                names = directory_entries[media.parent]
+                if names is None or media.name not in names or sidecar.name in names:
+                    continue
+                db.execute(
+                    "DELETE FROM media_stream_index WHERE path=? AND source='external' AND external_path=?",
+                    (str(media), str(sidecar)),
+                )
+                db.execute(
+                    "DELETE FROM external_subtitle_index WHERE media_path=? AND external_path=?",
+                    (str(media), str(sidecar)),
+                )
+                removed += 1
+    return removed
 
 
 def pending_external_sidecars(job: str) -> list[dict]:
@@ -910,7 +955,7 @@ def _subtitle_metrics(text: str) -> dict:
     }
 
 
-def inspect_portuguese_language(path: str, detection_scope: dict | None = None, text_cache: dict | None = None) -> None:
+def inspect_portuguese_language(path: str, detection_scope: dict | None = None, text_cache: dict | None = None, *, cache_only: bool = False) -> None:
     from app.detection_policy import is_final, source_stamp, subtitle_assessment, language_key
     if is_final(path): return
     media = Path(path)
@@ -976,7 +1021,12 @@ def inspect_portuguese_language(path: str, detection_scope: dict | None = None, 
                 text_key = ("external", key[2])
                 cached = cache.get(text_key)
                 if cached is None:
-                    cached = decode_external(Path(key[2]).read_bytes()[:2_000_000])
+                    if cache_only:
+                        base.update(analysis_status="no_confidence", analysis_reason="Subtitle format is not in the complete text cache")
+                        results.append(base)
+                        continue
+                    text = cached_subtitle_text(media, "external", -1, key[2])
+                    cached = (text, "UTF-8 (cached)") if text is not None else decode_external(Path(key[2]).read_bytes()[:2_000_000])
                     cache[text_key] = cached
                 text, _ = cached
             elif (codec in {"subrip", "srt", "ass", "ssa", "webvtt", "mov_text", "text", "subtitles"}
@@ -985,7 +1035,13 @@ def inspect_portuguese_language(path: str, detection_scope: dict | None = None, 
                 text_key = ("embedded", key[1])
                 text = cache.get(text_key)
                 if text is None:
-                    text = extracted_text(media, f"0:s:{key[1]}")
+                    if cache_only:
+                        base.update(analysis_status="no_confidence", analysis_reason="Subtitle format is not in the complete text cache")
+                        results.append(base)
+                        continue
+                    text = cached_subtitle_text(media, "embedded", key[1])
+                    if text is None:
+                        text = extracted_text(media, f"0:s:{key[1]}")
                     cache[text_key] = text
             else:
                 text = ""
@@ -1037,14 +1093,16 @@ def subtitle_index_with_sidecars(item: dict) -> None:
     if _is_final_version(path):
         logger.info("subtitle_index event=skipped_final_version file=%s", path.replace("\n", "\\n"))
         return
-    text_cache = {}
+    text_cache = item.get("_subtitle_text_cache") if item.get("_subtitle_cache_only") else {}
+    if text_cache is None:
+        text_cache = {}
     indexed_item = dict(item)
     indexed_item["_subtitle_text_cache"] = text_cache
     _legacy_processors["subtitles"](indexed_item)
     persist_external_sidecars("subtitles", path)
     scope = item.get("detection_scope") or {}
     if not scope.get("skip_detection"):
-        inspect_portuguese_language(path, scope, text_cache)
+        inspect_portuguese_language(path, scope, text_cache, cache_only=bool(item.get("_subtitle_cache_only")))
 
 
 indexes.processors["subtitles"] = subtitle_index_with_sidecars
@@ -1788,6 +1846,11 @@ def _commit_tv_note_changes(show_id: str, path: str, changes: dict) -> None:
         if final:
             from app.detection_policy import retire_final_detection
             retire_final_detection(db)
+    if changes.get("final_version") is True:
+        from app.subtitle_cache import prioritize_final_media
+        prioritize_final_media(
+            [str(episode["path"]) for episode in episodes] if is_show else [path]
+        )
 
 
 def process_tv_edit_session_commit(task_id: int, payload: dict) -> dict:

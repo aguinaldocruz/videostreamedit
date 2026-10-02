@@ -159,6 +159,8 @@ def affected_media_path(task_type: str, payload: dict) -> str:
         return str((payload.get("edit") or payload).get("path") or "")
     if task_type == "subtitle_html_cleanup":
         return str(payload.get("path") or "")
+    if task_type == "matroska_layout_remux":
+        return str(payload.get("path") or "")
     if task_type in {"tv_filtered_stream_edit", "tv_filtered_stream_edit_now", "filtered_stream_edit", "filtered_stream_edit_now", "plex_import_refresh"}:
         return str(payload.get("path") or "")
     if task_type == "movie_import":
@@ -234,7 +236,7 @@ def validate_media_signature(task_type: str, payload: dict) -> None:
         raise RuntimeError("Media changed between queueing and execution; job refused for safety")
 
 def _create_media_luw(task_id: int, task_type: str, payload: dict, path: str) -> str | None:
-    destructive_types = {"media_edit", "filtered_stream_edit", "filtered_stream_edit_now", "tv_filtered_stream_edit", "tv_filtered_stream_edit_now", "movie_import", "subtitle_html_cleanup", "image_subtitle_convert", "ocr_rollback", "plex_import_refresh"}
+    destructive_types = {"media_edit", "filtered_stream_edit", "filtered_stream_edit_now", "tv_filtered_stream_edit", "tv_filtered_stream_edit_now", "movie_import", "subtitle_html_cleanup", "image_subtitle_convert", "ocr_rollback", "plex_import_refresh", "matroska_layout_remux"}
     if os.getenv("DATABASE_BACKEND", "sqlite").lower() != "postgres" or task_type not in destructive_types or not path:
         return None
     existing = payload.get("_luw_id")
@@ -247,6 +249,8 @@ def _create_media_luw(task_id: int, task_type: str, payload: dict, path: str) ->
     edit = payload.get("edit") or payload
     if task_type == "movie_import":
         rollback_strategy = "atomic-copy-target-and-retain-source"
+    elif task_type == "matroska_layout_remux":
+        rollback_strategy = "verified-stream-copy-then-atomic-replacement"
     elif edit.get('audio_compatibility'):
         rollback_strategy = 'atomic-remux-with-audio-stage-commit-intent'
     elif task_type in {"image_subtitle_convert", "ocr_rollback", "subtitle_html_cleanup"}:
@@ -551,7 +555,7 @@ TASK_HANDLERS = {"media_edit": process_media_edit, "media_reindex": process_medi
 
 
 DEFAULT_TASK_PRIORITIES = [
-    "media_edit", "tv_filtered_stream_edit_batch", "tv_filtered_stream_edit_now", "filtered_stream_edit_now",
+    "media_edit", "matroska_layout_remux", "tv_filtered_stream_edit_batch", "tv_filtered_stream_edit_now", "filtered_stream_edit_now",
     "tv_filtered_stream_edit", "filtered_stream_edit", "movie_import",
     "audio_language_detection", "subtitle_html_cleanup", "image_subtitle_convert", "review_audio_prepare",
     "media_reindex", "plex_sync", "plex_import_refresh", "index_check_prepare", "index_rebuild_prepare",
@@ -564,6 +568,8 @@ def task_priority_order() -> list[str]:
         try: seen = [str(value) for value in json.loads(row["value"] or "[]")] if row else []
         except (TypeError, ValueError, json.JSONDecodeError): seen = []
         existing = [str(item["task_type"]) for item in db.execute("SELECT DISTINCT task_type FROM task_queue").fetchall()]
+    if "matroska_layout_remux" not in seen and "media_edit" in seen:
+        seen.insert(seen.index("media_edit") + 1, "matroska_layout_remux")
     return list(dict.fromkeys([item for item in seen + DEFAULT_TASK_PRIORITIES + existing if item]))
 
 
@@ -1091,6 +1097,76 @@ def _group_has_unfinished_tasks(db, group_id: str | None) -> bool:
         return True
     return bool(db.execute("""SELECT 1 FROM workflow_stages WHERE group_id=?::uuid
         AND status IN ('pending','running','blocked') LIMIT 1""", (group_id,)).fetchone())
+
+
+@app.post("/api/v65/queue/group/{group_id}/retire-invalid")
+def retire_invalid_workflow_jobs(group_id: str) -> dict:
+    """Remove terminal jobs for a missing-source workflow, retaining recovery.
+
+    A failed import may leave a pending dependent stage even though its source
+    has moved. This action retires that stage and job history atomically; it
+    never discards or relocates the only surviving media snapshot.
+    """
+    try:
+        workflow_id = uuid.UUID(group_id)
+    except ValueError as exc:
+        raise HTTPException(400, "Invalid workflow group") from exc
+    with connection() as db:
+        _lock_workflow_mutation(db.raw)
+        group = db.execute(
+            "SELECT resource_key,status FROM workflow_groups WHERE group_id=?::uuid FOR UPDATE",
+            (str(workflow_id),),
+        ).fetchone()
+        if not group or group["status"] != "failed":
+            raise HTTPException(409, "Only failed workflows can be retired")
+        source = str(group["resource_key"] or "")
+        if not source or Path(source).exists():
+            raise HTTPException(409, "The original media still exists; use normal retry, rollback or deletion")
+        if not Path(source).parent.is_dir():
+            raise HTTPException(409, "The source directory is unavailable; reconnect storage before retiring jobs")
+        active = db.execute(
+            "SELECT 1 FROM task_queue WHERE replace(group_id,'-','')=? AND status IN ('pending','running') LIMIT 1",
+            (workflow_id.hex,),
+        ).fetchone()
+        active_index = db.execute(
+            "SELECT 1 FROM index_task_queue WHERE replace(group_id,'-','')=? AND status IN ('pending','running') LIMIT 1",
+            (workflow_id.hex,),
+        ).fetchone()
+        locked = db.execute("SELECT 1 FROM workflow_locks WHERE group_id=?::uuid LIMIT 1", (str(workflow_id),)).fetchone()
+        running_stage = db.execute("SELECT 1 FROM workflow_stages WHERE group_id=?::uuid AND status='running' LIMIT 1", (str(workflow_id),)).fetchone()
+        active_luw = db.execute(
+            "SELECT 1 FROM workflow_luws WHERE group_id=?::uuid AND status IN ('locked','applying','verifying') LIMIT 1",
+            (str(workflow_id),),
+        ).fetchone()
+        if active or active_index or locked or active_luw or running_stage:
+            raise HTTPException(409, "This workflow still has active work or a media lock")
+        jobs = db.execute(
+            "SELECT id,status FROM task_queue WHERE replace(group_id,'-','')=? FOR UPDATE",
+            (workflow_id.hex,),
+        ).fetchall()
+        if not jobs or not any(row["status"] == "failed" for row in jobs):
+            raise HTTPException(409, "No failed jobs remain in this workflow")
+        artifacts = db.execute(
+            "SELECT artifact_path FROM workflow_artifacts WHERE group_id=?::uuid",
+            (str(workflow_id),),
+        ).fetchall()
+        recovery = [str(row["artifact_path"]) for row in artifacts if Path(str(row["artifact_path"])).is_file()]
+        db.execute(
+            "UPDATE workflow_stages SET status='cancelled',finished_at=now(),updated_at=now() "
+            "WHERE group_id=?::uuid AND status IN ('pending','blocked','failed')",
+            (str(workflow_id),),
+        )
+        db.execute(
+            "UPDATE workflow_groups SET definition=definition || ?::jsonb,updated_at=now() "
+            "WHERE group_id=?::uuid",
+            (json.dumps({"retired_invalid_jobs": True, "recovery_retained": True, "recovery_discard_requested": False}), str(workflow_id)),
+        )
+        db.execute("DELETE FROM media_change_request WHERE task_id IN (SELECT id FROM task_queue WHERE replace(group_id,'-','')=?)", (workflow_id.hex,))
+        db.execute("DELETE FROM task_queue_expedite WHERE task_id IN (SELECT id FROM task_queue WHERE replace(group_id,'-','')=?)", (workflow_id.hex,))
+        removed = db.execute("DELETE FROM task_queue WHERE replace(group_id,'-','')=?", (workflow_id.hex,)).rowcount
+        db.execute("DELETE FROM task_queue_group WHERE replace(group_id,'-','')=?", (workflow_id.hex,))
+    logger.warning("task_queue event=invalid_workflow_retired group=%s jobs=%d recovery_files=%d", workflow_id, removed, len(recovery))
+    return {"retired": removed, "group_id": str(workflow_id), "source_missing": source, "recovery_files": recovery}
 
 
 def retry_tasks_atomically(db, where: str, params: list) -> int:

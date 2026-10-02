@@ -45,6 +45,11 @@ def ensure_unified_index() -> None:
                 path TEXT PRIMARY KEY, modified_ns BIGINT NOT NULL, size BIGINT NOT NULL,
                 schema_version INTEGER NOT NULL DEFAULT 2, indexed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
+            CREATE TABLE IF NOT EXISTS external_sidecar_index_state (
+                job TEXT NOT NULL, path TEXT NOT NULL, signature TEXT NOT NULL,
+                indexed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY(job,path)
+            );
             CREATE TABLE IF NOT EXISTS core_index_parity_audit (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 sample_limit INTEGER NOT NULL,
@@ -73,6 +78,12 @@ def ensure_unified_index() -> None:
                 path TEXT PRIMARY KEY, title TEXT NOT NULL DEFAULT '', video_index INTEGER NOT NULL DEFAULT 0,
                 modified_ns BIGINT NOT NULL, size BIGINT NOT NULL, indexed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
+            CREATE TABLE IF NOT EXISTS matroska_layout_check (
+                path TEXT PRIMARY KEY, size BIGINT NOT NULL, modified_ns BIGINT NOT NULL,
+                status TEXT NOT NULL, detail TEXT NOT NULL DEFAULT '',
+                checked_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS matroska_layout_check_status ON matroska_layout_check(status,path);
         """)
         if not column_exists(db, "media_stream_index_state", "content_signature"):
             db.execute("ALTER TABLE media_stream_index_state ADD COLUMN content_signature TEXT NOT NULL DEFAULT ''")
@@ -178,6 +189,8 @@ def core_content_signature(path: Path, stat=None) -> str:
 def unified_core_index(item: dict) -> None:
     ensure_unified_index()
     path = Path(item["path"])
+    from app.matroska_layout import safe_checkpoint
+    safe_checkpoint(path)
     values = fast_streams(path)
     video_meta = next((value for value in values if value.get("source") == "__video_meta__"), {"track_name": "", "video_index": 0})
     values = [value for value in values if value.get("source") != "__video_meta__"]
@@ -187,6 +200,14 @@ def unified_core_index(item: dict) -> None:
         # Publish one complete media snapshot in this transaction, but avoid
         # rewriting unchanged stream rows. Readers see either the old snapshot
         # or the new one, never the intermediate state.
+        previous_state = db.execute(
+            "SELECT modified_ns,size,content_signature FROM media_stream_index_state WHERE path=?",
+            (str(path),),
+        ).fetchone()
+        previous_sidecars = db.execute(
+            "SELECT signature FROM external_sidecar_index_state WHERE job='core' AND path=?",
+            (str(path),),
+        ).fetchone()
         current_rows = {
             (str(row["source"]), str(row["stream_type"]), int(row["type_index"]), str(row["external_path"] or "")): dict(row)
             for row in db.execute(
@@ -223,9 +244,119 @@ def unified_core_index(item: dict) -> None:
         db.execute("INSERT OR REPLACE INTO media_stream_index_state(path,modified_ns,size,schema_version,content_signature,indexed_at) VALUES(?,?,?,3,?,CURRENT_TIMESTAMP)", (str(path), stat.st_mtime_ns, stat.st_size, content_signature))
         db.execute("INSERT OR REPLACE INTO media_video_title(path,title,video_index,modified_ns,size,indexed_at) VALUES(?,?,?,?,?,CURRENT_TIMESTAMP)", (str(path), str(video_meta.get("track_name") or ""), int(video_meta.get("video_index") or 0), stat.st_mtime_ns, stat.st_size))
     tv_bulk.persist_external_sidecars("core", str(path))
+    # The core index is the change detector. Retire cached subtitles here,
+    # not by probing every cached media again during a scheduled cache pass.
+    try:
+        subtitle_rows = any(key[1] in {"subtitle", "external"} for key in current_rows.keys() | snapshot.keys())
+        file_changed = bool(previous_state and (
+            int(previous_state["modified_ns"]) != stat.st_mtime_ns
+            or int(previous_state["size"]) != stat.st_size
+            or str(previous_state["content_signature"] or "") != content_signature
+        ))
+        old_subtitles = {(key, value["codec"]) for key, value in current_rows.items() if key[1] in {"subtitle", "external"}}
+        new_subtitles = {(key, value["codec"]) for key, value in snapshot.items() if key[1] in {"subtitle", "external"}}
+        with connection() as db:
+            current_sidecars = db.execute(
+                "SELECT signature FROM external_sidecar_index_state WHERE job='core' AND path=?",
+                (str(path),),
+            ).fetchone()
+        sidecars_changed = bool(previous_sidecars and current_sidecars and previous_sidecars["signature"] != current_sidecars["signature"])
+        layout_changed = old_subtitles != new_subtitles
+        if (subtitle_rows and (file_changed or layout_changed or sidecars_changed)) or (previous_state is None and subtitle_rows):
+            from app.subtitle_cache import invalidate_and_enqueue_media_many
+            invalidate_and_enqueue_media_many([str(path)])
+    except Exception as exc:
+        logger.warning("subtitle_cache event=core_invalidation_failed path=%s error=%s", path, str(exc).replace("\n", " ")[:300])
 
 
 indexes.processors["core"] = unified_core_index
+
+
+@app.get("/api/v82/reports/matroska-layout")
+def matroska_layout_report(kind: str) -> dict:
+    """Report previously checked media; recheck changed warnings only."""
+    if kind not in {"tv", "movies"}:
+        raise HTTPException(400, "Kind must be tv or movies")
+    from app.v19 import report_blocked_paths
+    from app.matroska_layout import active_remux_paths, revalidate_warning_rows
+    blocked = report_blocked_paths()
+    active_remux = active_remux_paths()
+    with connection() as db:
+        rows = db.execute(
+            "SELECT c.path,c.size,c.modified_ns,c.detail,c.checked_at,p.kind,p.title,p.show_title,p.season_number,p.episode_number "
+            "FROM matroska_layout_check c JOIN plex_media p ON p.path=c.path "
+            "WHERE c.status='tracks_after_cluster' AND p.kind=? "
+            "AND NOT EXISTS (SELECT 1 FROM index_task_queue q WHERE q.path=c.path AND q.status IN ('pending','running')) "
+            "ORDER BY p.show_title,p.season_number,p.episode_number,p.title",
+            ("episode" if kind == "tv" else "movie",),
+        ).fetchall()
+    current_warnings = revalidate_warning_rows(rows)
+    media = [dict(row) for row in rows if str(row["path"]) in current_warnings and str(row["path"]) not in blocked and str(row["path"]) not in active_remux]
+    if kind == "movies":
+        items = [{"title": Path(str(row["title"] or row["path"])).stem, "path": row["path"],
+                  "detail": row["detail"], "checked_at": row["checked_at"]} for row in media]
+    else:
+        grouped: dict[str, list[dict]] = {}
+        for row in media:
+            show = str(row["show_title"] or "Unknown show")
+            season = int(row["season_number"] or 0)
+            episode = int(row["episode_number"] or 0)
+            label = f"S{season:02d}E{episode:02d} · {Path(str(row['title'] or row['path'])).stem}"
+            grouped.setdefault(show, []).append({"episode": label, "path": row["path"],
+                                                  "detail": row["detail"], "checked_at": row["checked_at"]})
+        items = [{"title": show, "episodes": episodes} for show, episodes in sorted(grouped.items())]
+    return {"kind": kind, "items": items, "title_count": len(items), "media_count": len(media),
+            "scope": "Media checked during normal processing; no catalog scan was started"}
+
+
+class MatroskaLayoutRemuxRequest(BaseModel):
+    kind: str
+    paths: list[str] = Field(min_length=1, max_length=30000)
+
+
+@app.post("/api/v82/reports/matroska-layout/remux")
+def queue_matroska_layout_remux(request: MatroskaLayoutRemuxRequest) -> dict:
+    if request.kind not in {"tv", "movies"}:
+        raise HTTPException(400, "Kind must be tv or movies")
+    report = matroska_layout_report(request.kind)
+    eligible = {item["path"] for group in report["items"]
+                for item in (group.get("episodes") or [group])}
+    paths = [path for path in dict.fromkeys(request.paths) if path in eligible]
+    if not paths:
+        return {"queued": 0, "skipped": len(request.paths)}
+    preflight = enqueue_bulk_preflight("matroska_layout_remux", [{"path": path} for path in paths],
+                                       mode="queued", priority=75, deduplicate=True)
+    return {"queued": len(paths), "skipped": len(request.paths) - len(paths), "preflight_id": preflight["id"]}
+
+
+def validate_matroska_layout_remux(payload: dict, fingerprint: dict) -> dict:
+    from app.matroska_layout import checkpoint
+    from app.v11 import plex_authorized_file
+    from app.v86 import assert_media_editable
+    if not fingerprint.get("exists"):
+        return {"decision": "invalid", "reason": "Media file is unavailable"}
+    media = plex_authorized_file(str(payload["path"]))
+    assert_media_editable(str(media))
+    status = checkpoint(media)
+    return {"decision": "approved" if status == "tracks_after_cluster" else "skipped",
+            "reason": "Late track headers confirmed" if status == "tracks_after_cluster" else f"Current layout: {status}",
+            "path": str(media)}
+
+
+def approve_matroska_layout_remux(payload: dict, result: dict) -> dict:
+    ids = []
+    for item in payload.get("_bulk_items") or []:
+        path = str(item["path"])
+        job = tasks.enqueue("matroska_layout_remux", {"path": path},
+                            f"Repair Matroska track layout · {Path(path).name}", deduplicate=True)
+        ids.append(job["id"])
+    return {"task_ids": ids, "queued": len(ids), "task_type": "matroska_layout_remux"}
+
+
+register_handler("matroska_layout_remux", validate_matroska_layout_remux)
+register_approval_handler("matroska_layout_remux", approve_matroska_layout_remux)
+from app.matroska_remux import process_matroska_layout_remux
+tasks.TASK_HANDLERS["matroska_layout_remux"] = process_matroska_layout_remux
 
 
 @app.on_event("startup")

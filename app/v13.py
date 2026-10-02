@@ -98,9 +98,8 @@ def _indexed_media_details(media: Path) -> dict | None:
         indexed=indexed_external.get(str(item.get("path")))
         merged={key:indexed[key] for key in ("language","region","title","forced","codec","filename_tags") if indexed and key in indexed}
         external.append({**item, **merged})
-    for path,item in indexed_external.items():
-        if path and not any(str(value.get("path")) == path for value in external):
-            external.append(item)
+    # A removed sidecar must not reappear just because its old index row still
+    # exists. The incremental index will retire that row separately.
     for item in streams:
         if item["codec_type"] == "audio":
             detection=audio_rows.get(int(item["type_index"]))

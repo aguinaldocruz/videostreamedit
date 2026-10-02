@@ -18,6 +18,7 @@ from pydantic import BaseModel, Field
 
 from app.v83 import app, _review_metadata, _review_plan, _subtitle_file, TEXT_SUBTITLE_CODECS
 from app.v28 import authorized_import_file
+from app.subtitle_cache_worker import cached_or_extract_track
 
 ROOT = Path(os.getenv('MEDIA_STREAM_DIR', '/tmp/vse-media-streams')) / 'interactive'
 SLOTS = threading.BoundedSemaphore(max(1, min(3, int(os.getenv('MEDIA_REVIEW_WORKERS', '2')))))
@@ -247,8 +248,27 @@ def subtitle_text(path: str, source: str, index: int | None = None, external_pat
             raise HTTPException(400, 'Subtitle no longer exists')
         if subs[index].get('codec_name') not in TEXT_SUBTITLE_CODECS:
             raise HTTPException(422, 'Image subtitles cannot be overlaid. Select a text subtitle or turn subtitles off.')
-    import tempfile
     from fastapi.responses import Response
+    if source in ('embedded', 'external'):
+        try:
+            selected = cached_or_extract_track(
+                media, source, index if source == 'embedded' else -1,
+                str(external_path or '') if source == 'external' else '',
+                _review_metadata(media),
+            )
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        converted = subprocess.run(
+            ['ffmpeg', '-nostdin', '-hide_banner', '-loglevel', 'error', '-f', 'srt', '-i', 'pipe:0',
+             '-f', 'webvtt', 'pipe:1'],
+            input=selected.text.encode('utf-8'), capture_output=True, timeout=30,
+        )
+        if converted.returncode or not converted.stdout:
+            raise HTTPException(422, 'Cached subtitle could not be converted to WebVTT')
+        return Response(converted.stdout, media_type='text/vtt')
+    import tempfile
     with tempfile.TemporaryDirectory(prefix='vse-text-') as directory:
         name = _subtitle_file(media, source, index, external_path, Path(directory))
         return Response((Path(directory) / name).read_bytes(), media_type='text/vtt')

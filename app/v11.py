@@ -289,7 +289,7 @@ def sync_plex() -> dict:
 @app.get("/api/v11/movies")
 def plex_movies() -> list[dict]:
     with connection() as db: rows=db.execute("SELECT * FROM plex_media WHERE kind='movie' ORDER BY title COLLATE NOCASE,path").fetchall()
-    return [{"path":r["path"],"name":r["title"]+Path(r["path"]).suffix,"relative_path":r["title"]+Path(r["path"]).suffix,"parts":[r["title"]],"root_name":r["library_name"],"size":r["size"],"modified":r["modified"]} for r in rows]
+    return [{"path":r["path"],"name":r["title"]+Path(r["path"]).suffix,"relative_path":r["title"]+Path(r["path"]).suffix,"parts":[r["title"]],"root_name":r["library_name"],"year":int(r["plex_year"] or 0),"size":r["size"],"modified":r["modified"]} for r in rows]
 
 
 @app.get("/api/v11/tv")

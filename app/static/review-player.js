@@ -12,7 +12,7 @@
     <details class="rp-compatibility"><summary>Compatibility & staged audio / subtitles <span data-stage-count></span></summary><div class="rp-compat-actions"><button type="button" data-retry>Try AAC stereo playback</button><button type="button" data-convert>Create AAC stereo version</button><small>Playback conversion is temporary. Permanent changes require review and approval; video is never re-encoded by audio approval.</small></div><div data-audio-stages></div><div data-subtitle-stages></div></details>`;
   old.replaceWith(dialog);
   const el = name => dialog.querySelector(`[data-${name}]`);
-  let path='', title='', generation=0, session=null, pending=null, hls=null, media=null, total=0, offset=0, desired=0, forceAAC=false, timer=null, pollTimer=null, playing=false, subtitleGeneration=0, blob=null;
+  let path='', title='', generation=0, session=null, pending=null, hls=null, media=null, total=0, offset=0, desired=0, forceAAC=false, timer=null, pollTimer=null, playing=false, subtitleGeneration=0, blob=null, refreshEditorAfterApproval=false;
   const subtitleCache = new Map();
   let playIntent=true;
   const resumeState=()=>pending?playIntent:media?!media.paused:true;
@@ -38,6 +38,13 @@
   }
   function close() {generation++;subtitleGeneration++;removeSession(pending);pending=null;stopPlayer();clearInterval(pollTimer);dialog.close();}
   el('close').onclick=close;
+  dialog.addEventListener('close',()=>{
+    if(!refreshEditorAfterApproval)return;
+    refreshEditorAfterApproval=false;
+    if(state.selectedPath!==path||!document.querySelector('#stream-dialog')?.open)return;
+    (window.streamEditorRefreshPaths??=new Set()).add(path);
+    openEditor(path,title).catch(error=>status(`Could not refresh stream properties: ${error.message}`,true));
+  });
   dialog.addEventListener('cancel',e=>{e.preventDefault();close();});
   window.addEventListener('pagehide',()=>{removeSession(session);removeSession(pending);});
   function updateTransport(){
@@ -50,6 +57,11 @@
     [row.querySelector('[name=language]')?.value,row.querySelector('[name=region]')?.value].filter(Boolean).join('-'),row.querySelector('[name=title]')?.value,row.dataset.codec].filter(Boolean).join(' · ');}
   function appendRow(select,row){const option=new Option(rowLabel(row),row.dataset.key);option.dataset.index=row.dataset.typeIndex;option.dataset.codec=row.dataset.codec||'';option.dataset.source=row.dataset.external==='true'?'external':'embedded';option.dataset.path=row.dataset.path||'';if(graphical.test(option.dataset.codec)){option.textContent+=' — image overlay unsupported';}select.add(option);}
   const chosen = name => el(name).selectedOptions[0];
+  const canCreateAacVersion = () => {
+    const option=chosen('audio');
+    return active('audio') && Boolean(option?.value) && !option.dataset.stage && option.dataset.codec.toLowerCase() !== 'aac';
+  };
+  const updateAudioConversionOffer = () => {el('convert').hidden=!canCreateAacVersion();};
   function subtitleQuery(){const option=chosen('subtitle');if(!active('subtitle')||!option?.value)return null;return new URLSearchParams({path,source:option.dataset.source,index:option.dataset.index||'0',external_path:option.dataset.path||''});}
   async function subtitleText(){const query=subtitleQuery();if(!query)return '';const key=query.toString();if(subtitleCache.has(key))return subtitleCache.get(key);const response=await fetch('/api/review/subtitle?'+query);if(!response.ok){const error=await response.json().catch(()=>({}));throw new Error(error.detail||'Subtitle could not be loaded');}const text=await response.text();subtitleCache.set(key,text);return text;}
   async function switchSubtitle(){
@@ -139,11 +151,11 @@
   el('toggle').onclick=toggle;el('play').onclick=toggle;el('stop').onclick=()=>{desired=0;generation++;removeSession(pending);pending=null;stopPlayer();el('stage').textContent='Stopped — press Play to start again';updateTransport();};
   el('volume').oninput=()=>{if(media)media.volume=Number(el('volume').value);};el('speed').onchange=()=>{if(media)media.playbackRate=Number(el('speed').value);};
   el('fullscreen').onclick=()=>{if(document.fullscreenElement)document.exitFullscreen();else dialog.requestFullscreen?.();};
-  el('audio').onchange=()=>{el('audio').title=chosen('audio')?.textContent||'';forceAAC=false;load(pending?desired:position(),resumeState());};
+  el('audio').onchange=()=>{el('audio').title=chosen('audio')?.textContent||'';updateAudioConversionOffer();forceAAC=false;load(pending?desired:position(),resumeState());};
   el('subtitle').onchange=()=>{el('subtitle').title=chosen('subtitle')?.textContent||'';mode()==='subtitle'?showText():switchSubtitle();};
-  dialog.querySelectorAll('[data-output]').forEach(button=>button.onclick=()=>{const count=dialog.querySelectorAll('[data-output].active').length;if(button.classList.contains('active')&&count===1)return;const before=mode(),time=pending?desired:position(),wasPlaying=resumeState();button.classList.toggle('active');button.setAttribute('aria-pressed',String(button.classList.contains('active')));if(mode()===before&&button.dataset.output==='subtitle')switchSubtitle();else load(time,wasPlaying);});
+  dialog.querySelectorAll('[data-output]').forEach(button=>button.onclick=()=>{const count=dialog.querySelectorAll('[data-output].active').length;if(button.classList.contains('active')&&count===1)return;const before=mode(),time=pending?desired:position(),wasPlaying=resumeState();button.classList.toggle('active');button.setAttribute('aria-pressed',String(button.classList.contains('active')));updateAudioConversionOffer();if(mode()===before&&button.dataset.output==='subtitle')switchSubtitle();else load(time,wasPlaying);});
   el('retry').onclick=()=>{forceAAC=true;load(position(),true);};
-  el('convert').onclick=async()=>{const option=chosen('audio');if(!option?.value||option.dataset.stage){status('Select an original audio stream to convert',true);return;}const button=el('convert');button.disabled=true;status('Queueing AAC preparation…');try{const result=await request('/api/review/audio',{method:'POST',body:JSON.stringify({path,audio_index:Number(option.dataset.index)})});status(`AAC preparation queued${result.task_id?' · job #'+result.task_id:''}; original media is unchanged`);await refreshStages();}catch(error){status(error.message,true);}finally{button.disabled=false;}};
+  el('convert').onclick=async()=>{const option=chosen('audio');if(!canCreateAacVersion()){status('Select an original non-AAC audio stream to convert',true);return;}const button=el('convert');button.disabled=true;status('Queueing AAC preparation…');try{const result=await request('/api/review/audio',{method:'POST',body:JSON.stringify({path,audio_index:Number(option.dataset.index)})});status(`AAC preparation queued${result.task_id?' · job #'+result.task_id:''}; original media is unchanged`);await refreshStages();}catch(error){status(error.message,true);}finally{button.disabled=false;}};
   function textPopup(text,heading){const popup=document.createElement('dialog');popup.className='rp-text-popup';popup.innerHTML='<h3></h3><pre></pre><button type="button">Close</button>';popup.querySelector('h3').textContent=heading;popup.querySelector('pre').textContent=text;popup.querySelector('button').onclick=()=>popup.close();popup.onclose=()=>popup.remove();document.body.append(popup);popup.showModal();}
   function actionButton(label,action){const button=document.createElement('button');button.type='button';button.textContent=label;button.onclick=async()=>{button.disabled=true;try{await action();}catch(error){status(error.message,true);}finally{button.disabled=false;}};return button;}
   async function refreshStages(){
@@ -175,16 +187,17 @@
         const card=document.createElement('article');card.className='rp-stage-card';const label=document.createElement('span');label.textContent=item.name||stagedPath.split('/').pop();card.append(label);
         card.append(actionButton('View text',async()=>{const response=await fetch('/api/v83/media-review/staged-subtitles/file?'+new URLSearchParams({path,staged_path:stagedPath}));if(!response.ok)throw new Error('Could not read staged subtitle');textPopup(await response.text(),label.textContent);}));
         const language=document.createElement('input');language.value=item.language||'';language.placeholder='Language';language.setAttribute('aria-label','Downloaded subtitle language');const region=document.createElement('input');region.value=item.region||'';region.placeholder='Region';region.setAttribute('aria-label','Downloaded subtitle region');card.append(language,region);
-        card.append(actionButton('Approve subtitle',async()=>{if(window.tvShowEditSession?.status==='open')throw new Error('Finish the TV draft before placing downloaded subtitles; playback and text review remain available.');await request('/api/v83/media-review/staged-subtitles/approve',{method:'POST',body:JSON.stringify({path,staged_path:stagedPath,language:language.value,region:region.value})});status('Subtitle placed beside the media; refresh stream properties after review.');await refreshStages();}));
+        card.append(actionButton('Approve subtitle',async()=>{if(window.tvShowEditSession?.status==='open')throw new Error('Finish the TV draft before placing downloaded subtitles; playback and text review remain available.');if(typeof queuedChangeCount==='function'&&queuedChangeCount()>0)throw new Error('Apply or discard pending stream-property changes before approving this subtitle.');await request('/api/v83/media-review/staged-subtitles/approve',{method:'POST',body:JSON.stringify({path,staged_path:stagedPath,language:language.value,region:region.value})});refreshEditorAfterApproval=true;status('Subtitle approved. Stream properties will refresh when you close Media Review.');await refreshStages();}));
         card.append(actionButton('Reject',async()=>{await request('/api/v83/media-review/staged-subtitles/reject',{method:'POST',body:JSON.stringify({path,staged_path:stagedPath})});await refreshStages();}));el('subtitle-stages').append(card);
       }
       if([...el('audio').options].some(o=>o.value===previousAudio))el('audio').value=previousAudio;
       if([...el('subtitle').options].some(o=>o.value===previousSubtitle))el('subtitle').value=previousSubtitle;
+      updateAudioConversionOffer();
       el('stage-count').textContent=`(${audioData.items.length+(subtitleData.items||[]).length})`;
     }catch(error){if(path===ownPath)status(error.message,true);}
   }
   window.reviewPlayerOpen=async function(preferredRow=null){
-    generation++;stopPlayer();removeSession(pending);pending=null;clearInterval(pollTimer);subtitleCache.clear();
+    generation++;stopPlayer();removeSession(pending);pending=null;clearInterval(pollTimer);subtitleCache.clear();refreshEditorAfterApproval=false;
     path=state.selectedPath;title=document.querySelector('#selected-file').textContent;total=0;offset=0;desired=0;forceAAC=false;
     el('title').textContent=title;el('audio').replaceChildren();el('subtitle').replaceChildren(new Option('No subtitles',''));
     for(const row of streamRows('audio'))appendRow(el('audio'),row);for(const row of streamRows('subtitle'))appendRow(el('subtitle'),row);
@@ -192,6 +205,7 @@
     const selectDefault=(kind,first,second)=>{const key=document.querySelector(`[name=${first}-${kind}]:checked`)?.value||document.querySelector(`[name=${second}-${kind}]:checked`)?.value;if([...el(kind).options].some(option=>option.value===key))el(kind).value=key;};
     selectDefault('audio','default','forced');selectDefault('subtitle','forced','default');if(preferredRow&&['audio','subtitle'].includes(preferredRow.dataset.codecType))el(preferredRow.dataset.codecType).value=preferredRow.dataset.key;
     if(!el('audio').options.length){const button=dialog.querySelector('[data-output=audio]');button.classList.remove('active');button.setAttribute('aria-pressed','false');}
+    updateAudioConversionOffer();
     el('stage').textContent='Preparing review…';dialog.showModal();updateTransport();refreshStages();pollTimer=setInterval(refreshStages,6000);await load(0,true);
   };
   document.querySelector('#review-media').onclick=()=>window.reviewPlayerOpen();

@@ -95,7 +95,9 @@
       const card=setup.querySelector(`[data-index-job="${job}"]`);
       try {
         const status=await api(`/api/v80/setup/index/${job}/status`);
-        card.querySelector('[data-index-status]').textContent=`${status.indexed} indexed · ${status.running} running · ${status.queued} queued · ${status.failed} failed${status.paused?' · Paused':''}`;
+        const waiting=job==='subtitles'?Math.max(0,Number(status.waiting_cache)||0):0;
+        const queued=waiting?`${Math.max(0,status.queued-waiting)} ready · ${waiting} waiting for subtitle cache`:`${status.queued} queued`;
+        card.querySelector('[data-index-status]').textContent=`${status.indexed} indexed · ${status.running} running · ${queued} · ${status.failed} failed${status.paused?' · Paused':''}`;
         return status;
       } catch(error) { card.querySelector('[data-index-status]').textContent=error.message; return null; }
     }));

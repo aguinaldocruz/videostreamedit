@@ -2,7 +2,7 @@
   const maintenance=document.querySelector('.index-maintenance');
   if(!maintenance)return;
   const labels={disabled:'Disabled',daily:'Daily',every_other_day:'Every other day',weekly:'Weekly'};
-  function describe(value){if(value.frequency==='disabled')return'Optional discovery disabled · pending index items still start immediately';const next=value.next_run?new Date(value.next_run).toLocaleString():'after the selected time';return`${labels[value.frequency]} · next check ${next}`}
+  function describe(value){if(value.frequency==='disabled')return'Optional discovery disabled · pending index items still start immediately';const next=value.next_run?formatAppDate(value.next_run):'after the selected time';return`${labels[value.frequency]} · next check ${next} · ${appTimezone()}`}
   maintenance.querySelectorAll('[data-index-job]').forEach(card=>{
     const job=card.dataset.indexJob;
     card.insertAdjacentHTML('beforeend',`<div class="index-schedule index-action-group" data-action-group="schedule"><span class="index-action-label">Schedule</span><label>Incremental check<select data-index-frequency><option value="disabled">Disabled</option><option value="daily">Daily</option><option value="every_other_day">Every other day</option><option value="weekly">Weekly</option></select></label><label>Time<input type="time" data-index-time value="03:00"></label><button type="button" data-index-schedule-save>Save schedule</button><small data-index-schedule-status>Loading schedule…</small></div>`);

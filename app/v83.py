@@ -15,6 +15,7 @@ from app.v2 import probe
 from app.v5 import external_subtitles
 from app.v28 import authorized_import_file
 from app.v82 import app
+from app import subtitle_cache as _subtitle_cache  # noqa: F401 - registers cache schema startup
 from app.v11 import connection
 
 logger = logging.getLogger("uvicorn.error")
@@ -279,3 +280,4 @@ def retired_review_stream():
 
 
 from app import review_playback, review_audio  # register bounded playback and supervised audio APIs
+from app import subtitle_cache_schedule as _subtitle_cache_schedule  # noqa: F401 - scheduled cache APIs

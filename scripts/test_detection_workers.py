@@ -66,3 +66,31 @@ with patch('app.postgres_store._lock_workflow_mutation'):
     assert len(updates) == 2
     assert all('group_id::text IN (?)' in sql and args == db.groups for sql, args in updates)
 print('PASS: scheduler survives transient errors; retirement touches only affected workflow groups')
+
+# Scheduled index checks must use the durable queue status, not the removed
+# in-memory index worker state.
+class ScheduleDB(DB):
+    def __init__(self, running):
+        self.running = running
+        self.updated = False
+    def execute(self, sql, params=()):
+        if sql.startswith('SELECT job,frequency,time_of_day,last_run'):
+            self.rows = [{'job': 'core', 'frequency': 'daily', 'time_of_day': '03:00', 'last_run': None}]
+        elif sql.startswith('UPDATE index_job_schedule'):
+            self.updated = True
+            self.rows = []
+        return self
+    def __iter__(self): return iter(self.rows)
+
+for running in (0, 1):
+    db = ScheduleDB(running)
+    with patch.object(v67, 'connection', return_value=db), patch.object(v67, 'schedule_due', return_value=True), patch.object(v67.index_jobs, 'status', return_value={'running': running, 'total': 0}) as status, patch.object(v67.index_jobs, 'start') as start, patch.object(v67.threading, 'Event') as event:
+        event.return_value.wait.side_effect = StopIteration
+        try:
+            v67.run_scheduler()
+        except StopIteration:
+            pass
+    status.assert_called_with('core')
+    assert start.call_count == (0 if running else 1)
+    assert db.updated == (running == 0)
+print('PASS: scheduled index checks use durable queue status and skip active jobs')

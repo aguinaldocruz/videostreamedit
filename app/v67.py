@@ -108,7 +108,7 @@ def run_scheduler() -> None:
             try:
                 if not schedule_due(schedule["frequency"], schedule["time_of_day"], schedule["last_run"], now):
                     continue
-                if index_jobs.states[job]["running"]:
+                if index_jobs.status(job)["running"]:
                     continue
                 index_jobs.start(job)
                 with connection() as db:

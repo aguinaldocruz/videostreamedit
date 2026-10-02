@@ -580,6 +580,9 @@ def plex_tv_with_alternatives(show_id: str | None = None) -> list[dict]:
         for season in show["seasons"]
         for episode in season["episodes"]
     }
+    if show_id and selected_paths:
+        from app.v79 import prune_missing_external_sidecars
+        prune_missing_external_sidecars(selected_paths)
     scoped = selected_paths if show_id else None
     aliases = aliases_by_path(scoped)
     requested = change_requests_by_path(scoped)
@@ -679,7 +682,7 @@ def image_subtitle_report(kind: str) -> dict:
         rows = db.execute(
             f"SELECT path,type_index,stream_type,external_path,language,region,track_name,codec FROM media_stream_index "
             f"WHERE stream_type IN ('subtitle','external') AND lower(trim(codec)) IN ({placeholders}) "
-            "ORDER BY path,type_index,external_path",
+            "ORDER BY subtitle_extended_index.path,type_index,external_path",
             IMAGE_SUBTITLE_CODECS,
         ).fetchall()
     rows = [row for row in rows if _detection_row_current(row) and str(row["path"]) not in blocked_paths]
@@ -753,8 +756,9 @@ def html_subtitle_report(kind: str) -> dict:
         text_codecs = ("subrip", "srt", "ass", "ssa", "webvtt", "mov_text", "text")
         placeholders = ",".join("?" for _ in text_codecs)
         rows = db.execute(
-            "SELECT path,source,type_index,external_path,codec FROM subtitle_extended_index "
-            "WHERE markup LIKE ? AND lower(codec) IN (" + placeholders + ") "
+            "SELECT subtitle_extended_index.path,source,type_index,external_path,codec FROM subtitle_extended_index "
+            "JOIN subtitle_extended_media inspected ON inspected.path=subtitle_extended_index.path "
+            "WHERE inspected.markup_version>=3 AND markup LIKE ? AND lower(codec) IN (" + placeholders + ") "
             "AND NOT EXISTS (SELECT 1 FROM task_queue t "
             "WHERE t.task_type='subtitle_html_cleanup' AND t.status IN ('pending','running') "
             "AND CAST(t.payload_json AS JSONB)->>'path'=subtitle_extended_index.path) "
@@ -1392,11 +1396,13 @@ register_approval_handler("video_title_cleanup", approve_video_title_cleanup)
 
 @app.get("/api/v19/reports/availability")
 def report_availability() -> dict:
-    """Summarize indexed findings without building every report or probing files."""
+    """Summarize findings, rechecking only changed Matroska warnings."""
+    from app.matroska_layout import active_remux_paths, revalidate_warning_rows
     keys = ("image", "damaged", "html", "language", "confidence", "duplicate_audio",
-            "duplicate_subtitle", "uncommon", "forced", "audio_only", "english_only", "external_only", "video_titles")
+            "duplicate_subtitle", "uncommon", "forced", "audio_only", "english_only", "external_only", "video_titles", "matroska_layout")
     found = {key: {"tv": set(), "movies": set()} for key in keys}
     blocked = report_blocked_paths()
+    active_layout_remux = active_remux_paths()
 
     def mark(key, path, kind):
         if path not in blocked and kind in {"movie", "episode"}:
@@ -1408,6 +1414,14 @@ def report_availability() -> dict:
         pending_rows = db.execute("SELECT path,job FROM index_task_queue WHERE status IN ('pending','running')").fetchall()
         pending = {str(row["path"]) for row in pending_rows}
         pending_subtitles = {str(row["path"]) for row in pending_rows if row["job"] == "subtitles"}
+        layout_rows = db.execute(
+            "SELECT c.path,c.size,c.modified_ns,p.kind FROM matroska_layout_check c JOIN plex_media p ON p.path=c.path "
+            "WHERE c.status='tracks_after_cluster'"
+        ).fetchall()
+        current_layout_warnings = revalidate_warning_rows(layout_rows)
+        for row in layout_rows:
+            if str(row["path"]) in current_layout_warnings and str(row["path"]) not in pending and str(row["path"]) not in active_layout_remux:
+                mark("matroska_layout", str(row["path"]), row["kind"])
         for row in db.execute("SELECT v.path,p.kind FROM media_video_title v JOIN plex_media p ON p.path=v.path WHERE trim(coalesce(v.title,''))<>''").fetchall():
             if row["path"] not in pending:
                 mark("video_titles", row["path"], row["kind"])
@@ -1499,13 +1513,15 @@ def report_availability() -> dict:
         codecs = ("subrip", "srt", "ass", "ssa", "webvtt", "mov_text", "text")
         marks = ",".join("?" for _ in codecs)
         for row in db.execute(
-            "SELECT DISTINCT s.path,p.kind,s.markup,s.damage FROM subtitle_extended_index s "
-            "JOIN plex_media p ON p.path=s.path WHERE lower(s.codec) IN (" + marks + ") "
+            "SELECT DISTINCT s.path,p.kind,s.markup,s.damage,inspected.markup_version FROM subtitle_extended_index s "
+            "JOIN plex_media p ON p.path=s.path "
+            "LEFT JOIN subtitle_extended_media inspected ON inspected.path=s.path "
+            "WHERE lower(s.codec) IN (" + marks + ") "
             "AND (s.markup LIKE ? OR (s.damage IS NOT NULL AND s.damage!='' AND s.damage!='None'))",
             (*codecs, "%HTML tags%"),
         ).fetchall():
             path = str(row["path"])
-            if "HTML tags" in str(row["markup"] or ""):
+            if int(row["markup_version"] or 0) >= 3 and "HTML tags" in str(row["markup"] or ""):
                 mark("html", path, row["kind"])
             if row["damage"] and row["damage"] != "None" and path not in pending_subtitles:
                 mark("damaged", path, row["kind"])

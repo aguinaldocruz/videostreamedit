@@ -96,7 +96,7 @@ function compatibleHistoryTemplates(current) {
 
 function templateSummary(template) {
   const timestamp = template.savedAt || template.updated_at || template.created_at;
-  const time = timestamp ? new Date(timestamp).toLocaleString() : 'Saved change';
+  const time = timestamp ? formatAppDate(timestamp) : 'Saved change';
   return {time, detail: (template.changes || []).join(' · ') || 'Stream property changes'};
 }
 

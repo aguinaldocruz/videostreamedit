@@ -40,7 +40,7 @@ window.movieMatchesStatusFilters = function (file) {
 };
 window.movieRowHTML = function (file) {
   const badges = `${file.note ? `<span class="note-tag" title="${attr(file.note)}">i</span>` : ''}${file.reviewed ? `<span class="reviewed-tag" title="Reviewed">✓</span>` : ''}${file.plex_sync_change ? `<span class="plex-sync-tag" title="Plex Sync Change">P</span>` : ''}${file.final_version ? `<button type="button" class="final-version-tag" data-final-toggle="movie" data-final-path="${attr(file.path)}" title="Final version · click to unfreeze">F</button>` : ''}${typeof reportConfidenceDot === 'function' ? reportConfidenceDot(file.portuguese_detection_confidence,file.portuguese_detection_metadata,file.portuguese_detection_language,'subtitle',file.portuguese_detection_no_confidence,file.portuguese_detection_region) : ''}${file.audio_detection_confidence >= 0.6 && typeof reportConfidenceDot === 'function' ? reportConfidenceDot(file.audio_detection_confidence,file.audio_detection_metadata,file.audio_detection_language,'audio') : ''}`;
-  return `<tr><td><strong class="movie-title title-with-alternatives" title="${attr(alternativeTitleHint(file))}"><span class="movie-primary-title">${esc(movieTitle(file))}</span><span class="movie-title-badges">${badges}</span></strong></td><td>${esc(file.root_name)}</td><td>${bytes(file.size)}</td><td><button class="edit-file" ${file.final_version ? 'disabled title="Final version · click F to unfreeze"' : ''} data-path="${attr(file.path)}" data-label="${attr(movieTitle(file))}">Stream properties</button></td></tr>`;
+  return `<tr><td><strong class="movie-title title-with-alternatives" title="${attr(alternativeTitleHint(file))}"><span class="movie-primary-title">${esc(movieTitle(file))}</span><span class="movie-title-badges">${badges}</span></strong></td><td>${Number(file.year) > 0 ? esc(file.year) : '—'}</td><td>${bytes(file.size)}</td><td><button class="edit-file" ${file.final_version ? 'disabled title="Final version · click F to unfreeze"' : ''} data-path="${attr(file.path)}" data-label="${attr(movieTitle(file))}">Stream properties</button></td></tr>`;
 };
 
 renderMovies = function () {
@@ -66,9 +66,40 @@ renderShows = function () {
     && (detectionState === 'all' || (detectionState === 'has_detection' && hasDetectionDiscrepancy(show)) || (detectionState === 'no_detection' && !hasDetectionDiscrepancy(show)))
     && (finalState === 'all' || (finalState === 'final' && show.final_version) || (finalState === 'not_final' && !show.final_version)));
   $('#tv-empty').style.display = shows.length ? 'none' : 'block';
-  $('#show-list').innerHTML = shows.map(show => `<button class="show-card ${state.currentShow?.id === show.id ? 'active' : ''}" data-id="${attr(show.id)}"><strong class="title-with-alternatives" title="${attr(alternativeTitleHint(show))}">${esc(clean(show.name))}${show.note ? ` <span class="note-tag" title="${attr(show.note)}">i</span>` : ''}${show.reviewed ? ` <span class="reviewed-tag" title="Reviewed">✓</span>` : ''}${show.plex_sync_change ? ` <span class="plex-sync-tag" title="Plex Sync Change">P</span>` : ''}${show.final_version ? ` <span class="final-version-tag" role="button" tabindex="0" data-final-toggle="show" data-final-key="${attr(show.id)}" title="Final version · click to unfreeze all episodes">F</span>` : ''}${typeof reportConfidenceDot === 'function' ? reportConfidenceDot(show.portuguese_detection_confidence,show.portuguese_detection_metadata,show.portuguese_detection_language,'subtitle',show.portuguese_detection_no_confidence,show.portuguese_detection_region) : ''}</strong><small>${show.episode_count} episodes · ${esc(show.root_name)}</small></button>`).join('');
+  $('#show-list').innerHTML = shows.map(show => `<button class="show-card ${state.currentShow?.id === show.id ? 'active' : ''}" data-id="${attr(show.id)}"><strong class="title-with-alternatives" title="${attr(alternativeTitleHint(show))}">${esc(clean(show.name))}${show.note ? ` <span class="note-tag" title="${attr(show.note)}">i</span>` : ''}${show.reviewed ? ` <span class="reviewed-tag" title="Reviewed">✓</span>` : ''}${show.plex_sync_change ? ` <span class="plex-sync-tag" role="button" tabindex="0" data-plex-reset="${attr(show.id)}" title="Plex Sync Change · click to clear">P</span>` : ''}${show.final_version ? ` <span class="final-version-tag" role="button" tabindex="0" data-final-toggle="show" data-final-key="${attr(show.id)}" title="Final version · click to unfreeze all episodes">F</span>` : ''}${typeof reportConfidenceDot === 'function' ? reportConfidenceDot(show.portuguese_detection_confidence,show.portuguese_detection_metadata,show.portuguese_detection_language,'subtitle',show.portuguese_detection_no_confidence,show.portuguese_detection_region) : ''}</strong><small>${show.episode_count} episodes · ${esc(show.root_name)}</small></button>`).join('');
   document.querySelectorAll('.show-card').forEach(button => button.onclick = () => {state.currentShow = state.shows.find(show => show.id === button.dataset.id);state.currentSeason = '*';$('#episode-search').value = '';window._preserveShowSelection = true;renderShows();loadSelectedTvShow(state.currentShow)});
 };
+
+document.addEventListener('click', async event => {
+  const badge = event.target.closest('[data-plex-reset]');
+  if (!badge) return;
+  event.preventDefault();
+  event.stopPropagation();
+  if (badge.dataset.busy === 'true') return;
+  const show = state.shows.find(item => String(item.id) === badge.dataset.plexReset);
+  if (!show) return;
+  badge.dataset.busy = 'true';
+  try {
+    const result = await api('/api/v86/note', {method:'PUT', body:JSON.stringify({entity_type:'tv',entity_key:show.id,note:show.note||'',plex_sync_change:false})});
+    show.plex_sync_change = Boolean(result.plex_sync_change);
+    window._preserveShowSelection = true;
+    renderShows();
+    renderEpisodes();
+    toast('Plex Sync Change cleared');
+  } catch (error) {
+    toast(error.message, true);
+  } finally {
+    delete badge.dataset.busy;
+  }
+}, true);
+
+document.addEventListener('keydown', event => {
+  if (event.key !== 'Enter' && event.key !== ' ') return;
+  const badge = event.target.closest?.('[data-final-toggle="show"],[data-plex-reset]');
+  if (!badge) return;
+  event.preventDefault();
+  badge.click();
+});
 
 const titleRenderEpisodes = renderEpisodes;
 renderEpisodes = function () {

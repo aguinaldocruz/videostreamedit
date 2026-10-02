@@ -15,6 +15,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from app import db_bootstrap
+from app import system_timezone
 from app.pg_compat import Connection, Row, connect as postgres_connect
 
 # db_bootstrap must run before any connection helper is used.  It loads the
@@ -31,8 +32,17 @@ SEASON_PATTERN = re.compile(r"(?:season|series|s)[ ._-]*(\d+)", re.IGNORECASE)
 
 logger = logging.getLogger("uvicorn.error")
 
+# Apply the saved IANA zone before any scheduler or worker starts. UTC remains
+# authoritative for instants stored in PostgreSQL; this controls local wall
+# times, app log rendering, and schedule evaluation.
+system_timezone.initialize()
+for log_name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
+    for handler in logging.getLogger(log_name).handlers:
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S %Z"))
+
 app = FastAPI(title="VideoStreamEdit", version="0.2.0")
 app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=5)
+app.include_router(system_timezone.router)
 
 
 class DatabaseBootstrapRequest(BaseModel):

@@ -4,12 +4,13 @@
   const dialog = document.querySelector('#image-subtitle-report-dialog');
   if (!page || !grid || !dialog || typeof api !== 'function') return;
   grid.insertAdjacentHTML('beforeend','<section class="reports-group" data-report-group="video-titles"><h3>Video stream titles</h3><p>Media with a title stored on a video stream. Remove these titles without changing audio or subtitles.</p><div class="reports-group-actions"><button type="button" data-video-title-report="movies">Movies</button><button type="button" data-video-title-report="tv">TV Shows</button></div></section>');
+  grid.insertAdjacentHTML('beforeend','<section class="reports-group" data-report-group="matroska-layout"><h3>Matroska header layout</h3><p>Previously checked media whose track headers are not before the first media Cluster. This is a compatibility warning, not proof of corruption.</p><div class="reports-group-actions"><button type="button" data-matroska-layout-report="movies">Movies</button><button type="button" data-matroska-layout-report="tv">TV Shows</button></div></section>');
 
   const categories = [
     ['Subtitle quality', 'Find subtitles that need inspection or cleanup.', ['image', 'damaged', 'html', 'confidence']],
     ['Language', 'Review language metadata and language-based findings.', ['language', 'duplicate_audio', 'duplicate_subtitle', 'uncommon']],
     ['Stream configuration', 'Find missing, external, or forced streams.', ['forced', 'english_only', 'audio_only', 'external_only']],
-    ['Video metadata', 'Review and clean video-stream metadata.', ['video_titles']]
+    ['Container and video metadata', 'Review container layout and video-stream metadata.', ['matroska_layout', 'video_titles']]
   ];
   const selectors = {
     image: '[data-image-subtitle-report]', damaged: '[data-damaged-subtitle-report]',
@@ -18,7 +19,8 @@
     duplicate_subtitle: '[data-duplicate-language-report$=":subtitle"]',
     uncommon: '[data-uncommon-language-report]', forced: '[data-forced-report]',
     english_only: '[data-english-only-report]', audio_only: '[data-audio-only-report]',
-    external_only: '[data-external-only-report]', video_titles: '[data-video-title-report]'
+    external_only: '[data-external-only-report]', video_titles: '[data-video-title-report]',
+    matroska_layout: '[data-matroska-layout-report]'
   };
   const cards = {};
   Object.entries(selectors).forEach(([key, selector]) => {
@@ -74,7 +76,8 @@
       button.dataset.noConfidenceReport || button.dataset.portugueseReport ||
       button.dataset.uncommonLanguageReport || button.dataset.forcedReport ||
       button.dataset.englishOnlyReport || button.dataset.audioOnlyReport ||
-      button.dataset.externalOnlyReport || button.dataset.videoTitleReport || '';
+      button.dataset.externalOnlyReport || button.dataset.videoTitleReport ||
+      button.dataset.matroskaLayoutReport || '';
     return value.split(':')[0];
   };
   window.refreshReportAvailability = function (force = false) {
@@ -273,6 +276,56 @@
         body.querySelectorAll('[data-video-remove]').forEach(b=>b.onclick=()=>queue([media[Number(b.dataset.videoRemove)].path]));
         body.querySelectorAll('[data-video-edit]').forEach(b=>b.onclick=()=>{const m=media[Number(b.dataset.videoEdit)];openReportMediaEditor(m.path,m.label,nav,dialog)});
       }catch(error){if(!error?.reportStale)body.innerHTML=`<p class="reports-error">${esc(error.message)}</p>`}finally{button.disabled=false}
+    };
+  });
+
+  page.querySelectorAll('[data-matroska-layout-report]').forEach(button => {
+    button.onclick = async () => {
+      const kind = button.dataset.matroskaLayoutReport;
+      title.textContent = (kind === 'tv' ? 'TV Shows' : 'Movies') + ' with late Matroska track headers';
+      dialog.querySelector('[data-report-summary]').textContent = 'Loading checked media…';
+      body.innerHTML = '<p class="reports-loading vse-status" data-status="pending">Loading…</p>';
+      if (!dialog.open) dialog.showModal();
+      button.disabled = true;
+      try {
+        const result = await reportRequest('/api/v82/reports/matroska-layout?kind=' + kind);
+        const groups = result.items || [];
+        const media = kind === 'tv' ? groups.flatMap(group => (group.episodes || []).map(ep => ({...ep, label: group.title + ' · ' + ep.episode}))) : groups.map(movie => ({...movie, label: movie.title}));
+        const nav = uniqueReportNavigation(media.map(item => ({path: item.path, label: item.label})));
+        dialog.querySelector('[data-report-summary]').textContent = `${result.title_count} titles · ${result.media_count} media · queued stream-copy repair; no catalog scan`;
+        const row = item => {
+          const index = media.findIndex(value => value.path === item.path);
+          return `<div class="report-item vse-panel"><div><button type="button" class="report-title-link vse-link" data-layout-edit="${index}">${esc(item.label || item.episode)}</button><span>${esc(item.detail)}</span></div><button type="button" class="report-item-action vse-btn" data-layout-remux="${index}">Queue fix</button><button type="button" class="report-item-action vse-btn" data-layout-edit="${index}">Stream properties</button></div>`;
+        };
+        body.innerHTML = media.length ? '<div class="report-result-actions"><button type="button" data-layout-all>Queue fix for all listed</button></div>' + (kind === 'tv' ? groups.map((group, i) => `<details class="report-show-group"><summary><strong>${esc(group.title)}</strong><span>${group.episodes.length} episodes</span><button type="button" class="report-item-action" data-layout-show="${i}">Queue show fix</button></summary><div class="report-show-episodes">${group.episodes.map(ep => row({...ep, label: ep.episode})).join('')}</div></details>`).join('') : media.map(row).join('')) : '<p class="reports-empty vse-status" data-status="current">No checked media with this layout warning.</p>';
+        const queue = async paths => {
+          if (!confirm(`Queue stream-copy Matroska layout repair for ${paths.length} media? Each file will be validated before atomic replacement and needs temporary disk space roughly equal to its size.`)) return;
+          const controls = [...body.querySelectorAll('button')];
+          controls.forEach(control => control.disabled = true);
+          beginGlobalBusy('Queueing Matroska layout repair', true);
+          try {
+            const queued = await api('/api/v82/reports/matroska-layout/remux', {method:'POST', body:JSON.stringify({kind, paths})});
+            toast(queued.queued ? `${queued.queued} media submitted · preflight #${queued.preflight_id}` : 'No eligible media remain');
+            await button.onclick();
+            window.refreshReportAvailability?.(true);
+          } catch (error) {
+            toast(error.message, true);
+            controls.forEach(control => control.disabled = false);
+          } finally { endGlobalBusy(); }
+        };
+        body.querySelector('[data-layout-all]')?.addEventListener('click', () => queue(media.map(item => item.path)));
+        body.querySelectorAll('[data-layout-show]').forEach(node => node.onclick = event => {
+          event.preventDefault(); event.stopPropagation();
+          queue(groups[Number(node.dataset.layoutShow)].episodes.map(item => item.path));
+        });
+        body.querySelectorAll('[data-layout-remux]').forEach(node => node.onclick = () => queue([media[Number(node.dataset.layoutRemux)].path]));
+        body.querySelectorAll('[data-layout-edit]').forEach(node => node.onclick = () => {
+          const item = media[Number(node.dataset.layoutEdit)];
+          if (item) openReportMediaEditor(item.path, item.label, nav, dialog);
+        });
+      } catch (error) {
+        if (!error?.reportStale) body.innerHTML = `<p class="reports-error vse-status" data-status="failed">${esc(error.message)}</p>`;
+      } finally { button.disabled = false; }
     };
   });
 

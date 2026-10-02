@@ -2,6 +2,7 @@ FROM python:3.13-slim-bookworm
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
+    TZ=America/Sao_Paulo \
     CONFIG_DIR=/config
 
 RUN apt-get update \

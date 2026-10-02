@@ -437,6 +437,7 @@ MUTATING_TASK_TYPES = frozenset({
     "media_edit", "movie_import", "filtered_stream_edit", "filtered_stream_edit_now",
     "tv_filtered_stream_edit", "tv_filtered_stream_edit_now", "subtitle_html_cleanup",
     "image_subtitle_convert", "ocr_rollback", "plex_import_refresh",
+    "matroska_layout_remux",
 })
 
 
@@ -484,6 +485,10 @@ def _file_digest(path: Path) -> str:
 
 def prepare_task_artifact(group_id: str | None, task_id: int, task_type: str, path: str, payload: dict) -> None:
     """Snapshot a mutating input before its handler can touch the media file."""
+    if task_type == 'matroska_layout_remux':
+        # The verified sibling output replaces the original atomically. A
+        # second full-size recovery copy would triple transient disk usage.
+        return
     if task_type == 'image_subtitle_convert':
         # OCR already owns a durable original in its user-approval staging
         # area, created before remux. Do not retain a second full movie here.
@@ -639,6 +644,7 @@ def _cleanup_retired_workflow_recovery(group_id: str | None = None) -> int:
             _lock_workflow_mutation(db)
             eligible = db.execute("""SELECT g.group_id FROM workflow_groups g
                 WHERE g.group_id=%s
+                AND coalesce(g.definition->>'recovery_retained','false') != 'true'
                 AND NOT EXISTS (SELECT 1 FROM task_queue q WHERE replace(q.group_id,'-','')=replace(g.group_id::text,'-','') AND q.status IN ('pending','running','failed'))
                 AND NOT EXISTS (SELECT 1 FROM index_task_queue q WHERE replace(q.group_id,'-','')=replace(g.group_id::text,'-','') AND q.status IN ('pending','running','failed'))
                 AND NOT EXISTS (SELECT 1 FROM workflow_locks l WHERE l.group_id=g.group_id)
@@ -1185,14 +1191,18 @@ def workflow_read_model(limit: int = 100, status: str | None = None) -> dict:
     where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
     with connection() as db:
         counts = db.execute("SELECT status,count(*) AS amount FROM workflow_groups GROUP BY status ORDER BY status").fetchall()
+        recovery_count = db.execute("SELECT count(*) AS amount FROM workflow_groups g WHERE g.definition->>'recovery_retained'='true' AND EXISTS (SELECT 1 FROM workflow_artifacts a WHERE a.group_id=g.group_id)").fetchone()["amount"]
         groups = db.execute(
             f"""SELECT g.group_id,g.kind,g.resource_key,g.status,g.current_stage,
                        g.error,g.created_at,g.started_at,g.finished_at,g.updated_at,
+                       (g.definition->>'recovery_retained'='true') AS recovery_retained,
+                       (SELECT count(*) FROM workflow_artifacts a WHERE a.group_id=g.group_id) AS recovery_files,
                        (SELECT count(*) FROM workflow_stages s WHERE s.group_id=g.group_id) AS stage_count,
                        (SELECT count(*) FROM workflow_stages s WHERE s.group_id=g.group_id AND s.status='succeeded') AS succeeded_stages,
                        (SELECT count(*) FROM workflow_stages s WHERE s.group_id=g.group_id AND s.status='failed') AS failed_stages
                 FROM workflow_groups g{where}
-                ORDER BY g.updated_at DESC,g.created_at DESC
+                ORDER BY CASE WHEN g.definition->>'recovery_retained'='true' THEN 0 ELSE 1 END,
+                         g.updated_at DESC,g.created_at DESC
                 LIMIT %s""",
             [*params, limit],
         ).fetchall()
@@ -1217,7 +1227,7 @@ def workflow_read_model(limit: int = 100, status: str | None = None) -> dict:
         item["group_id"] = gid
         item["stages"] = stages_by_group.get(gid, [])
         result.append(item)
-    return {"counts": {str(row["status"]): int(row["amount"]) for row in counts}, "groups": result}
+    return {"counts": {str(row["status"]): int(row["amount"]) for row in counts}, "recovery_count": int(recovery_count), "groups": result}
 
 
 

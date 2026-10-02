@@ -1,4 +1,8 @@
+import hashlib
+import json
 import logging
+import os
+import uuid
 from pathlib import Path
 from typing import Literal
 
@@ -6,6 +10,7 @@ from fastapi import HTTPException
 from pydantic import BaseModel, Field
 
 from app.postgres_store import (
+    _lock_workflow_mutation,
     initialize_schema as initialize_postgres_workflow_schema,
 )
 from app.postgres_store import (
@@ -37,6 +42,11 @@ class LanguageRegionUse(BaseModel):
 class WorkflowRollbackRequest(BaseModel):
     # Explicit confirmation prevents an accidental media restore from a stale UI.
     confirm: Literal["ROLLBACK"]
+
+
+class RecoveryDiscardRequest(BaseModel):
+    confirm: Literal["DELETE RECOVERY"]
+    review_token: str = Field(min_length=64, max_length=64)
 
 
 class MediaNoteRequest(BaseModel):
@@ -168,6 +178,115 @@ def get_workflow(group_id: str) -> dict:
     if not details:
         raise HTTPException(404, "Workflow group not found")
     return details
+
+
+def _recovery_review(db, group_id: uuid.UUID) -> dict:
+    group = db.execute(
+        "SELECT group_id,status,resource_key,definition FROM workflow_groups WHERE group_id=?::uuid",
+        (str(group_id),),
+    ).fetchone()
+    if not group:
+        raise HTTPException(404, "Workflow group not found")
+    root = Path(os.environ.get("WORKFLOW_STAGE_ROOT", "/data/workflow-staging")).resolve()
+    rows = db.execute(
+        "SELECT artifact_id,original_path,artifact_path,status FROM workflow_artifacts WHERE group_id=?::uuid ORDER BY artifact_id",
+        (str(group_id),),
+    ).fetchall()
+    files = []
+    for row in rows:
+        path = Path(str(row["artifact_path"]))
+        safe = not path.is_symlink() and path.resolve().is_relative_to(root)
+        try:
+            stat = path.stat() if safe and path.is_file() else None
+        except OSError:
+            stat = None
+        original = str(row["original_path"] or "")
+        files.append({
+            "artifact_id": int(row["artifact_id"]),
+            "original_path": original,
+            "original_exists": bool(original and Path(original).is_file()),
+            "staged_path": str(path),
+            "exists": stat is not None,
+            "size_bytes": stat.st_size if stat else 0,
+            "mtime_ns": stat.st_mtime_ns if stat else None,
+            "safe_path": safe,
+            "status": str(row["status"]),
+        })
+    token_data = {"group_id": str(group_id), "files": files}
+    token = hashlib.sha256(json.dumps(token_data, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+    definition = group["definition"] or {}
+    return {
+        "group_id": str(group_id), "status": str(group["status"]),
+        "resource_key": str(group["resource_key"] or ""),
+        "retained": bool(definition.get("recovery_retained")),
+        "retired_jobs": bool(definition.get("retired_invalid_jobs")),
+        "files": files, "review_token": token,
+    }
+
+
+@app.get("/api/v86/workflows/{group_id}/recovery")
+def get_workflow_recovery(group_id: str) -> dict:
+    try:
+        uid = uuid.UUID(group_id)
+    except ValueError as exc:
+        raise HTTPException(400, "Invalid workflow group") from exc
+    with connection() as db:
+        return _recovery_review(db, uid)
+
+
+@app.post("/api/v86/workflows/{group_id}/recovery/discard")
+def discard_retained_workflow_recovery(group_id: str, request: RecoveryDiscardRequest) -> dict:
+    """Permanently delete only explicitly reviewed, retired recovery copies."""
+    try:
+        uid = uuid.UUID(group_id)
+    except ValueError as exc:
+        raise HTTPException(400, "Invalid workflow group") from exc
+    with connection() as db:
+        _lock_workflow_mutation(db.raw)
+        db.execute("SELECT group_id FROM workflow_groups WHERE group_id=?::uuid FOR UPDATE", (str(uid),)).fetchone()
+        review = _recovery_review(db, uid)
+        if not review["retained"] or not review["retired_jobs"] or review["status"] != "failed":
+            raise HTTPException(409, "Only explicitly retained recovery from retired failed jobs can be discarded")
+        if review["review_token"] != request.review_token:
+            raise HTTPException(409, "Recovery changed since review; inspect it again before deletion")
+        if not review["files"] or any(not item["safe_path"] for item in review["files"]):
+            raise HTTPException(409, "Recovery is missing or outside the managed staging area")
+        active = db.execute(
+            "SELECT 1 FROM task_queue WHERE replace(group_id,'-','')=? AND status IN ('pending','running','failed') LIMIT 1",
+            (uid.hex,),
+        ).fetchone()
+        active_stage = db.execute(
+            "SELECT 1 FROM workflow_stages WHERE group_id=?::uuid AND status IN ('pending','running','blocked') LIMIT 1",
+            (str(uid),),
+        ).fetchone()
+        locked = db.execute("SELECT 1 FROM workflow_locks WHERE group_id=?::uuid LIMIT 1", (str(uid),)).fetchone()
+        active_luw = db.execute(
+            "SELECT 1 FROM workflow_luws WHERE group_id=?::uuid AND status IN ('locked','applying','verifying') LIMIT 1",
+            (str(uid),),
+        ).fetchone()
+        if active or active_stage or locked or active_luw:
+            raise HTTPException(409, "Workflow became active; recovery cannot be deleted")
+        deleted, bytes_removed = 0, 0
+        for item in review["files"]:
+            path = Path(item["staged_path"])
+            if item["exists"]:
+                try:
+                    path.unlink()
+                except OSError as exc:
+                    raise HTTPException(503, f"Could not delete recovery file: {exc}") from exc
+                deleted += 1
+                bytes_removed += item["size_bytes"]
+        db.execute("DELETE FROM workflow_artifacts WHERE group_id=?::uuid", (str(uid),))
+        db.execute(
+            "UPDATE workflow_groups SET definition=definition || ?::jsonb,updated_at=now() WHERE group_id=?::uuid",
+            (json.dumps({"recovery_retained": False, "recovery_discarded_by_user": True}), str(uid)),
+        )
+    try:
+        (Path(os.environ.get("WORKFLOW_STAGE_ROOT", "/data/workflow-staging")) / str(uid)).rmdir()
+    except OSError:
+        pass
+    logger.warning("workflow event=retained_recovery_discarded group=%s files=%d bytes=%d", uid, deleted, bytes_removed)
+    return {"group_id": str(uid), "deleted_files": deleted, "bytes_removed": bytes_removed}
 
 
 @app.get("/api/v86/luws")
@@ -362,12 +481,23 @@ def get_final_version(path: str) -> dict:
         raise HTTPException(404, "Media is not indexed")
     with connection() as db:
         row = db.execute("SELECT final_version,reviewed FROM media_notes WHERE entity_type=? AND entity_key=?", entity).fetchone()
-    return {"path": str(path), "final_version": bool(row and row["final_version"]), "reviewed": bool(row and row["reviewed"]), "entity_type": entity[0], "entity_key": entity[1]}
+        parent_final = False
+        if entity[0] == "tv" and entity[1].startswith("episode:"):
+            media = db.execute("SELECT library_key,show_title FROM plex_media WHERE path=?", (entity[1][len("episode:"):],)).fetchone()
+            if media:
+                parent_key = f"{media['library_key']}:{media['show_title'] or 'Unknown show'}"
+                parent = db.execute("SELECT final_version FROM media_notes WHERE entity_type='tv' AND entity_key=?", (parent_key,)).fetchone()
+                parent_final = bool(parent and parent["final_version"])
+    final = bool(row and row["final_version"])
+    return {"path": str(path), "final_version": final, "parent_final_version": parent_final,
+            "effective_final_version": final or parent_final, "reviewed": bool(row and row["reviewed"]),
+            "entity_type": entity[0], "entity_key": entity[1]}
 
 
 @app.put("/api/v86/final-version")
 def set_final_version(request: FinalVersionRequest) -> dict:
     path = str(request.path)
+    assert_no_tv_draft_save(path)
     entity = _final_note_key(path)
     if not entity:
         raise HTTPException(404, "Media is not indexed")
@@ -400,6 +530,8 @@ def set_final_version(request: FinalVersionRequest) -> dict:
     if request.final_version:
         from app.detection_policy import retire_final_detection
         with connection() as db: retire_final_detection(db)
+        from app.subtitle_cache import prioritize_final_media
+        prioritize_final_media([media_path])
     logger.info("change=final_version_saved path=%s final=%s", path.replace("\n"," ")[:300], bool(request.final_version))
     return {"path":path,"final_version":bool(request.final_version),"reviewed":reviewed,"entity_type":entity[0],"entity_key":entity[1],"parent":parent_result}
 
@@ -463,6 +595,10 @@ def set_show_final_version(request: FinalVersionShowRequest) -> dict:
     if request.final_version:
         from app.detection_policy import retire_final_detection
         with connection() as db: retire_final_detection(db)
+        from app.subtitle_cache import prioritize_final_media
+        prioritize_final_media([str(row["path"]) for row in episodes])
+    from app.v19 import _listing_cache
+    _listing_cache.pop('tv-summary', None)
     logger.info("change=show_final_version_saved show=%s final=%s episodes=%s", raw_key.replace("\n", " ")[:300], bool(request.final_version), len(episodes))
     return {"entity_key": raw_key, "final_version": bool(request.final_version), "episodes": len(episodes), "reviewed": bool(request.final_version)}
 
@@ -497,6 +633,7 @@ def save_media_note(request: MediaNoteRequest) -> dict:
             if pending: raise HTTPException(423, 'This TV-show draft is being saved. Notes and review changes are locked until its task completes.')
     with connection() as db:
         current = db.execute("SELECT reviewed,plex_sync_change,final_version FROM media_notes WHERE entity_type=? AND entity_key=?", (request.entity_type, request.entity_key)).fetchone()
+        was_final = bool(current["final_version"]) if current else False
         reviewed = bool(request.reviewed) if request.reviewed is not None else bool(current["reviewed"]) if current else False
         plex_sync_change = bool(request.plex_sync_change) if request.plex_sync_change is not None else bool(current["plex_sync_change"]) if current else False
         final_version = bool(request.final_version) if request.final_version is not None else bool(current["final_version"]) if current else False
@@ -504,6 +641,20 @@ def save_media_note(request: MediaNoteRequest) -> dict:
             db.execute("INSERT INTO media_notes(entity_type,entity_key,note,reviewed,plex_sync_change,final_version,updated_at) VALUES(?,?,?,?,?,?,CURRENT_TIMESTAMP) ON CONFLICT(entity_type,entity_key) DO UPDATE SET note=excluded.note,reviewed=excluded.reviewed,plex_sync_change=excluded.plex_sync_change,final_version=excluded.final_version,updated_at=CURRENT_TIMESTAMP", (request.entity_type, request.entity_key, note, int(reviewed), int(plex_sync_change), int(final_version)))
         else:
             db.execute("DELETE FROM media_notes WHERE entity_type=? AND entity_key=?", (request.entity_type, request.entity_key))
+    if final_version and not was_final:
+        from app.subtitle_cache import prioritize_final_media
+        if request.entity_type == "movie":
+            prioritize_final_media([request.entity_key])
+        elif request.entity_key.startswith("episode:"):
+            prioritize_final_media([request.entity_key[len("episode:"):]])
+        elif ":" in request.entity_key:
+            library_key, show_title = request.entity_key.split(":", 1)
+            with connection() as db:
+                episodes = db.execute(
+                    "SELECT path FROM plex_media WHERE kind='episode' AND library_key=? AND show_title=?",
+                    (library_key, show_title),
+                ).fetchall()
+            prioritize_final_media([str(row["path"]) for row in episodes])
     logger.info("change=media_note_saved type=%s key=%s present=%s reviewed=%s plex_sync_change=%s final_version=%s", request.entity_type, request.entity_key.replace("\n", " ")[:200], bool(note), reviewed, plex_sync_change, final_version)
     return {"entity_type": request.entity_type, "entity_key": request.entity_key, "note": note, "reviewed": reviewed, "plex_sync_change": plex_sync_change, "final_version": final_version}
 

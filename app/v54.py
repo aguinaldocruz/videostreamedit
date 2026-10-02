@@ -26,11 +26,17 @@ def index_core(item: dict) -> None:
 
 def index_subtitles(item: dict) -> None:
     path = Path(item['path'])
-    values = inspect_extended(path, item.get('_subtitle_text_cache'))
+    from app.matroska_layout import safe_checkpoint
+    safe_checkpoint(path)
+    if item.get('_subtitle_cache_only'):
+        values = inspect_extended(path, item.get('_subtitle_text_cache'), cache_only=True,
+                                  metadata=item.get('_subtitle_metadata'))
+    else:
+        values = inspect_extended(path, item.get('_subtitle_text_cache'))
     with connection() as db:
         db.execute('DELETE FROM subtitle_extended_index WHERE path=?', (str(path),))
         db.executemany('INSERT INTO subtitle_extended_index(path,source,type_index,external_path,codec,encoding,markup,damage) VALUES(?,?,?,?,?,?,?,?)', values)
-        db.execute("INSERT OR REPLACE INTO subtitle_extended_media(path,modified,size,markup_version,indexed_at) VALUES(?,?,?,2,datetime('now'))", (str(path), item['modified'], item['size']))
+        db.execute("INSERT OR REPLACE INTO subtitle_extended_media(path,modified,size,markup_version,indexed_at) VALUES(?,?,?,3,datetime('now'))", (str(path), item['modified'], item['size']))
 
 
 processors = {'core': index_core, 'subtitles': index_subtitles}

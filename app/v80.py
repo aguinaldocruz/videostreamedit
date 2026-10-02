@@ -26,6 +26,7 @@ from app.postgres_store import (
     task_stage_exists,
 )
 from app.v11 import column_exists, connection
+from app.v51 import SubtitleCachePending
 from app.v79 import app
 
 logger = logging.getLogger("uvicorn.error")
@@ -127,8 +128,34 @@ def _indexed_fingerprint_current(db, job: str, path: str) -> bool:
         ).fetchone()
         return bool(row and int(row["modified"] or -1) == int(stat.st_mtime)
                     and int(row["size"] or -1) == int(stat.st_size)
-                    and int(row["markup_version"] or 0) >= 2)
+                    and int(row["markup_version"] or 0) >= 3)
     return False
+
+
+SUBTITLE_CACHE_READY_SQL = (
+    "EXISTS (SELECT 1 FROM subtitle_cache_media c WHERE c.path=q.path "
+    "AND c.format_version=? AND c.expected_tracks=c.cached_tracks)"
+)
+
+
+def _verified_subtitle_inspection_cache(media: Path) -> tuple[str, dict, dict] | None:
+    """Read a complete, current cache without extracting any subtitle packets."""
+    from app.subtitle_cache import get_valid_media
+    from app.subtitle_cache_worker import text_track_manifest
+    from app.v2 import probe
+
+    metadata = probe(media)
+    signature, tracks = text_track_manifest(media, metadata)
+    cached = get_valid_media(str(media), signature)
+    expected = {(track["source"], track["type_index"], track["external_path"]) for track in tracks}
+    if cached is None or {track.key for track in cached} != expected:
+        return None
+    text_cache = {
+        (("embedded", track.type_index) if track.source == "embedded" else ("external", track.external_path)):
+        (track.text if track.source == "embedded" else (track.text, "UTF-8 (cached)"))
+        for track in cached
+    }
+    return signature, metadata, text_cache
 
 
 def enqueue(job: str, path: str, reason: str = "Media changed", detection: dict | None = None) -> bool:
@@ -264,7 +291,7 @@ def pending_index_items(job: str) -> list[dict]:
         return []
     import app.v79 as tv_index
     table = {"core": "media_stream_index_state", "subtitles": "subtitle_extended_media"}[job]
-    markup_stale = " OR coalesce(cached.markup_version,0) != 2" if job == "subtitles" else ""
+    markup_stale = " OR coalesce(cached.markup_version,0) != 3" if job == "subtitles" else ""
     signature_select = ", cached.content_signature AS content_signature" if job == "core" else ""
     if job == "core":
         freshness = "cached.path IS NULL OR (cached.modified_ns / 1000000000) != media.modified OR cached.size != media.size"
@@ -755,6 +782,13 @@ def request_media_indexes(path: str, names: list[str], reason: str, *, defer_det
 def queue_state(job: str) -> dict:
     with connection() as db:
         counts = {row["status"]: row["n"] for row in db.execute("SELECT status,count(*) n FROM index_task_queue WHERE job=? GROUP BY status", (job,))}
+        waiting_cache = 0
+        if job == "subtitles":
+            from app.subtitle_cache import CACHE_FORMAT_VERSION
+            waiting_cache = int(db.execute(
+                "SELECT count(*) FROM index_task_queue q WHERE q.job=? AND q.status='pending' "
+                f"AND NOT {SUBTITLE_CACHE_READY_SQL}", (job, CACHE_FORMAT_VERSION),
+            ).fetchone()[0])
         setting = db.execute("SELECT paused,stop_requested FROM index_queue_settings WHERE job=?", (job,)).fetchone()
         # Keep each status visible: a large pending backlog must not crowd all
         # completed entries out of the setup view.
@@ -793,6 +827,7 @@ def queue_state(job: str) -> dict:
     eta_seconds = round(remaining / rate) if rate > 0 and remaining else None
     return {"running": running, "paused": bool(setting["paused"]),
             "queued": counts.get("pending", 0), "failed": counts.get("failed", 0),
+            "waiting_cache": waiting_cache,
             "completed": counts.get("succeeded", 0), "indexed": indexed,
             "total": remaining, "eta_seconds": eta_seconds, "rate_per_second": rate,
             "current": "Index queue", "items": items, "queue": True}
@@ -854,7 +889,18 @@ def worker(job: str) -> None:
                 db.execute("UPDATE index_queue_settings SET stop_requested=0,paused=1 WHERE job=?", (job,))
                 setting = {"paused": 1}
             foreground = db.execute("SELECT 1 FROM task_queue WHERE status='running' AND task_type='index_rebuild_prepare' LIMIT 1").fetchone() if job == "core" else None
-            row = None if setting["paused"] or foreground else db.execute("SELECT * FROM index_task_queue WHERE job=? AND status='pending' ORDER BY CASE WHEN expedite_until > ? THEN 0 ELSE 1 END, id LIMIT 1", (job, datetime.now().astimezone().replace(tzinfo=None).isoformat())).fetchone()
+            row = None
+            if not setting["paused"] and not foreground:
+                if job == "subtitles":
+                    from app.subtitle_cache import CACHE_FORMAT_VERSION
+                    row = db.execute(
+                        "SELECT q.* FROM index_task_queue q WHERE q.job=? AND q.status='pending' "
+                        f"AND {SUBTITLE_CACHE_READY_SQL} "
+                        "ORDER BY CASE WHEN q.expedite_until > ? THEN 0 ELSE 1 END, q.id LIMIT 1",
+                        (job, CACHE_FORMAT_VERSION, datetime.now().astimezone().replace(tzinfo=None).isoformat()),
+                    ).fetchone()
+                else:
+                    row = db.execute("SELECT * FROM index_task_queue WHERE job=? AND status='pending' ORDER BY CASE WHEN expedite_until > ? THEN 0 ELSE 1 END, id LIMIT 1", (job, datetime.now().astimezone().replace(tzinfo=None).isoformat())).fetchone()
             # Claiming a row is not yet an execution attempt: workflow locks
             # may temporarily defer it. Count attempts only after its stage
             # has actually been acquired, otherwise a blocked item appears
@@ -867,6 +913,37 @@ def worker(job: str) -> None:
         row_group_id = row["group_id"] if "group_id" in row else None
         stage_started = False
         try:
+            media = Path(path)
+            if not media.is_file():
+                recovered = resolve_moved_plex_path(path)
+                if not recovered:
+                    from app.v65 import enqueue as enqueue_task
+                    enqueue_task("plex_sync", {"rebuild": False, "source": "missing-index-media"}, "Plex sync requested for missing indexed media", deduplicate=True)
+                    with connection() as db:
+                        db.execute("UPDATE index_task_queue SET attempts=attempts+1,updated_at=CURRENT_TIMESTAMP WHERE id=?", (row["id"],))
+                    row = dict(row)
+                    row["attempts"] = int(row.get("attempts") or 0) + 1
+                    raise FileNotFoundError(f"Media file is not accessible and Plex has no accessible replacement: {path}")
+                path = recovered
+                media = Path(path)
+                with connection() as db:
+                    db.execute("UPDATE index_task_queue SET path=?,reason=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (path, "Recovered moved Plex media", row["id"]))
+                logger.info("index_queue=%s event=item_path_recovered id=%d file=%s", job, row["id"], path.replace("\n", "\\n"))
+            cache_signature = None
+            inspection_data = None
+            if job == "subtitles":
+                inspection_data = _verified_subtitle_inspection_cache(media)
+                if inspection_data is None:
+                    # A DB-complete row can become stale after a source change.
+                    # Retire it once; the cache worker will refill it on its
+                    # next scheduled run. This is a deferral, not a failed job.
+                    from app.subtitle_cache import invalidate_and_enqueue_media_many
+                    invalidate_and_enqueue_media_many([path])
+                    with connection() as db:
+                        db.execute("UPDATE index_task_queue SET status='pending',started_at=NULL,error='Waiting for valid subtitle cache',updated_at=CURRENT_TIMESTAMP WHERE id=?", (row["id"],))
+                    logger.info("index_queue=subtitles event=deferred_for_cache id=%d file=%s", row["id"], path.replace("\n", "\\n"))
+                    continue
+                cache_signature, subtitle_metadata, subtitle_texts = inspection_data
             if not task_stage_exists(row_group_id, f"index:{job}", row["id"]):
                 register_task_stage(row_group_id, f"index:{job}", path, {"job": job, "reason": row["reason"]}, row["id"])
             else:
@@ -886,18 +963,6 @@ def worker(job: str) -> None:
                 db.execute("UPDATE index_task_queue SET attempts=attempts+1,updated_at=CURRENT_TIMESTAMP WHERE id=?", (row["id"],))
             row = dict(row)
             row["attempts"] = int(row.get("attempts") or 0) + 1
-            media = Path(path)
-            if not media.is_file():
-                recovered = resolve_moved_plex_path(path)
-                if not recovered:
-                    from app.v65 import enqueue as enqueue_task
-                    enqueue_task("plex_sync", {"rebuild": False, "source": "missing-index-media"}, "Plex sync requested for missing indexed media", deduplicate=True)
-                    raise FileNotFoundError(f"Media file is not accessible and Plex has no accessible replacement: {path}")
-                path = recovered
-                media = Path(path)
-                with connection() as db:
-                    db.execute("UPDATE index_task_queue SET path=?,reason=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (path, "Recovered moved Plex media", row["id"]))
-                logger.info("index_queue=%s event=item_path_recovered id=%d file=%s", job, row["id"], path.replace("\n", "\\n"))
             stat = media.stat()
             # The index processor updates media_stream_index itself; using that
             # table as a before/after fingerprint makes subtitle inspection look
@@ -912,7 +977,11 @@ def worker(job: str) -> None:
                 detection_scope = json.loads(row["detection_json"] or "{}") if "detection_json" in row else {}
             except (TypeError, ValueError, json.JSONDecodeError):
                 detection_scope = {}
-            legacy.processors[job]({"path": path, "title": catalog["title"], "modified": int(stat.st_mtime), "size": stat.st_size, "detection_scope": detection_scope})
+            index_item = {"path": path, "title": catalog["title"], "modified": int(stat.st_mtime), "size": stat.st_size, "detection_scope": detection_scope}
+            if inspection_data is not None:
+                index_item.update({"_subtitle_cache_only": True, "_subtitle_text_cache": subtitle_texts,
+                                   "_subtitle_metadata": subtitle_metadata})
+            legacy.processors[job](index_item)
             subtitle_after = subtitle_index_signature(path, job) if job == "core" else subtitle_before
             stream_structure_changed = subtitle_before != subtitle_after
             # A media operation can finish its final rename/write shortly
@@ -931,8 +1000,17 @@ def worker(job: str) -> None:
                            settled.st_mtime_ns != final.st_mtime_ns or settled.st_size != final.st_size)
             else:
                 changed = after.st_mtime_ns != stat.st_mtime_ns or after.st_size != stat.st_size
+            if cache_signature is not None:
+                from app.subtitle_cache_worker import text_track_manifest
+                if text_track_manifest(media)[0] != cache_signature:
+                    from app.subtitle_cache import invalidate_and_enqueue_media_many
+                    invalidate_and_enqueue_media_many([path])
+                    changed = True
             with connection() as db:
                 if changed:
+                    if job == "subtitles":
+                        db.execute("DELETE FROM subtitle_extended_index WHERE path=?", (path,))
+                        db.execute("DELETE FROM subtitle_extended_media WHERE path=?", (path,))
                     db.execute("UPDATE index_task_queue SET status='pending',finished_at=NULL,updated_at=CURRENT_TIMESTAMP,error='Media changed during indexing; waiting for stable fingerprint' WHERE id=?", (row["id"],))
                     logger.info("index_queue=%s event=requeued_after_change id=%d file=%s settling=%s", job, row["id"], path.replace("\n", "\\n"), settling)
                 else:
@@ -944,6 +1022,9 @@ def worker(job: str) -> None:
                 finish_task_stage(row_group_id, f"index:{job}", path, {"job": job, "path": path}, row["id"])
                 if job in {"core", "subtitles"}:
                     _queue_index_dependents(path, job, "Incremental dependency")
+            elif stage_started and changed:
+                fail_task_stage(row_group_id, f"index:{job}", path, "Media changed during indexing; retry pending", row["id"])
+                reset_task_stage_for_retry(row_group_id, row["id"])
             # A final-version lock is for the current local media. A Plex
             # catalog refresh or an externally changed file must invalidate it
             # even when the replacement happens to expose the same stream
@@ -956,6 +1037,15 @@ def worker(job: str) -> None:
             processed += 1
             if processed == 1 or processed % 25 == 0:
                 logger.info("index_queue=%s event=progress processed=%d last_id=%d seconds=%.2f", job, processed, row["id"], time.monotonic()-started)
+        except SubtitleCachePending as exc:
+            from app.subtitle_cache import invalidate_and_enqueue_media_many
+            invalidate_and_enqueue_media_many([path])
+            if stage_started:
+                fail_task_stage(row_group_id, f"index:{job}", path, str(exc), row["id"])
+                reset_task_stage_for_retry(row_group_id, row["id"])
+            with connection() as db:
+                db.execute("UPDATE index_task_queue SET status='pending',started_at=NULL,error='Waiting for valid subtitle cache',updated_at=CURRENT_TIMESTAMP WHERE id=?", (row["id"],))
+            logger.info("index_queue=subtitles event=deferred_for_cache id=%d file=%s", row["id"], path.replace("\n", "\\n"))
         except Exception as exc:
             message = str(getattr(exc, "detail", exc))[-3000:]
             if stage_started:

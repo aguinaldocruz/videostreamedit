@@ -27,10 +27,11 @@ import app.v65 as tasks
 from app.postgres_store import mark_read_models_fresh
 from app.v2 import probe
 from app.v51 import (
-    HTML_TAG,
+    has_removable_html,
     TEXT_SUBTITLE_CODECS,
     SubtitleCleanup,
     apply_subtitle_cleanup,
+    cached_subtitle_text,
     complete_extracted_text,
 )
 from app.v67 import app
@@ -231,6 +232,7 @@ def structurally_changed_records(records: list[tuple], previous: dict[str, tuple
 
 def persist_library(library: dict, records: list[tuple], aliases: list[tuple], watermark: int, rebuild: bool, current_paths: set[str] | None = None) -> None:
     moved_paths: dict[str, str] = {}
+    retired_paths: set[str] = set()
     with plex.connection() as db:
         current_by_key: dict[str, list[str]] = {}
         for record in records:
@@ -274,7 +276,13 @@ def persist_library(library: dict, records: list[tuple], aliases: list[tuple], w
             if removed:
                 db.executemany("DELETE FROM plex_media WHERE path=?", [(path,) for path in removed])
                 db.executemany("DELETE FROM plex_title_aliases WHERE path=?", [(path,) for path in removed])
+                retired_paths.update(str(path) for path in removed)
                 logger.info("plex_sync event=removed_media_reconciled library=%s removed=%d", library["title"].replace("\n", " "), len(removed))
+        retired_paths.update(moved_paths)
+        if retired_paths:
+            db.executemany("DELETE FROM subtitle_cache_media WHERE path=?", [(path,) for path in retired_paths])
+            db.executemany("DELETE FROM subtitle_cache_pending WHERE path=?", [(path,) for path in retired_paths])
+            db.executemany("DELETE FROM subtitle_cache_failure WHERE path=?", [(path,) for path in retired_paths])
         db.execute("INSERT INTO plex_sync_state(library_key,watermark,last_check,last_rebuild) VALUES(?,?,CAST(CURRENT_TIMESTAMP AS TEXT),CASE WHEN ? THEN CAST(CURRENT_TIMESTAMP AS TEXT) ELSE NULL END) ON CONFLICT(library_key) DO UPDATE SET watermark=excluded.watermark,last_check=CAST(CURRENT_TIMESTAMP AS TEXT),last_rebuild=CASE WHEN ? THEN CAST(CURRENT_TIMESTAMP AS TEXT) ELSE plex_sync_state.last_rebuild END", (library["library_key"], watermark, bool(rebuild), bool(rebuild)))
     if moved_paths:
         from app.v80 import migrate_index_paths
@@ -424,6 +432,14 @@ def process_plex_sync(task_id: int, payload: dict) -> dict:
             mark_plex_sync_changes(structural_records, previous)
             clear_reviewed_for_removed_media(library["library_key"], catalog_paths(all_items))
             persist_library(library, records, aliases, started, rebuild, catalog_paths(all_items))
+            # Plex detects the source change and retires its old cache now.
+            # Core indexing, requested below, decides whether any subtitle
+            # tracks remain and only then creates priority cache work.
+            with plex.connection() as db:
+                cache_pass_started = bool(db.execute("SELECT 1 FROM subtitle_cache_run LIMIT 1").fetchone())
+            if previous or cache_pass_started:
+                from app.subtitle_cache import invalidate_media_many
+                invalidate_media_many([str(record[0]) for record in changed_records])
             if changed_records:
                 from app.v80 import request_media_indexes
                 for record in changed_records:
@@ -476,13 +492,14 @@ def process_subtitle_html(task_id: int, payload: dict) -> dict:
         result = saved['result'] if saved else apply_subtitle_cleanup(SubtitleCleanup.model_validate(payload), operation_id=f"task-{task_id}")
         checkpoint(result, 1)
         tasks.update_progress(task_id, 1, total + 1, "Subtitle cleanup completed")
-    tasks.update_progress(task_id, total, total + 1, "Queueing subtitle indexes")
-    from app.v80 import request_media_indexes
-    # HTML/ASS markup cleanup changes presentation only.  Preserve existing
-    # subtitle language detection; subtitle indexing still refreshes HTML,
-    # damage and preview metadata.
-    register_internal_change_scope(result["path"], {"subtitle_indices": "all"}, "Subtitle HTML removed")
-    request_media_indexes(result["path"], ["subtitles"], "Subtitle HTML removed")
+    if result["changed"]:
+        tasks.update_progress(task_id, total, total + 1, "Queueing subtitle indexes")
+        from app.v80 import request_media_indexes
+        # HTML/ASS markup cleanup changes presentation only. Preserve existing
+        # subtitle language detection; refresh HTML and damage metadata only
+        # when the cleanup actually changed a subtitle.
+        register_internal_change_scope(result["path"], {"subtitle_indices": "all"}, "Subtitle HTML removed")
+        request_media_indexes(result["path"], ["subtitles"], "Subtitle HTML removed")
     tasks.update_progress(task_id, total + 1, total + 1, "Subtitle cleanup completed")
     return result
 
@@ -511,7 +528,9 @@ def preflight_html_cleanup(payload: dict, fingerprint: dict) -> dict:
             return {"decision": "skipped", "reason": "Only text subtitles can have markup removed"}
         if not external.is_file():
             return {"decision": "invalid", "reason": "External subtitle file is not accessible"}
-        text = external.read_text(encoding="utf-8", errors="replace")
+        text = cached_subtitle_text(Path(request.path), "external", -1, str(external)) if suffix == "srt" else None
+        if text is None:
+            text = external.read_text(encoding="utf-8", errors="replace")
     else:
         if not fingerprint.get("exists"):
             return {"decision": "invalid", "reason": "Media file is not accessible"}
@@ -521,13 +540,15 @@ def preflight_html_cleanup(payload: dict, fingerprint: dict) -> dict:
             codec = str(subtitles[index].get("codec_name") or "").lower() if 0 <= index < len(subtitles) else ""
             if codec not in TEXT_SUBTITLE_CODECS:
                 return {"decision": "skipped", "reason": "Only text subtitles can have markup removed"}
-            text = complete_extracted_text(Path(request.path), f"0:s:{index}")
+            text = cached_subtitle_text(Path(request.path), "embedded", index)
+            if text is None:
+                text = complete_extracted_text(Path(request.path), f"0:s:{index}")
         except Exception as exc:
             return {"decision": "invalid", "reason": f"Subtitle text could not be extracted: {exc}"}
         if not text:
             return {"decision": "skipped", "reason": "Subtitle text could not be extracted"}
-    if not HTML_TAG.search(text):
-        return {"decision": "skipped", "reason": "No HTML tags found"}
+    if not has_removable_html(text):
+        return {"decision": "skipped", "reason": "No removable HTML tags found"}
     return {"decision": "approved", "reason": "Text subtitle contains removable markup"}
 
 
@@ -1204,7 +1225,7 @@ def reconcile_startup_artifacts() -> None:
             value = str(payload.get(key) or (payload.get("edit") or {}).get(key) or "")
             if value:
                 parent_dirs.add(str(Path(value).resolve().parent))
-    patterns = (".*.subtitle-clean.vse-*.mkv", ".*.subtitle-clean.vse-*.mp4", ".*.subtitle-clean.vse.mkv", ".*.subtitle-clean.vse.mp4", ".*.vse-ocr-*.mkv", ".*.vse-ocr-*.mp4", ".*.vse-ocr.mkv", ".*.vse-ocr.mp4", ".*.vse-rollback-*", ".*.vse-rollback", ".*.vse-finalize", ".*.vse-*.tmp")
+    patterns = (".*.subtitle-clean.vse-*.mkv", ".*.subtitle-clean.vse-*.mp4", ".*.subtitle-clean.vse.mkv", ".*.subtitle-clean.vse.mp4", ".*.vse-ocr-*.mkv", ".*.vse-ocr-*.mp4", ".*.vse-ocr.mkv", ".*.vse-ocr.mp4", ".*.vse-rollback-*", ".*.vse-rollback", ".*.vse-finalize", ".*.vse-*.tmp", ".*.vse-remux-*.mkv")
     active_payload = " ".join(str(row["payload_json"] or "") for row in rows)
     removed = 0
     cutoff = time.time() - 600
