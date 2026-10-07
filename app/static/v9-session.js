@@ -17,7 +17,7 @@ function editorSnapshot(){
   }
   const selected=name=>document.querySelector(`#stream-content [name=${name}]:checked`)?.value||null;
   const finalButton=$('#stream-final-version');
-  return{values,order,defaultAudio:selected('default-audio'),forcedAudio:selected('forced-audio'),defaultSubtitle:selected('default-subtitle'),forcedSubtitle:selected('forced-subtitle'),finalVersion:finalButton?.dataset.finalVersion==='true'};
+  return{values,order,defaultAudio:selected('default-audio'),forcedAudio:selected('forced-audio'),defaultSubtitle:selected('default-subtitle'),forcedSubtitle:selected('forced-subtitle'),finalVersion:finalButton?.dataset.finalVersion==='true',subtitleColor:document.querySelector('#stream-form')?.dataset.subtitleColorPending||''};
 }
 
 function queuedChangeCount(){
@@ -34,6 +34,7 @@ function queuedChangeCount(){
   }
   for(const type of['audio','subtitle'])if(current.order[type].join('\n')!==editorBaseline.order[type].join('\n'))count++;
   for(const field of['defaultAudio','forcedAudio','defaultSubtitle','forcedSubtitle'])if(current[field]!==editorBaseline[field])count++;
+  if(current.subtitleColor!==editorBaseline.subtitleColor&&current.subtitleColor)count++;
   const finalButton=$('#stream-final-version'); if(finalButton?.dataset.finalPending!==undefined && (finalButton.dataset.finalPending==='true')!==Boolean(editorBaseline.finalVersion))count++;
   return count;
 }
@@ -127,6 +128,7 @@ async function applyTvDraftProjection(path){
     if(operation.note_edit||operation.audio_compatibility)continue;
     const direct=operation.direct_edit;
     if(direct){
+      if(direct.subtitle_color)document.querySelector('#stream-form').dataset.subtitleColorPending=direct.subtitle_color;
       for(const change of direct.tracks||[])rows.filter(row=>String(row.dataset.codecType)===String(change.codec_type)&&Number(row.dataset.typeIndex)===Number(change.type_index)).forEach(row=>{if(change.language!==undefined)row.querySelector('[name=language]').value=change.language||'';if(change.region!==undefined)row.querySelector('[name=region]').value=change.region||'';if(change.title!==undefined)row.querySelector('[name=title]').value=change.title||''});
       for(const change of direct.external_subtitles||[])rows.filter(row=>row.dataset.external==='true'&&String(row.dataset.path)===String(change.path)).forEach(row=>{if(change.language!==undefined)row.querySelector('[name=language]').value=change.language||'';if(change.region!==undefined)row.querySelector('[name=region]').value=change.region||'';if(change.title!==undefined)row.querySelector('[name=title]').value=change.title||'';const embed=row.querySelector('[name=embed]');if(embed&&change.embed!==undefined)embed.checked=Boolean(change.embed)});
       const removedKeys=new Set((direct.remove||[]).map(String));
@@ -134,8 +136,8 @@ async function applyTvDraftProjection(path){
       setChoice('default-audio',direct.default_audio);setChoice('forced-audio',direct.forced_audio);
       setChoice('default-subtitle',direct.default_subtitle);setChoice('forced-subtitle',direct.forced_subtitle);
       if(direct.final_version!==undefined&&direct.final_version!==null){
-        const button=document.querySelector('#stream-final-version'),final=Boolean(direct.final_version);
-        if(button){button.dataset.finalVersion=String(final);delete button.dataset.finalPending;button.textContent=final?'Unfreeze final':'Final version';button.classList.toggle('active',final)}
+        const final=Boolean(direct.final_version);
+        setStreamFinalVersionState(final,{draft:true,title:'Final-version change is staged in this TV-show draft. Save the show to commit it.'});
         if(typeof setStreamFinalLock==='function')setStreamFinalLock(final&&!window.activeTvDraftForPath?.(path));
       }
       if(Array.isArray(direct.order)&&direct.order.length){
@@ -175,8 +177,8 @@ async function applyTvDraftProjection(path){
   }
   const draftFinal=window.tvDraftFinalForPath?.(path);
   if(draftFinal!==undefined){
-    const button=document.querySelector('#stream-final-version');
-    if(button){button.dataset.finalVersion=String(draftFinal);delete button.dataset.finalPending;button.textContent=draftFinal?'Unfreeze final':'Final version';button.classList.toggle('active',draftFinal);button.disabled=window.tvDraftShowFinal?.()!==undefined;button.title=button.disabled?'The show-wide Final-version draft controls this episode':'Final-version change is staged in this TV-show draft'}
+    const disabled=window.tvDraftShowFinal?.()!==undefined;
+    setStreamFinalVersionState(draftFinal,{draft:true,disabled,title:disabled?'The show-wide Final-version draft controls this episode':'Final-version change is staged in this TV-show draft. Save the show to commit it.'});
     if(typeof setStreamFinalLock==='function')setStreamFinalLock(false);
   }
   window.syncStreamLanguageRegionSelectors?.();
@@ -192,7 +194,7 @@ window.activeTvDraftForPath=path=>{
   if(!session?.session_id||session.status==='committed'||!show||String(session.show_id)!==String(show.id))return null;
   return show.seasons?.some(season=>season.episodes?.some(episode=>episode.path===path))?session:null;
 };
-openEditor=async function(path,label){await sessionOpenEditor(path,label);if(document.querySelector('#stream-content .stream-row')){await applyTvDraftProjection(path);captureEditorBaseline()}};
+openEditor=async function(path,label){const form=document.querySelector('#stream-form');if(form)delete form.dataset.subtitleColorPending;await sessionOpenEditor(path,label);if(document.querySelector('#stream-content .stream-row')){await applyTvDraftProjection(path);captureEditorBaseline()}};
 window.markEditorCommittedClean=()=>{
   // The media was reread after a successful commit. Replace the baseline with
   // that committed snapshot, rather than relying only on a boolean: late
@@ -201,6 +203,7 @@ window.markEditorCommittedClean=()=>{
   editorCommitClean=true;
   const form=document.querySelector('#stream-form');if(form)form.dataset.commitClean='true';
   document.querySelectorAll('#stream-content [data-dirty]').forEach(input=>delete input.dataset.dirty);
+  if(form&&!window.activeTvDraftForPath?.(state.selectedPath))delete form.dataset.subtitleColorPending;
   updateQueuedChangeLabels();
 };
 
@@ -232,7 +235,7 @@ $('#stream-form').onsubmit=async function(e){
   let mediaCommitSucceeded=false;
   try{
     if(window.activeTvDraftForPath?.(path)?.session_id){
-      const draftOperation={direct_edit:{path,tracks,external_subtitles:external,order,default_audio:defaults.audio,forced_audio:forced.audio,default_subtitle:defaults.subtitle,forced_subtitle:forced.subtitle,remove,final_version:document.querySelector('#stream-final-version')?.dataset.finalPending!==undefined?(document.querySelector('#stream-final-version').dataset.finalPending==='true'):null}};
+      const draftOperation={direct_edit:{path,tracks,external_subtitles:external,order,default_audio:defaults.audio,forced_audio:forced.audio,default_subtitle:defaults.subtitle,forced_subtitle:forced.subtitle,remove,final_version:document.querySelector('#stream-final-version')?.dataset.finalPending!==undefined?(document.querySelector('#stream-final-version').dataset.finalPending==='true'):null,subtitle_color:e.target.dataset.subtitleColorPending||null}};
       await api('/api/v79/tv/edit-session/'+encodeURIComponent(window.tvShowEditSession.session_id)+'/operation',{method:'POST',body:JSON.stringify({path,operation:draftOperation})});
       window.tvDraftStreamProjections[path]=[draftOperation];
       window.projectTvEpisodeEdit?.(path,{tracks,remove,external_subtitles:external,default_audio:defaults.audio,forced_audio:forced.audio,default_subtitle:defaults.subtitle,forced_subtitle:forced.subtitle});
@@ -242,12 +245,12 @@ $('#stream-form').onsubmit=async function(e){
       // authoritative too; this prevents a late editor refresh from showing
       // the committed Portuguese value over the virtual Portuguese-Brazil
       // draft.
-      await openEditor(path,label);
+      await openEditor(path,label,{preserveFinal:true});
       window.markEditorCommittedClean?.();
       applySucceeded=true;return;
     }
     const filename=validateStreamFilename(),renameQueued=filename!==streamFilenameOriginal,streamQueued=queued-(renameQueued?1:0);let result={warnings:[]},finalPath=path;
-    if(streamQueued){setApplyProgress(2,4,"Updating media container",queuedChangeSummary());result=await api("/api/v7/media/edit",{method:"POST",body:JSON.stringify({path,tracks,external_subtitles:external,order,default_audio:defaults.audio,forced_audio:forced.audio,default_subtitle:defaults.subtitle,forced_subtitle:forced.subtitle,remove,final_version:document.querySelector('#stream-final-version')?.dataset.finalPending!==undefined?(document.querySelector('#stream-final-version').dataset.finalPending==='true'):null})});mediaCommitSucceeded=true;window.markEditorCommittedClean?.()};setApplyProgress(3,4,"Updating indexes","Queueing refreshed stream and media indexes");await api("/api/v80/index/request",{method:"POST",body:JSON.stringify({path,indexes:result.operation==="single_remux"?["core","subtitles"]:["core"],reason:"Clone last change completed"})})
+    if(streamQueued){setApplyProgress(2,4,"Updating media container",queuedChangeSummary());result=await api("/api/v7/media/edit",{method:"POST",body:JSON.stringify({path,tracks,external_subtitles:external,order,default_audio:defaults.audio,forced_audio:forced.audio,default_subtitle:defaults.subtitle,forced_subtitle:forced.subtitle,remove,final_version:document.querySelector('#stream-final-version')?.dataset.finalPending!==undefined?(document.querySelector('#stream-final-version').dataset.finalPending==='true'):null,subtitle_color:e.target.dataset.subtitleColorPending||null})});mediaCommitSucceeded=true;window.markEditorCommittedClean?.()};setApplyProgress(3,4,"Updating indexes","Queueing refreshed stream and media indexes");await api("/api/v80/index/request",{method:"POST",body:JSON.stringify({path,indexes:result.operation==="single_remux"?["core","subtitles"]:["core"],reason:"Clone last change completed"})})
     if(renameQueued){setApplyProgress(3,4,"Renaming media",filename);const renamed=await api("/api/v37/media/rename",{method:"POST",body:JSON.stringify({path,filename})});finalPath=renamed.path;adoptRenamedMediaPath(path,finalPath)}
     if(usedValues.length){setApplyProgress(3,4,"Saving reusable values","Recording successfully used metadata values");await offerSavedValues(usedValues)}
     setApplyProgress(4,4,"Refreshing properties","Reading updated streams from the media file");toast(result.warnings.length?result.warnings.join(" "):queued+" change"+(queued===1?"":"s")+" applied",result.warnings.length>0);const indexes=result.operation==='single_remux'?['core','subtitles']:result.subtitle_html_cleaned?['core','subtitles']:['core'];
@@ -258,7 +261,7 @@ $('#stream-form').onsubmit=async function(e){
     // route is called with refresh by openEditor, so this read is from the
     // committed media rather than the old index snapshot.
     (window.streamEditorRefreshPaths??=new Set()).add(finalPath);
-    await openEditor(finalPath,$('#selected-file').textContent);
+    await openEditor(finalPath,$('#selected-file').textContent,{preserveFinal:true});
     editorBaseline=null;
     editorCommitClean=true;
     if(typeof window.clearPendingHtmlCleanups==='function')window.clearPendingHtmlCleanups();

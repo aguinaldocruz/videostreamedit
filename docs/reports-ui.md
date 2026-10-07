@@ -1,12 +1,18 @@
 # Reports
 
-Reports are grouped into Subtitle quality, Language, and Stream configuration.
+Reports are grouped into Subtitle quality, Language, Stream configuration,
+and Container and video metadata.
 Movie counts represent media files; TV counts represent episodes, not shows.
 Availability is read from indexed data, excludes Final Version media and pending
 edits, and respects report-specific language, forced-track, and dismissal rules.
 The page shows a checking state until availability is known. A failed check is
 not treated as an empty report. Concurrent availability requests are coalesced
 in the browser, with a short reuse window while browsing.
+Approval changes invalidate lists and counts immediately, including in-flight
+count responses. Final Version excludes movies, individual episodes, and all
+episodes of a final TV show from every report and Dashboard's findings.
+Unfreezing restores eligibility without clearing retained findings. See
+[Final Version and reports](FINAL_VERSION_REPORTS.md).
 
 Report dialogs share search, refresh, bounded result display (100 entries at a
 time), and a scrollable results area. Search only changes the visible list;

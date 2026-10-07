@@ -75,7 +75,7 @@ def get_output_config() -> dict:
 def save_output_config(request: OutputFolderRequest) -> dict:
     root = resolve_existing(request.path)
     if not root.is_dir() or is_blocked(root):
-        raise HTTPException(403, "This folder cannot be used as the movie output root")
+        raise HTTPException(403, "This folder cannot be used as the media output root")
     with connection() as db:
         db.execute("INSERT INTO import_output_config(id,root_folder,last_folder) VALUES(1,?,?) ON CONFLICT(id) DO UPDATE SET root_folder=excluded.root_folder,last_folder=excluded.last_folder", (str(root), str(root)))
         db.execute("DELETE FROM import_output_folders")
@@ -86,10 +86,10 @@ def save_output_config(request: OutputFolderRequest) -> dict:
 def browse_output_folder(path: str | None = None) -> dict:
     root = output_root()
     if not root:
-        raise HTTPException(400, "Configure the movie output folder in Setup first")
+        raise HTTPException(400, "Configure the media output folder in Setup first")
     current = resolve_existing(path) if path else root
     if not current.is_dir() or not inside(current, root) or is_blocked(current):
-        raise HTTPException(403, "Folder is outside the configured movie output root")
+        raise HTTPException(403, "Folder is outside the configured media output root")
     try:
         directories = [{"name": item.name, "path": str(item.resolve())} for item in sorted(current.iterdir(), key=lambda item: item.name.casefold()) if item.is_dir() and inside(item.resolve(), root) and not is_blocked(item.resolve())]
     except PermissionError as exc:
@@ -101,10 +101,10 @@ def browse_output_folder(path: str | None = None) -> dict:
 def select_output_folder(request: OutputFolderRequest) -> dict:
     root = output_root()
     if not root:
-        raise HTTPException(400, "Configure the movie output folder in Setup first")
+        raise HTTPException(400, "Configure the media output folder in Setup first")
     path = resolve_existing(request.path)
     if not path.is_dir() or not inside(path, root) or is_blocked(path):
-        raise HTTPException(403, "Folder is outside the configured movie output root")
+        raise HTTPException(403, "Folder is outside the configured media output root")
     with connection() as db:
         db.execute("INSERT OR IGNORE INTO import_output_folders(path) VALUES(?)", (str(path),))
         db.execute("UPDATE import_output_config SET last_folder=? WHERE id=1", (str(path),))

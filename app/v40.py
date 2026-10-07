@@ -5,7 +5,6 @@ import logging
 from pydantic import BaseModel
 
 import app.v7 as media_editor
-import app.v28 as movie_import
 from app.v11 import connection
 from app.v39 import app
 
@@ -78,9 +77,6 @@ def edit_and_learn_track_names(request: media_editor.ReorderEditRequest) -> dict
     """Compatibility URL backed by the canonical editor and learning hook."""
     from app.v43 import optimized_media_edit
     return optimized_media_edit(request)
-
-
-movie_import.reorder_edit = edit_and_learn_track_names
 
 
 @app.post("/api/v40/track-name-suggestions")

@@ -52,15 +52,15 @@ def process_plex_import_refresh(task_id: int, payload: dict) -> dict:
             "SELECT library_key,title,kind FROM plex_libraries WHERE library_key=? AND selected=1",
             (library_key,),
         ).fetchone()
-    if not library or library["kind"] != "movie":
-        raise RuntimeError("The destination Plex movie library is not selected")
+    if not library or library["kind"] not in {"movie", "show"}:
+        raise RuntimeError("The destination Plex movie or TV library is not selected")
     tasks.update_progress(task_id, 0, 4, "Requesting Plex destination scan")
     plex_scan(library_key, target.parent)
     logger.info("plex_sync event=post_import_scan_requested library=%s folder=%s", library_key, str(target.parent).replace("\n", "\\n"))
     found = None
     started = int(time.time()) - 10
     for attempt in range(1, 19):
-        tasks.update_progress(task_id, 1, 4, f"Waiting for Plex to discover movie ({attempt}/18)")
+        tasks.update_progress(task_id, 1, 4, f"Waiting for Plex to discover imported media ({attempt}/18)")
         time.sleep(5 if attempt > 1 else 2)
         if rating_key:
             try:
@@ -77,7 +77,7 @@ def process_plex_import_refresh(task_id: int, payload: dict) -> dict:
             # Plex may assign a new rating key while preserving old added/updated
             # timestamps after a filesystem rename. A bounded full lookup is the
             # only reliable fallback for that case.
-            found = item_for_path(plex_sync.paged_library(library_key, "movie"), str(target), "")
+            found = item_for_path(plex_sync.paged_library(library_key, library['kind']), str(target), "")
         if found:
             break
     if not found:

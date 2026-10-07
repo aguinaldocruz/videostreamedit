@@ -14,13 +14,13 @@
   const el = name => dialog.querySelector(`[data-${name}]`);
   let path='', title='', generation=0, session=null, pending=null, hls=null, media=null, total=0, offset=0, desired=0, forceAAC=false, timer=null, pollTimer=null, playing=false, subtitleGeneration=0, blob=null, refreshEditorAfterApproval=false;
   const subtitleCache = new Map();
-  let playIntent=true;
+  let playIntent=true, timelineReady=false;
   const resumeState=()=>pending?playIntent:media?!media.paused:true;
   const graphical = /^(hdmv_pgs_subtitle|pgs|dvd_subtitle|dvb_subtitle|vobsub|xsub)$/i;
   const active = kind => dialog.querySelector(`[data-output="${kind}"]`).classList.contains('active');
   const mode = () => active('video') ? (active('audio')?'av':'video') : active('audio')?'audio':'subtitle';
   const format = value => {const s=Math.max(0,Math.floor(Number(value)||0));return `${s>=3600?Math.floor(s/3600)+':':''}${String(Math.floor(s/60)%60).padStart(s>=3600?2:1,'0')}:${String(s%60).padStart(2,'0')}`;};
-  const position = () => media ? Math.min(total,offset+(Number(media.currentTime)||0)) : desired;
+  const position = () => media && timelineReady ? Math.max(0,Math.min(total,offset+(Number(media.currentTime)||0))) : desired;
   const status = (text,error=false) => {el('status').textContent=text;el('status').classList.toggle('error',error);};
   async function request(url, options={}) {
     const response=await fetch(url,{signal:AbortSignal.timeout(60000),...options,headers:{'Content-Type':'application/json',...(options.headers||{})}});
@@ -30,10 +30,11 @@
   }
   const removeSession = id => {if(id)fetch(`/api/review/playback/${id}`,{method:'DELETE',keepalive:true}).catch(()=>{});};
   function stopPlayer() {
+    subtitleGeneration++;timelineReady=false;
     clearInterval(timer);timer=null;
     removeSession(session);session=null;
     if(hls){hls.destroy();hls=null;}
-    if(media){media.pause();media.removeAttribute('src');media.load();media=null;}
+    if(media){const previous=media;media=null;previous.pause();previous.querySelectorAll('track').forEach(track=>{track.track.mode='disabled';track.remove();});previous.removeAttribute('src');previous.load();}
     if(blob){URL.revokeObjectURL(blob);blob=null;}
   }
   function close() {generation++;subtitleGeneration++;removeSession(pending);pending=null;stopPlayer();clearInterval(pollTimer);dialog.close();}
@@ -64,28 +65,38 @@
   const updateAudioConversionOffer = () => {el('convert').hidden=!canCreateAacVersion();};
   function subtitleQuery(){const option=chosen('subtitle');if(!active('subtitle')||!option?.value)return null;return new URLSearchParams({path,source:option.dataset.source,index:option.dataset.index||'0',external_path:option.dataset.path||''});}
   async function subtitleText(){const query=subtitleQuery();if(!query)return '';const key=query.toString();if(subtitleCache.has(key))return subtitleCache.get(key);const response=await fetch('/api/review/subtitle?'+query);if(!response.ok){const error=await response.json().catch(()=>({}));throw new Error(error.detail||'Subtitle could not be loaded');}const text=await response.text();subtitleCache.set(key,text);return text;}
-  async function switchSubtitle(){
-    const own=++subtitleGeneration, target=media;
-    if(!target||target.tagName!=='VIDEO')return;
-    target.querySelectorAll('track').forEach(track=>track.remove());
+  let subtitlePromise=Promise.resolve(true);
+  function switchSubtitle(){return subtitlePromise=loadSubtitle();}
+  async function loadSubtitle(){
+    const own=++subtitleGeneration, target=media, clockOffset=offset;
+    if(!target||target.tagName!=='VIDEO')return true;
+    target.querySelectorAll('track').forEach(track=>{track.track.mode='disabled';track.remove();});
     if(blob){URL.revokeObjectURL(blob);blob=null;}
-    if(!subtitleQuery())return;
+    if(!subtitleQuery()||!timelineReady)return true;
     status('Loading subtitle overlay…');
     try{
       const text=await subtitleText();if(own!==subtitleGeneration||target!==media)return;
       blob=URL.createObjectURL(new Blob([text],{type:'text/vtt'}));
       const track=document.createElement('track');track.kind='subtitles';track.label=chosen('subtitle').textContent;track.default=true;track.src=blob;
-      track.onload=()=>{if(target!==media)return;const cues=[...(track.track.cues||[])];for(const cue of cues){if(cue.endTime<=offset){track.track.removeCue(cue);continue;}cue.startTime=Math.max(0,cue.startTime-offset);cue.endTime=Math.max(0,cue.endTime-offset);}track.track.mode='showing';status('Subtitle changed — playback unchanged');};
-      target.append(track);track.track.mode='showing';
-    }catch(error){if(own===subtitleGeneration)status(error.message,true);}
+      // Keep the track hidden until its ORIGINAL source times are mapped to
+      // this playback session. Never show unshifted cues for even one frame.
+      track.track.mode='hidden';
+      await new Promise((resolve,reject)=>{
+        const timeout=setTimeout(()=>{if(own===subtitleGeneration&&target===media)reject(new Error('Subtitle overlay timed out; playback is paused for review'));else resolve();},15000);
+        track.onload=()=>{clearTimeout(timeout);if(own!==subtitleGeneration||target!==media)return resolve();const cues=[...(track.track.cues||[])];for(const cue of cues){if(cue.endTime<=clockOffset){track.track.removeCue(cue);continue;}cue.startTime=Math.max(0,cue.startTime-clockOffset);cue.endTime=Math.max(0,cue.endTime-clockOffset);}track.track.mode='showing';status('Subtitle synchronized to playback');resolve();};
+        track.onerror=()=>{clearTimeout(timeout);reject(new Error('Subtitle overlay could not be loaded'));};
+        target.append(track);
+      });
+      return true;
+    }catch(error){if(own===subtitleGeneration&&target===media){target.pause();status(error.message,true);}return false;}
   }
   async function showText(){
     const own=generation;
     stopPlayer();status('Loading subtitle text…');
     try{const text=await subtitleText();if(own!==generation||!dialog.open)return;el('stage').innerHTML='<div class="rp-text"><pre></pre><button type="button" data-clean-html hidden>Queue HTML removal</button></div>';el('stage').querySelector('pre').textContent=text||'Select a text subtitle.';
-      const option=chosen('subtitle'),button=el('stage').querySelector('button');button.hidden=!/<[^>]+>/.test(text)||!option?.value||option.dataset.source==='staged';
+      const option=chosen('subtitle'),button=el('stage').querySelector('button');button.hidden=!window.hasRemovableSubtitleHtml(text)||!option?.value||option.dataset.source==='staged';
       button.onclick=async()=>{button.disabled=true;try{await request('/api/v68/subtitle-html-cleanup',{method:'POST',body:JSON.stringify({path,type_index:option.dataset.source==='embedded'?Number(option.dataset.index):null,external_path:option.dataset.source==='external'?option.dataset.path:null})});toast('HTML cleanup queued');close();}catch(error){status(error.message,true);button.disabled=false;}};status('Subtitle text — original media unchanged');
-    }catch(error){status(error.message,true);}
+    }catch(error){if(own===generation&&dialog.open)status(error.message,true);}
   }
   let hlsPromise;
   function loadHls(){if(window.Hls)return Promise.resolve(window.Hls);return hlsPromise ||= new Promise((resolve,reject)=>{const script=document.createElement('script');script.src='/assets/review-hls.js';script.onload=()=>resolve(window.Hls);script.onerror=()=>{hlsPromise=null;reject(new Error('The local playback library could not be loaded'));};document.head.append(script);});}
@@ -95,7 +106,9 @@
     desired=Math.max(0,Math.min(start,total?total-.1:start));
     if(mode()==='subtitle')return showText();
     const audio=chosen('audio');if(active('audio')&&!audio?.value){status('Select an audio stream or turn Audio off',true);return;}
-    if(media)media.pause();
+    // Release the previous producer/decoder immediately. Abandoned sessions
+    // must not retain worker slots or emit stale audio/events while switching.
+    stopPlayer();
     const began=performance.now();
     const elapsed=()=>`${Math.floor((performance.now()-began)/1000)}s elapsed`;
     status('Step 1 of 4 · Checking file fingerprint and stream metadata…');
@@ -111,36 +124,60 @@
       const badge=plan.video_copy?(plan.audio_copy?'Stream copy':'AAC stereo playback'):'Video compatibility conversion';el('plan').textContent=badge;el('plan').title=plan.video_copy?'Video is not re-encoded. Playback uses a bounded temporary buffer.':'This codec needs video conversion for playback only. The media is unchanged.';
       // Browser hints supplement server checks, never replace runtime error handling.
       if(plan.audio_copy&&active('audio')&&navigator.mediaCapabilities?.decodingInfo){try{const support=await navigator.mediaCapabilities.decodingInfo({type:'media-source',audio:{contentType:'audio/mp4; codecs="mp4a.40.2"',channels:String(plan.audio_channels||2),bitrate:192000,samplerate:Number(plan.audio_sample_rate)||48000}});if(!support.supported&&!forceAAC){removeSession(id);forceAAC=true;return load(desired,autoplay);}}catch(_){} }
-      let ready=false;
+      let ready=false, timing;
       for(let count=0;count<240;count++){
         if(own!==generation){removeSession(id);return;}
         const progress=await request(`/api/review/playback/${id}/status`);
         if(progress.error)throw new Error(progress.error);
-        if(progress.ready){ready=true;break;}
+        if(progress.ready){ready=true;timing=progress;break;}
         status(`Step ${progress.phase==='waiting'?2:3} of 4 · ${progress.message||'Preparing first playable segment'} · ${progress.buffered_seconds||0}s processed · ${elapsed()}`);
         await new Promise(resolve=>setTimeout(resolve,500));
       }
       if(!ready)throw new Error('Playback preparation timed out. Try AAC stereo or choose another stream.');
       if(own!==generation){removeSession(id);return;}
-      stopPlayer();session=id;pending=null;offset=result.start;
+      session=id;pending=null;offset=0;
       el('stage').innerHTML=mode()==='audio'?'<audio preload="auto"></audio>':'<video playsinline preload="auto"></video>';
       media=el('stage').firstElementChild;const target=media;media.volume=Number(el('volume').value);media.playbackRate=Number(el('speed').value);
-      const onReady=()=>{if(media!==target)return;status('Step 4 of 4 complete · Playback ready');if(playIntent)target.play().catch(()=>status('Press Play to start'));switchSubtitle();updateTransport();};
-      media.addEventListener('loadedmetadata',onReady,{once:true});
-      media.addEventListener('timeupdate',updateTransport);media.addEventListener('play',()=>{playing=true;updateTransport();});media.addEventListener('pause',()=>{playing=false;updateTransport();});
-      media.addEventListener('waiting',()=>status('Buffering selected streams…'));media.addEventListener('playing',()=>status('Playing'));
-      media.addEventListener('error',()=>status('Browser could not decode this stream. Use “Try AAC stereo playback” or choose another audio.',true));
+      const current=()=>own===generation&&media===target;
+      let started=false;
+      const onReady=async()=>{
+        if(!current()||started||!timelineReady||target.readyState<1)return;
+        started=true;
+        // The source seek may include keyframe preroll. Skip that preroll in
+        // the browser, preserving the exact requested movie position.
+        target.currentTime=Math.max(0,desired-offset);
+        switchSubtitle();
+        let overlayReady, loading;
+        // If the user changes subtitles during startup, await the NEWEST
+        // choice. An obsolete load must neither start unsynchronized video
+        // nor leave the current player silently paused forever.
+        do{loading=subtitlePromise;overlayReady=await loading;}while(current()&&loading!==subtitlePromise);
+        if(!current()||!overlayReady)return;
+        status('Step 4 of 4 complete · Playback ready');if(playIntent)target.play().catch(()=>{if(current())status('Press Play to start');});updateTransport();
+      };
+      const anchor=value=>{if(!current()||!Number.isFinite(value))return;offset=value;timelineReady=true;target.dataset.timelineOffset=String(offset);onReady();};
+      media.addEventListener('loadedmetadata',()=>onReady(),{once:true});
+      media.addEventListener('timeupdate',()=>{if(current())updateTransport();});media.addEventListener('play',()=>{if(current()){playing=true;updateTransport();}});media.addEventListener('pause',()=>{if(current()){playing=false;updateTransport();}});
+      media.addEventListener('waiting',()=>{if(current())status('Buffering selected streams…');});media.addEventListener('playing',()=>{if(current())status('Playing');});
+      media.addEventListener('error',()=>{if(current())status('Browser could not decode this stream. Use “Try AAC stereo playback” or choose another audio.',true);});
       const Hls=await loadHls();
       if(own!==generation)return;
       if(Hls?.isSupported()){
-        hls=new Hls({enableWorker:true,lowLatencyMode:false,startPosition:0,liveSyncDuration:86400,liveMaxLatencyDuration:172800,maxBufferLength:24,backBufferLength:12});
-        hls.on(Hls.Events.ERROR,(_,data)=>{if(data.fatal&&own===generation)status(`Playback error (${data.details}). Try AAC stereo or seek to restart the buffer.`,true);});
+        hls=new Hls({enableWorker:true,lowLatencyMode:false,startPosition:Math.max(0,desired-timing.presentation_start),defaultAudioCodec:'mp4a.40.2',liveSyncDuration:86400,liveMaxLatencyDuration:172800,liveSyncOnStallIncrease:0,maxBufferLength:24,backBufferLength:12});
+        // HLS.js rebases decode timestamps for MSE. Its actual timestamp
+        // offset (not requested seek time or first keyframe guess) maps the
+        // video, audio, full-media slider and WebVTT to ONE source clock.
+        hls.on(Hls.Events.INIT_PTS_FOUND,(_,data)=>{if(data.id==='main')anchor(Number(data.initPTS)/Number(data.timescale)+timing.container_offset-result.source_origin);});
+        hls.on(Hls.Events.ERROR,(_,data)=>{if(data.fatal&&current()){target.pause();status(`Playback error (${data.details}). Try AAC stereo or seek to restart the buffer.`,true);}});
         hls.loadSource(result.manifest_url);hls.attachMedia(media);
-      }else if(media.canPlayType('application/vnd.apple.mpegurl'))media.src=result.manifest_url;
+      }else if(media.canPlayType('application/vnd.apple.mpegurl')){
+        target.addEventListener('loadeddata',()=>{if(current()&&target.buffered.length)anchor(timing.presentation_start-target.buffered.start(0));},{once:true});
+        media.src=result.manifest_url;
+      }
       else throw new Error('This browser does not support HLS playback');
-      timer=setInterval(()=>{if(session&&media)request(`/api/review/playback/${session}/heartbeat`,{method:'POST',body:JSON.stringify({position:media.currentTime||0})}).catch(()=>{});},3000);
+      timer=setInterval(()=>{if(current()&&session)request(`/api/review/playback/${session}/heartbeat`,{method:'POST',body:JSON.stringify({position:position()})}).then(progress=>{if(current()&&progress.error){target.pause();status(progress.error,true);}}).catch(()=>{});},3000);
       status(`Step 4 of 4 · Loading buffered video/audio into browser · ${elapsed()}`);updateTransport();
-    }catch(error){if(own===generation){removeSession(id);pending=null;status(error.message,true);}}
+    }catch(error){if(own===generation){stopPlayer();removeSession(id);pending=null;status(error.message,true);}}
     finally{clearInterval(checkTimer);}
   }
   function seek(value){const next=Math.max(0,Math.min(total-.1,Number(value)||0));const relative=next-offset;if(media&&!pending&&relative>=0){for(let i=0;i<media.buffered.length;i++)if(relative>=media.buffered.start(i)&&relative<media.buffered.end(i)){media.currentTime=relative;updateTransport();return;}}load(next,resumeState());}

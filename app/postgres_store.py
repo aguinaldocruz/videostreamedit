@@ -219,6 +219,13 @@ def register_task_stage(group_id: str | None, task_type: str, path: str, payload
     workflow_id = _workflow_id(group_id)
     with connection() as db:
         _lock_workflow_mutation(db)
+        # enqueue commits before registering; a worker can register the same
+        # owner first. Serialize and reuse that exact stage, even if finished.
+        if task_id is not None and db.execute(
+            "SELECT 1 FROM workflow_stages WHERE group_id=%s AND task_type=%s AND payload->>'task_id'=%s",
+            (workflow_id, task_type, str(task_id)),
+        ).fetchone():
+            return
         db.execute(
             """INSERT INTO workflow_groups(group_id, kind, resource_key, status, definition, input_signature)
                VALUES (%s, %s, %s, 'pending', %s::jsonb, %s::jsonb)
@@ -372,18 +379,33 @@ def finish_task_stage(group_id: str | None, task_type: str, path: str, result: d
         db.execute("UPDATE workflow_groups SET status=%s, finished_at=CASE WHEN %s THEN now() ELSE finished_at END, updated_at=now() WHERE group_id=%s", ('running' if pending else 'succeeded', not pending, workflow_id))
 
 
-def fail_task_stage(group_id: str | None, task_type: str, path: str, error: str, task_id: int | None = None) -> None:
+def fail_task_stage(group_id: str | None, task_type: str, path: str, error: str, task_id: int | None = None, *, db=None, allow_pending: bool = False) -> None:
+    """Fail the exact owner stage, including a pre-execution safety rejection.
+
+    Generic queue callers pass their transaction so the queue row and workflow
+    become terminal together. Other callers retain the running-only contract.
+    Never release a sibling stage's resource lock or reopen terminal work.
+    """
     if not group_id or not DATABASE_URL:
         return
     workflow_id = _workflow_id(group_id)
-    resource = path or f"task:{workflow_id}"
-    with connection() as db:
+    with (nullcontext(db) if db is not None else connection()) as db:
         _lock_workflow_mutation(db)
-        stage = db.execute("SELECT stage_id FROM workflow_stages WHERE group_id=%s AND task_type=%s AND status='running' AND payload->>'task_id'=%s ORDER BY stage_number LIMIT 1", (workflow_id, task_type, str(task_id))).fetchone()
+        eligible = "('pending','running','blocked')" if allow_pending else "('running')"
+        stage = db.execute(f"SELECT stage_id FROM workflow_stages WHERE group_id=%s AND task_type=%s AND status IN {eligible} AND payload->>'task_id'=%s ORDER BY stage_number LIMIT 1", (workflow_id, task_type, str(task_id))).fetchone()
         if not stage:
             return
         db.execute("UPDATE workflow_stages SET status='failed', error=%s, finished_at=now(), updated_at=now() WHERE stage_id=%s", (error[-4000:], stage["stage_id"]))
-        db.execute("DELETE FROM workflow_locks WHERE resource_key=%s AND group_id=%s", (resource, workflow_id))
+        db.execute("DELETE FROM workflow_locks WHERE stage_id=%s AND group_id=%s", (stage["stage_id"], workflow_id))
+        # A previous attempt can have created a LUW before a later retry fails
+        # its signature check. Retire only this task's non-executing LUW; live
+        # owners and recovery journals are not touched here.
+        if allow_pending:
+            db.execute("""UPDATE workflow_luws u SET status='failed',current_step='error',error=%s,
+                finished_at=now(),updated_at=now() WHERE u.group_id=%s AND u.idempotency_key=%s
+                AND u.status IN ('planned','preflighted','waiting')
+                AND NOT EXISTS (SELECT 1 FROM workflow_luw_locks k WHERE k.luw_id=u.luw_id)""",
+                (error[-4000:], workflow_id, f'task:{task_id}'))
         db.execute("UPDATE workflow_groups SET status='failed', error=%s, updated_at=now() WHERE group_id=%s", (error[-4000:], workflow_id))
 
 
@@ -435,7 +457,7 @@ class WorkflowStorageError(RuntimeError):
 
 MUTATING_TASK_TYPES = frozenset({
     "media_edit", "movie_import", "filtered_stream_edit", "filtered_stream_edit_now",
-    "tv_filtered_stream_edit", "tv_filtered_stream_edit_now", "subtitle_html_cleanup",
+    "tv_filtered_stream_edit", "tv_filtered_stream_edit_now", "subtitle_html_cleanup", "subtitle_autofix",
     "image_subtitle_convert", "ocr_rollback", "plex_import_refresh",
     "matroska_layout_remux",
 })
@@ -485,9 +507,16 @@ def _file_digest(path: Path) -> str:
 
 def prepare_task_artifact(group_id: str | None, task_id: int, task_type: str, path: str, payload: dict) -> None:
     """Snapshot a mutating input before its handler can touch the media file."""
-    if task_type == 'matroska_layout_remux':
+    if task_type == 'movie_import':
+        # Import never edits the source. The one verified destination output
+        # is atomically published; optional source removal follows that commit.
+        # Backing up the entire input here defeats the single-output pipeline.
+        return
+    if task_type in {'matroska_layout_remux', 'subtitle_html_cleanup', 'subtitle_autofix'}:
         # The verified sibling output replaces the original atomically. A
         # second full-size recovery copy would triple transient disk usage.
+        # HTML commits have durable replacement receipts and idempotent retry;
+        # verification/index follow-up failures must not repeat a committed write.
         return
     if task_type == 'image_subtitle_convert':
         # OCR already owns a durable original in its user-approval staging

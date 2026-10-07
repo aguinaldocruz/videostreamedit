@@ -46,11 +46,12 @@
   const heading = page.querySelector('.page-title p');
   if (heading) heading.textContent = 'Review indexed media findings and open the affected streams directly.';
   const note = page.querySelector('.reports-note');
-  if (note) note.textContent = 'Reports reflect indexed data. Pending edits and media not indexed yet may be absent.';
+  if (note) note.textContent = 'Final version media are excluded from every report. Reports reflect indexed data; pending edits and media not indexed yet may be absent.';
 
   let availabilityPromise = null;
   let lastAvailability = 0;
   let availability = null;
+  let availabilityRevision = 0;
   const updateCategories = () => {
     grid.querySelectorAll('.reports-category').forEach(section => {
       section.hidden = !section.querySelector('.reports-group:not([hidden])');
@@ -81,6 +82,7 @@
     return value.split(':')[0];
   };
   window.refreshReportAvailability = function (force = false) {
+    if (force) availabilityRevision++;
     if (availabilityPromise) return availabilityPromise;
     if (!force && availability && Date.now() - lastAvailability < 15000) return Promise.resolve(availability);
     page.classList.add('reports-checking');
@@ -88,7 +90,14 @@
       const status = card.querySelector('.report-card-status');
       if (status) status.textContent = 'Checking availability…';
     });
-    availabilityPromise = api('/api/v19/reports/availability').then(result => {
+    availabilityPromise = (async () => {
+      // A final-version change can commit while an older count request is
+      // still running. Never cache or render that pre-approval response.
+      let result, revision;
+      do {
+        revision = availabilityRevision;
+        result = await api('/api/v19/reports/availability');
+      } while (revision !== availabilityRevision);
       availability = result.reports || {};
       lastAvailability = Date.now();
       Object.entries(cards).forEach(([key, card]) => {
@@ -106,7 +115,7 @@
       page.classList.remove('reports-checking', 'reports-availability-error');
       window.applyReportVisibility?.();
       return availability;
-    }).catch(error => {
+    })().catch(error => {
       page.classList.remove('reports-checking');
       page.classList.add('reports-availability-error');
       Object.values(cards).forEach(card => {
@@ -167,6 +176,16 @@
     window.refreshReportAvailability(true);
     if (dialog.open && dialog.dataset.reportKey === key) window.resumeReportView(window.captureReportView());
   };
+  const invalidateReports = () => {
+    availabilityRevision++;
+    availability = null;
+    lastAvailability = 0;
+    if (!page.classList.contains('hidden') || dialog.open) window.refreshReportAvailability();
+    if (dialog.open) window.resumeReportView(window.captureReportView());
+  };
+  ['media-final-version-changed', 'media-properties-applied', 'media-properties-queued'].forEach(name => {
+    document.addEventListener(name, invalidateReports);
+  });
   toolbar.querySelector('[data-report-refresh]').onclick = () => window.resumeReportView(window.captureReportView());
   function filterRows() {
     scopeControls();
@@ -346,7 +365,7 @@
       return open.apply(button, args);
     };
   }));
-  document.querySelector('[data-page="reports"]')?.addEventListener('click', () => window.refreshReportAvailability());
+  document.querySelector('[data-page="reports"]')?.addEventListener('click', () => window.refreshReportAvailability(true));
   dialog.addEventListener('close', () => {
     window.reportEpoch = (window.reportEpoch || 0) + 1;
     window.refreshReportAvailability(true);

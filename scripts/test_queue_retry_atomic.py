@@ -38,4 +38,15 @@ else:
 assert not any(e[0] == 'publish' for e in events)
 assert source.count("AND {runnable}") == 3
 assert source.count('changed = retry_tasks_atomically(') == 2
-print('PASS: single/bulk shared transaction, lock order, reset-before-publication, failure propagation, all-lane cooldown')
+worker = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == 'run_queue')
+failure_calls = [n for n in ast.walk(worker) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == 'fail_task_stage']
+assert len(failure_calls) == 1
+failure_call = failure_calls[0]
+assert ast.unparse(next(k.value for k in failure_call.keywords if k.arg == 'db')) == 'db.raw'
+assert next(k.value for k in failure_call.keywords if k.arg == 'allow_pending').value is True
+atomic_failure = next(n for n in ast.walk(worker) if isinstance(n, ast.With)
+                      and failure_call in list(ast.walk(n)))
+assert 'connection()' in ast.unparse(atomic_failure.items[0].context_expr)
+assert any(isinstance(n, ast.Constant) and isinstance(n.value, str) and "SET status='failed'" in n.value for n in ast.walk(atomic_failure))
+assert ast.unparse(atomic_failure.body[0]).startswith('fail_task_stage(')
+print('PASS: atomic retry and early failure projection, exact transaction ownership, all-lane cooldown')

@@ -84,7 +84,7 @@ class ScheduleDB(DB):
 
 for running in (0, 1):
     db = ScheduleDB(running)
-    with patch.object(v67, 'connection', return_value=db), patch.object(v67, 'schedule_due', return_value=True), patch.object(v67.index_jobs, 'status', return_value={'running': running, 'total': 0}) as status, patch.object(v67.index_jobs, 'start') as start, patch.object(v67.threading, 'Event') as event:
+    with patch.object(v67, 'connection', return_value=db), patch.object(v67, 'schedule_due', return_value=True), patch.object(v67.index_jobs, 'status', return_value={'running': running, 'total': 0}) as status, patch.object(v67, 'queue_scheduled_job') as start, patch.object(v67.threading, 'Event') as event:
         event.return_value.wait.side_effect = StopIteration
         try:
             v67.run_scheduler()

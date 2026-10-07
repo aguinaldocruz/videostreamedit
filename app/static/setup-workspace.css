@@ -40,6 +40,21 @@
   border-left: 2px solid var(--vse-border, #303947);
 }
 #setup.setup-redesigned .setup-section-tabs[hidden] { display: none; }
+#setup.setup-redesigned .setup-workspace-content > .setup-section-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: .4rem;
+  padding: .6rem;
+  margin-bottom: 1rem;
+  border: 1px solid var(--vse-border, #303947);
+  border-radius: .7rem;
+  background: var(--vse-surface, #151b22);
+}
+#setup.setup-redesigned .setup-workspace-content > .setup-section-tabs[hidden] { display: none; }
+#setup.setup-redesigned .setup-workspace-content > .setup-section-tabs button {
+  flex: 0 1 auto;
+  text-align: center;
+}
 #setup.setup-redesigned .setup-group-tabs button,
 #setup.setup-redesigned .setup-section-tabs button {
   min-width: 0;

@@ -94,7 +94,7 @@ def inspect_layout(path: Path) -> tuple[str, str]:
     return "unknown", "No first media Cluster found within the bounded header check"
 
 
-def checkpoint(path: Path) -> str:
+def checkpoint(path: Path, *, force: bool = False) -> str:
     """Recheck only when the media file's size or nanosecond mtime changes."""
     media = Path(path)
     if media.suffix.casefold() not in MATROSKA_SUFFIXES:
@@ -104,7 +104,7 @@ def checkpoint(path: Path) -> str:
         previous = db.execute(
             "SELECT size,modified_ns,status FROM matroska_layout_check WHERE path=?", (str(media),),
         ).fetchone()
-    if previous and int(previous["size"]) == stat.st_size and int(previous["modified_ns"]) == stat.st_mtime_ns:
+    if not force and previous and int(previous["size"]) == stat.st_size and int(previous["modified_ns"]) == stat.st_mtime_ns:
         return str(previous["status"])
     status, detail = inspect_layout(media)
     after = media.stat()
@@ -121,10 +121,10 @@ def checkpoint(path: Path) -> str:
     return status
 
 
-def safe_checkpoint(path: Path) -> None:
+def safe_checkpoint(path: Path, *, force: bool = False) -> None:
     """A diagnostic must never fail its parent cache/index/media operation."""
     try:
-        checkpoint(path)
+        checkpoint(path, force=force)
     except Exception as exc:
         logger.warning("matroska_layout event=checkpoint_failed path=%s error=%s", path,
                        str(exc).replace("\n", " ")[:300])

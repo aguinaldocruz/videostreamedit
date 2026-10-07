@@ -1,8 +1,29 @@
-# Complete text-subtitle cache implementation
+# Subtitle cache implementation
 
-The cache covers complete text-based embedded and external subtitles. It does
-not OCR graphical subtitles. The media remains authoritative; cached text is
-usable only with a matching source signature and a complete track manifest.
+The cache covers complete text-based embedded and external subtitles, plus
+embedded Matroska PGS and VobSub image subtitles. It does not OCR image
+subtitles. The media remains authoritative; cached tracks are usable only
+with a matching source signature and a complete track manifest.
+
+Text and image tracks have separate manifests and storage. A media item can
+have text only, images only, or both. The regular bounded cache run checks
+both sets independently; it does not re-extract valid text solely because an
+image track is uncached. PGS is stored as its original SUP packet stream;
+VobSub is stored as its original SUB and IDX pair in PostgreSQL `bytea` fields.
+Graphical payloads are checksum-verified on retrieval, and media-change hooks
+invalidate both sets together. The next run also queues already indexed
+image subtitles that the saved catalog cursor may have passed. Unsupported
+graphical formats are not converted or marked cached. Image tracks remain
+unavailable to text-only inspection, language detection, and HTML cleanup;
+future graphical operations can consume the source-verified binary cache.
+
+SRT extraction copies raw subtitle packets, avoiding FFmpeg's UTF-8 decoder
+failures on older files. Decoding is strict; reversible Windows-1252 inference
+is recorded, while ambiguous/malformed content remains quarantined. Verified
+empty tracks have a separate extraction status and do not fail the entire
+media cache. Neither decoding nor caching repairs source files. Inspection
+retains empty-track and non-UTF-8 source warnings. See
+[failed-job safeguards](FAILED_JOB_FIXES.md) for validation and retry behavior.
 
 ## Phases
 
@@ -54,23 +75,34 @@ usable only with a matching source signature and a complete track manifest.
    with a complete, source- and checksum-verified cache. Uncached or partial
    media remains pending (shown as waiting for subtitle cache) for a later
    inspection pass; inspection never extracts text as a fallback. Embedded HTML
-   cleanup derives a clean
-   subtitle from cached text, remuxes to a temporary media file, verifies stream
-   count, cue count, dialogue and absence of HTML, and only then replaces the
-   original. The verified final text is published under the new media
-   signature, with other tracks marked uncached. External SRT cleanup uses the
-   same cached-input/verified-output pattern; other external text formats keep
-   their native-format edit path and refresh a normalized cache afterward.
+   cleanup prepares all selected subtitles from cached text before making
+   changes. Missing embedded texts are extracted together. There is one
+   container remux per media, not one per subtitle: the native Matroska writer
+   preserves global stream order, exact language/region, titles, flags, tags,
+   chapters and attachments. Verification compares every cue's text and
+   millisecond timing, including untouched cached embedded text in the same
+   output-extraction pass. Only then is the original atomically replaced.
+   Changed and verified unchanged text caches are published together in one
+   transaction under the new source signature; complete, source-matching
+   image caches are rebound only after their unchanged passthrough layout
+   passes verification, without copying their binary payloads. External SRT
+   cleanup uses the same cache-first pattern and preserves source encoding/BOM;
+   other external text formats keep their native document, preparing and
+   verifying a normalized cache before commit. Sidecar-only cleanup has no
+   container remux. A complete retained cache needs no recache; a partial cache
+   remains explicitly incomplete and queues only its missing work.
    Failed output verification leaves the original untouched. A cache database
    write failure after a verified media commit leaves the cache invalid rather
    than making the completed edit retryable. Core index refreshes use their
    stream and sidecar change results to retire obsolete cache entries and add
    changed media to a priority recache
-   queue. HTML edits likewise queue the remaining tracks of that media;
+   queue. HTML edits queue remaining tracks only if they are genuinely uncached;
    completed recaches remove their queue entry, while failures receive bounded
    retry backoff. Newly discovered Plex media join this priority queue after
    an existing catalog is established. Future subtitle editors can reuse this
    per-media validation boundary.
+   See [batch HTML cleanup](SUBTITLE_HTML_BATCH_CLEANUP.md) for the commit,
+   recovery, space-admission and regression-test contract.
 5. **Production verification (pending).** Exercise changed files/sidecars,
    media edits, finalized media, cancellation, restart, stale-source races,
    and mixed codecs; pilot a small catalog subset before enabling the full

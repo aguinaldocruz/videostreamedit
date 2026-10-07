@@ -10,7 +10,7 @@ from pathlib import Path
 
 
 tree = ast.parse((Path(__file__).resolve().parents[1] / "app/subtitle_cache_schedule.py").read_text())
-names = {"_parse_clock", "_due", "_next_run", "ensure_schema", "_final_uncached_paths", "_remaining_work_count"}
+names = {"_parse_clock", "_due", "_next_run", "ensure_schema", "_final_uncached_paths", "_remaining_work_count", "_enqueue_uncached_image_media"}
 nodes = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in names]
 for node in nodes:
     node.decorator_list = []
@@ -28,7 +28,7 @@ def connect():
 scope = {"connect": connect, "datetime": datetime, "timedelta": timedelta,
          "time": time, "remaining_work_lock": threading.Lock(), "remaining_work_snapshot": (0.0, 0),
          "FREQUENCY_DAYS": {"daily": 1, "every_other_day": 2, "weekly": 7},
-         "CACHE_FORMAT_VERSION": 1}
+         "CACHE_FORMAT_VERSION": 1, "IMAGE_CACHE_FORMAT_VERSION": 1}
 exec(compile(ast.Module(body=nodes, type_ignores=[]), "subtitle-cache-schedule-test", "exec"), scope)
 scope["ensure_schema"]()
 row = dict(database.execute("SELECT * FROM subtitle_cache_schedule WHERE id=1").fetchone())
@@ -62,9 +62,11 @@ ALTER TABLE plex_media ADD COLUMN library_key TEXT NOT NULL DEFAULT '';
 ALTER TABLE plex_media ADD COLUMN show_title TEXT NOT NULL DEFAULT '';
 CREATE TABLE media_notes(entity_type TEXT, entity_key TEXT, final_version INTEGER);
 CREATE TABLE subtitle_cache_media(path TEXT, format_version INTEGER, expected_tracks INTEGER, cached_tracks INTEGER);
+CREATE TABLE subtitle_image_cache_media(path TEXT, format_version INTEGER, expected_tracks INTEGER);
+CREATE TABLE subtitle_image_cache_track(path TEXT);
 CREATE TABLE subtitle_cache_failure(path TEXT PRIMARY KEY);
 CREATE TABLE media_stream_index_state(path TEXT PRIMARY KEY);
-CREATE TABLE media_stream_index(path TEXT,stream_type TEXT);
+CREATE TABLE media_stream_index(path TEXT,stream_type TEXT,codec TEXT);
 CREATE TABLE subtitle_cache_track(path TEXT);
 INSERT INTO plex_media(path,kind,library_key,show_title) VALUES
  ('/final-movie','movie','',''),('/show-episode','episode','tv','A Show'),('/not-final','movie','','');
@@ -75,10 +77,18 @@ INSERT INTO subtitle_cache_track VALUES('/final-movie');
 assert scope["_final_uncached_paths"](database) == ["/show-episode"]
 database.execute("INSERT INTO media_stream_index_state VALUES('/show-episode')")
 assert scope["_final_uncached_paths"](database) == []
-database.execute("INSERT INTO media_stream_index VALUES('/show-episode','subtitle')")
+database.execute("INSERT INTO media_stream_index VALUES('/show-episode','subtitle','SubRip/SRT')")
 assert scope["_final_uncached_paths"](database) == ["/show-episode"]
 assert scope["_remaining_work_count"]() == 5
 database.execute("INSERT INTO subtitle_cache_failure VALUES('/show-episode')")
 scope["remaining_work_snapshot"] = (0.0, 0)
 assert scope["_remaining_work_count"]() == 4
+database.execute("INSERT INTO plex_media(path,kind) VALUES('/image-only','movie')")
+database.execute("INSERT INTO media_stream_index VALUES('/image-only','subtitle','HDMV PGS')")
+assert scope["_enqueue_uncached_image_media"](database) == 1
+assert scope["_enqueue_uncached_image_media"](database) == 0
+assert database.execute("SELECT 1 FROM subtitle_cache_pending WHERE path='/image-only'").fetchone()
+database.execute("DELETE FROM subtitle_cache_pending WHERE path='/image-only'")
+database.execute("INSERT INTO subtitle_cache_failure VALUES('/image-only')")
+assert scope["_enqueue_uncached_image_media"](database) == 0
 print("PASS: cache schedule starts disabled, validates time, and waits for the next recurrence")

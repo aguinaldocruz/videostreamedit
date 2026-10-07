@@ -15,9 +15,11 @@
     setup.querySelectorAll('.index-schedule,.plex-sync-schedule').forEach(node=>{
       const card=document.createElement('section');card.className='scheduled-task-card schedule-discovery-card';
       if(node.classList.contains('plex-sync-schedule')){
+        card.dataset.scheduleActionsJob='plex_sync';
         card.innerHTML='<div class="schedule-card-heading"><div><strong>Plex library sync</strong><small>Check Plex for new or changed movies and episodes.</small></div></div>';
       }else{
         const job=node.closest('[data-index-job]')?.dataset.indexJob;
+        card.dataset.scheduleActionsJob=job;
         const [title,description]=indexCopy[job]||['Media index check','Discover new or changed media for indexing.'];
         card.innerHTML=`<div class="schedule-card-heading"><div><strong>${title}</strong><small>${description}</small></div></div>`;
       }
@@ -26,9 +28,9 @@
     const jobs=[['subtitle_detection','Subtitle language detection','Check subtitle-language findings in the background.'],['voice_detection','Voice language detection','Check audio-language findings in the background.']];
     const labels={disabled:'Disabled',daily:'Daily',every_other_day:'Every other day',weekly:'Weekly'};
     function describe(v){return v.frequency==='disabled'?'Disabled':`${labels[v.frequency]||v.frequency} · next ${v.next_run?formatAppDate(v.next_run)+' · '+appTimezone():'scheduled'}`}
-    cards.insertAdjacentHTML('beforeend',jobs.map(([job,label,description])=>`<section class="scheduled-task-card schedule-detection-card" data-scheduled-job="${job}"><div class="schedule-card-heading"><div><strong>${label}</strong><small>${description}</small></div></div><div class="schedule-card-controls"><label>Frequency<select data-frequency><option value="disabled">Disabled</option><option value="daily">Daily</option><option value="every_other_day">Every other day</option><option value="weekly">Weekly</option></select></label><label>Time<input type="time" data-time value="03:00"></label><button type="button" data-save>Save schedule</button></div><small class="schedule-card-status" data-scheduled-status role="status">Loading…</small></section>`).join(''));
-    cards.insertAdjacentHTML('beforeend',`<div class="scheduled-task-card subtitle-cache-card" data-subtitle-cache>
-      <div class="subtitle-cache-heading"><strong>Cache subtitles</strong><small>Complete text subtitles only · Final Revision first, then newest media</small></div>
+    cards.insertAdjacentHTML('beforeend',jobs.map(([job,label,description])=>`<section class="scheduled-task-card schedule-detection-card" data-scheduled-job="${job}" data-schedule-actions-job="${job}"><div class="schedule-card-heading"><div><strong>${label}</strong><small>${description}</small></div></div><div class="schedule-card-controls"><label>Frequency<select data-frequency><option value="disabled">Disabled</option><option value="daily">Daily</option><option value="every_other_day">Every other day</option><option value="weekly">Weekly</option></select></label><label>Time<input type="time" data-time value="03:00"></label><button type="button" data-save>Save schedule</button></div><small class="schedule-card-status" data-scheduled-status role="status">Loading…</small></section>`).join(''));
+    cards.insertAdjacentHTML('afterbegin',`<div class="scheduled-task-card subtitle-cache-card" data-subtitle-cache data-schedule-actions-job="subtitle_cache">
+      <div class="subtitle-cache-heading"><strong>Cache subtitles</strong><small>Text and supported image subtitles · Final Revision first, then newest media</small></div>
       <div class="subtitle-cache-controls">
         <label>Frequency<select data-cache-frequency><option value="disabled">Disabled</option><option value="daily">Daily</option><option value="every_other_day">Every other day</option><option value="weekly">Weekly</option></select></label>
         <label>Start time<input type="time" data-cache-time value="03:00"></label>

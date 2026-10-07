@@ -3,9 +3,53 @@ state.deferredDetectionPath='';
 async function flushDeferredStreamDetection(){const path=state.deferredDetectionPath;if(!path)return;state.deferredDetectionPath='';try{await api('/api/v79/language-detection/flush?path='+encodeURIComponent(path),{method:'POST'});}catch(error){toast('Could not queue language detection: '+error.message,true)}}
 let mediaNavigation=[],mediaNavigationIndex=-1,mediaNavigationKind='item';
 function ensureMediaNavigation(){if($('#media-navigation'))return;const close=$('#stream-dialog .icon-close');close.insertAdjacentHTML('beforebegin','<div id="media-navigation" class="media-navigation hidden"><button type="button" id="previous-media" aria-label="Previous">&lt;</button><button type="button" id="next-media" aria-label="Next">&gt;</button></div><button type="button" id="movie-note-button" class="note-button" title="Edit movie note" aria-label="Edit movie note">i</button><button type="button" id="stream-final-version" class="final-version-action" title="Mark this media as Final version">Final version</button>');$('#previous-media').onclick=()=>navigateMedia(-1);$('#next-media').onclick=()=>navigateMedia(1);$('#movie-note-button').onclick=()=>openEntityNote('movie',state.selectedPath,$('#selected-file').textContent)}
-async function refreshStreamFinalVersion(path){const button=$('#stream-final-version');if(!button)return;button.disabled=false;try{const result=await api('/api/v86/final-version?path='+encodeURIComponent(path)),final=Boolean(result.effective_final_version??result.final_version);button.dataset.finalVersion=final?'true':'false';delete button.dataset.finalPending;button.textContent=final?'Unfreeze final':'Final version';button.title=final?'Unfreeze final (stage this change, then Apply or Queue)':'Mark this media as Final version (stage this change, then Apply or Queue)';button.classList.toggle('active',final);setStreamFinalLock(final)}catch(error){button.dataset.finalVersion='false';delete button.dataset.finalPending;button.textContent='Final version';setStreamFinalLock(false)}}
+function setStreamFinalVersionState(final,{draft=false,disabled=false,title=''}={}){
+  const button=$('#stream-final-version');if(!button)return;
+  button.dataset.finalVersion=String(final);delete button.dataset.finalPending;
+  button.textContent=final?(draft?'Final version · draft':'Final version · set'):'Final version';
+  button.title=title||(final?'Final version is set. Click to stage unfreezing, then Apply or Queue.':'Final version is not set. Click to stage approval, then Apply or Queue.');
+  button.classList.toggle('active',final);button.setAttribute('aria-pressed',String(final));button.disabled=disabled;
+}
+async function refreshStreamFinalVersion(path){
+  const button=$('#stream-final-version');if(!button)return;button.disabled=true;
+  // Import editing targets a copy, not the source's catalog approval. A new
+  // source may not be indexed at all; do not lock its copy-edit controls.
+  if(movieImportMode?.editing){
+    setStreamFinalVersionState(false,{disabled:true,title:'Final Version can be set after the imported media is in the catalog.'});
+    setStreamFinalLock(false);return;
+  }
+  try{
+    const result=await api('/api/v86/final-version?path='+encodeURIComponent(path));
+    if(state.selectedPath!==path||!$('#stream-dialog')?.open)return;
+    const final=Boolean(result.effective_final_version??result.final_version);
+    setStreamFinalVersionState(final);setStreamFinalLock(final);
+  }catch(error){
+    if(state.selectedPath!==path||!$('#stream-dialog')?.open)return;
+    delete button.dataset.finalVersion;delete button.dataset.finalPending;
+    button.textContent='Final version · unknown';button.title='Could not read approval status: '+error.message;
+    button.classList.remove('active');button.setAttribute('aria-pressed','mixed');button.disabled=true;setStreamFinalLock(true);
+    const message=$('#stream-content .final-version-lock-message');
+    if(message)message.textContent='Approval status is unavailable · editing locked. Reopen this media to retry.';
+  }
+}
 function setStreamFinalLock(locked){const content=$('#stream-content'),submit=$('#stream-form [type=submit]');if(content)content.querySelectorAll('input,select,textarea,button').forEach(input=>{input.disabled=locked});if(submit)submit.disabled=locked;const message=content?.querySelector('.final-version-lock-message');if(locked&&!message&&content){content.insertAdjacentHTML('afterbegin','<p class="final-version-lock-message">Final version · view-only. Open the button above to unfreeze this media.</p>')}else if(!locked&&message)message.remove()}
-function wireStreamFinalVersion(){const button=$('#stream-final-version');if(!button||button.dataset.ready)return;button.dataset.ready='1';button.onclick=()=>{const current=button.dataset.finalVersion==='true',next=button.dataset.finalPending!==undefined?button.dataset.finalPending!=='true':!current;button.dataset.finalPending=String(next);button.textContent=next?'Final version (pending)':'Unfreeze final (pending)';const draft=Boolean(window.activeTvDraftForPath?.(state.selectedPath));button.title=next?`Final Version will be set when you ${draft?'stage this episode':'Apply or Queue changes'}`:`Final Version will be removed when you ${draft?'stage this episode':'Apply or Queue changes'}`;button.classList.toggle('active',next);if(!next)setStreamFinalLock(false);updateQueuedChangeLabels();toast(next?`Final Version staged; ${draft?'save the episode to the TV-show draft':'choose Apply or Queue to commit'}`:`Final Version removal staged; ${draft?'save the episode to the TV-show draft':'choose Apply or Queue to commit'}`)}}
+function wireStreamFinalVersion(){
+  const button=$('#stream-final-version');if(!button||button.dataset.ready)return;button.dataset.ready='1';
+  button.onclick=()=>{
+    const current=button.dataset.finalVersion==='true';
+    const next=button.dataset.finalPending!==undefined?button.dataset.finalPending!=='true':!current;
+    const draft=Boolean(window.activeTvDraftForPath?.(state.selectedPath));
+    if(next===current){
+      setStreamFinalVersionState(current,{draft});setStreamFinalLock(current&&!draft);
+      updateQueuedChangeLabels();toast('Pending Final Version change undone');return;
+    }
+    button.dataset.finalPending=String(next);button.textContent=next?'Final version (pending)':'Unfreeze final (pending)';
+    button.title=next?`Final Version will be set when you ${draft?'stage this episode':'Apply or Queue changes'}`:`Final Version will be removed when you ${draft?'stage this episode':'Apply or Queue changes'}`;
+    button.classList.toggle('active',next);button.setAttribute('aria-pressed',String(next));
+    if(!next)setStreamFinalLock(false);updateQueuedChangeLabels();
+    toast(next?`Final Version staged; ${draft?'save the episode to the TV-show draft':'choose Apply or Queue to commit'}`:`Final Version removal staged; ${draft?'save the episode to the TV-show draft':'choose Apply or Queue to commit'}`);
+  };
+}
 function updateMediaNavigation(){ensureMediaNavigation();wireStreamFinalVersion();const active=mediaNavigationIndex>=0;$('#media-navigation').classList.toggle('hidden',!active);$('#movie-note-button').classList.toggle('hidden',mediaNavigationKind!=='movie');const previous=$('#previous-media'),next=$('#next-media');previous.disabled=!active||mediaNavigationIndex===0;next.disabled=!active||mediaNavigationIndex===mediaNavigation.length-1;previous.title=`Previous ${mediaNavigationKind}`;next.title=`Next ${mediaNavigationKind}`;previous.setAttribute('aria-label',previous.title);next.setAttribute('aria-label',next.title)}
 window.captureMediaNavigationContext=()=>({items:mediaNavigation.map(item=>({...item})),index:mediaNavigationIndex,kind:mediaNavigationKind});
 window.setMediaNavigationContext=(items,index=0,kind='report')=>{mediaNavigation=items.map(item=>({...item}));mediaNavigationIndex=Math.max(0,Math.min(index,mediaNavigation.length-1));mediaNavigationKind=kind;currentShowContext=mediaNavigation[mediaNavigationIndex]?.showTitle||'';updateMediaNavigation()};

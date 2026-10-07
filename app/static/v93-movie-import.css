@@ -1,5 +1,8 @@
 
 /* Phase 5 Movie Import visual layer. Source/destination semantics and copy flow remain unchanged. */
+#movie-import .import-media-kind{display:flex;align-items:center;flex-wrap:wrap;gap:.65rem;margin:.6rem 0 1rem}
+#movie-import .import-media-kind select{width:auto;min-width:10rem}
+#movie-import .import-media-kind small{color:var(--vse-muted,#9aa6b2)}
 #movie-import .page-title{border-bottom:1px solid var(--vse-border,#303947);padding-bottom:.8rem}
 #movie-import .page-title button{border:1px solid var(--vse-border,#303947);border-radius:var(--vse-radius-sm,8px);background:var(--vse-surface,#151b22);color:var(--vse-text,#e7edf5)}
 #movie-import .page-title button:hover{border-color:var(--vse-accent,#62b0ff)}

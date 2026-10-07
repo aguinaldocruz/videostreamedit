@@ -4,6 +4,15 @@ from pathlib import Path
 ALIASES = {'eng':'en', 'por':'pt', 'pob':'pt', 'spa':'es', 'fra':'fr', 'fre':'fr',
            'deu':'de', 'ger':'de', 'ita':'it', 'jpn':'ja', 'rus':'ru'}
 
+# One committed-state rule for reports and detection eligibility. A final TV
+# show covers all its episodes, including ones without an individual note.
+FINAL_MEDIA_QUERY = """SELECT p.path FROM plex_media p WHERE EXISTS (
+    SELECT 1 FROM media_notes n WHERE n.final_version=1 AND
+    ((p.kind='movie' AND n.entity_type='movie' AND n.entity_key=p.path) OR
+     (p.kind='episode' AND n.entity_type='tv' AND
+      (n.entity_key='episode:'||p.path OR
+       n.entity_key=p.library_key||':'||COALESCE(NULLIF(p.show_title,''),'Unknown show')))))"""
+
 
 def language_key(language, region=''):
     value = str(language or '').strip().lower().replace('_', '-')
@@ -40,20 +49,16 @@ def source_stamp(path):
 
 
 def final_paths(paths=None, db=None):
-    from app.v11 import connection
     if paths is not None and not paths: return set()
     if db is None:
+        from app.v11 import connection
         with connection() as db:
             return final_paths(paths, db)
     clause, args = '', []
     if paths is not None:
         args = list(paths)
         clause = ' AND p.path IN (' + ','.join('?' for _ in args) + ')'
-    rows = db.execute("""SELECT p.path FROM plex_media p WHERE EXISTS (
-        SELECT 1 FROM media_notes n WHERE n.final_version=1 AND
-        ((p.kind='movie' AND n.entity_type='movie' AND n.entity_key=p.path) OR
-         (p.kind='episode' AND n.entity_type='tv' AND
-          (n.entity_key='episode:'||p.path OR n.entity_key=p.library_key||':'||COALESCE(p.show_title,'Unknown show')))))""" + clause, args).fetchall()
+    rows = db.execute(FINAL_MEDIA_QUERY + clause, args).fetchall()
     return {str(r['path']) for r in rows}
 
 
@@ -84,10 +89,7 @@ def retire_final_detection(db):
     """Cheap set-based retirement; never cancels mixed-purpose media edits."""
     from app.postgres_store import _lock_workflow_mutation
     _lock_workflow_mutation(db.raw)
-    final_query = """SELECT p.path FROM plex_media p JOIN media_notes n ON n.final_version=1 AND
-        ((p.kind='movie' AND n.entity_type='movie' AND n.entity_key=p.path) OR
-        (p.kind='episode' AND n.entity_type='tv' AND (n.entity_key='episode:'||p.path OR
-         n.entity_key=p.library_key||':'||COALESCE(p.show_title,'Unknown show'))))"""
+    final_query = FINAL_MEDIA_QUERY
     db.execute('DELETE FROM deferred_language_detection WHERE path IN (' + final_query + ')')
     retired = list(db.execute("UPDATE task_queue SET status='cancelled',progress_message='Skipped: Final Version',finished_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE status='pending' AND task_type='audio_language_detection' AND payload_json::jsonb->>'path' IN (" + final_query + ') RETURNING group_id').fetchall())
     retired += list(db.execute("UPDATE index_task_queue SET status='cancelled',updated_at=CURRENT_TIMESTAMP WHERE status='pending' AND job='subtitles' AND path IN (" + final_query + ') RETURNING group_id').fetchall())
@@ -122,7 +124,14 @@ def subtitle_assessment(text, codec, metadata, region, allowed):
     if not detected and language_key(metadata)[0] not in {'', 'und', 'unknown', *allowed}:
         return '', 0.0, 'No common-language evidence; existing metadata retained', 'skipped_non_common'
     if not detected or confidence <= .60:
-        return detected, confidence, evidence or 'Insufficient evidence for a configured common language', 'no_confidence'
+        analyzed = sorted(set(allowed or ()) & {'en', 'pt'})
+        if not analyzed:
+            reason = 'No confident result: the local subtitle detector currently has built-in language profiles only for English and Portuguese; configured languages are not deeply analyzed'
+        elif evidence:
+            reason = evidence
+        else:
+            reason = 'No confident English or Portuguese vocabulary evidence was found; other configured languages are not deeply analyzed'
+        return detected, confidence, reason, 'no_confidence'
     agrees = language_matches(detected, metadata, region)
     return detected, confidence, ('Detected language agrees with metadata' if agrees else evidence or 'Detected language differs from metadata'), ('complete' if agrees else 'mismatch')
 

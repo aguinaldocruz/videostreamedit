@@ -37,9 +37,10 @@ def main() -> int:
     check("track-name-only", detection_scope_for_edit({"tracks": [{"codec_type": "subtitle", "type_index": 2, "track_name": "Signs"}]}), {})
     check("default-forced-only", detection_scope_for_edit({"tracks": [{"codec_type": "audio", "type_index": 1, "default": True, "forced": False}]}), {})
 
-    # Language/region changes target only the changed streams.
-    check("subtitle-language", detection_scope_for_edit({"tracks": [{"codec_type": "subtitle", "type_index": 3, "language": "pt", "region": "BR"}]}), {"subtitle_indices": [3]})
-    check("audio-language", detection_scope_for_edit({"tracks": [{"codec_type": "audio", "type_index": 1, "language": "en"}]}), {"audio_indices": [1]})
+    # Language/region changes recompare existing evidence only for changed
+    # streams; they do not discard unchanged text/audio detection results.
+    check("subtitle-language", detection_scope_for_edit({"tracks": [{"codec_type": "subtitle", "type_index": 3, "language": "pt", "region": "BR"}]}), {"subtitle_indices": [3], "subtitle_recompare": True})
+    check("audio-language", detection_scope_for_edit({"tracks": [{"codec_type": "audio", "type_index": 1, "language": "en"}]}), {"audio_indices": [1], "audio_recompare": True})
     check("subtitle-removal", detection_scope_for_edit({"remove": ["embedded:subtitle:4"]}), {"subtitle_indices": "all"})
     check("external-integration", detection_scope_for_edit({"external_subtitles": [{"embed": True}]}), {"subtitle_indices": "all"})
 

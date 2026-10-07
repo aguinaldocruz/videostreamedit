@@ -100,6 +100,15 @@ scope={'Path':Path,'subprocess':subprocess,'HTTPException':HTTPException,'extern
 extract('app/v83.py',{'_aac_browser_safe','_review_plan','_subtitle_file'},scope)
 module('app.v83',app=APP,_review_metadata=probe,_review_plan=scope['_review_plan'],
        _subtitle_file=scope['_subtitle_file'],TEXT_SUBTITLE_CODECS=scope['TEXT_SUBTITLE_CODECS'])
+# Exercise the playback conversion using a complete extracted SRT without
+# importing the production cache/database/scheduler into this isolated harness.
+def cached_subtitle(media, source, index, external_path='', metadata=None):
+    selected = str(media) if source == 'embedded' else external_path
+    text = subprocess.check_output(['ffmpeg', '-v', 'error', '-i', selected,
+                                    '-map', f'0:s:{index}' if source == 'embedded' else '0:0',
+                                    '-f', 'srt', 'pipe:1']).decode()
+    return types.SimpleNamespace(text=text)
+module('app.subtitle_cache_worker', cached_or_extract_track=cached_subtitle)
 playback=importlib.import_module('app.review_playback')
 audio=importlib.import_module('app.review_audio')
 audio.initialize_audio_stages()
@@ -156,7 +165,9 @@ def fixture():return {'path':str(MEDIA),'size':MEDIA.stat().st_size,'streams':pr
 
 @APP.get('/test/resources')
 def resources():
-    return {'sessions':[{'done':s.get('done'), 'produced':s['produced']} for s in playback.SESSIONS.values()],
+    return {'sessions':[{'done':s.get('done'), 'produced':s['produced'], 'position':s['position'],
+                         'buffer_duration':s['buffer_duration'], 'error':s['error']}
+                        for s in playback.SESSIONS.values()],
             'buffer_directories':len(list(playback.ROOT.iterdir())), 'staged_directories':len(list(audio.ROOT.iterdir()))}
 
 
@@ -207,5 +218,6 @@ if __name__=='__main__':
     subprocess.run(['ffmpeg','-v','error','-f','lavfi','-i','testsrc2=size=320x180:rate=24:duration=90',
       '-f','lavfi','-i','sine=frequency=440:sample_rate=48000:duration=90','-f','lavfi','-i','sine=frequency=660:sample_rate=48000:duration=90',
       '-i',str(ROOT/'scripts/fixtures/review.srt'),'-map','0:v','-map','1:a','-map','2:a','-map','3:s',
-      '-c:v','libx264','-threads','2','-preset','ultrafast','-g','48','-c:a:0','aac','-c:a:1','ac3','-c:s','srt','-y',str(MEDIA)],check=True)
+      '-c:v','libx264','-threads','2','-preset','veryfast','-g','144','-sc_threshold','0','-bf','3',
+      '-c:a:0','aac','-c:a:1','ac3','-c:s','srt','-output_ts_offset','5','-y',str(MEDIA)],check=True)
     uvicorn.run(APP,host='0.0.0.0',port=18383)

@@ -244,8 +244,9 @@ def unified_core_index(item: dict) -> None:
         db.execute("INSERT OR REPLACE INTO media_stream_index_state(path,modified_ns,size,schema_version,content_signature,indexed_at) VALUES(?,?,?,3,?,CURRENT_TIMESTAMP)", (str(path), stat.st_mtime_ns, stat.st_size, content_signature))
         db.execute("INSERT OR REPLACE INTO media_video_title(path,title,video_index,modified_ns,size,indexed_at) VALUES(?,?,?,?,?,CURRENT_TIMESTAMP)", (str(path), str(video_meta.get("track_name") or ""), int(video_meta.get("video_index") or 0), stat.st_mtime_ns, stat.st_size))
     tv_bulk.persist_external_sidecars("core", str(path))
-    # The core index is the change detector. Retire cached subtitles here,
-    # not by probing every cached media again during a scheduled cache pass.
+    # Core owns change detection, but a verified writer may have already
+    # published the replacement cache. Keep matching complete/partial caches;
+    # retire only stale portions, never scan fingerprints in the cache pass.
     try:
         subtitle_rows = any(key[1] in {"subtitle", "external"} for key in current_rows.keys() | snapshot.keys())
         file_changed = bool(previous_state and (
@@ -263,8 +264,8 @@ def unified_core_index(item: dict) -> None:
         sidecars_changed = bool(previous_sidecars and current_sidecars and previous_sidecars["signature"] != current_sidecars["signature"])
         layout_changed = old_subtitles != new_subtitles
         if (subtitle_rows and (file_changed or layout_changed or sidecars_changed)) or (previous_state is None and subtitle_rows):
-            from app.subtitle_cache import invalidate_and_enqueue_media_many
-            invalidate_and_enqueue_media_many([str(path)])
+            from app.subtitle_cache_worker import reconcile_cache_after_index
+            reconcile_cache_after_index(path)
     except Exception as exc:
         logger.warning("subtitle_cache event=core_invalidation_failed path=%s error=%s", path, str(exc).replace("\n", " ")[:300])
 
@@ -290,6 +291,9 @@ def matroska_layout_report(kind: str) -> dict:
             "ORDER BY p.show_title,p.season_number,p.episode_number,p.title",
             ("episode" if kind == "tv" else "movie",),
         ).fetchall()
+    # Approved or changing media must not be checked as a side effect of
+    # opening a report. Filter before the file-layout revalidation too.
+    rows = [row for row in rows if str(row["path"]) not in blocked and str(row["path"]) not in active_remux]
     current_warnings = revalidate_warning_rows(rows)
     media = [dict(row) for row in rows if str(row["path"]) in current_warnings and str(row["path"]) not in blocked and str(row["path"]) not in active_remux]
     if kind == "movies":

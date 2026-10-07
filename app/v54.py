@@ -4,6 +4,7 @@ from app.v11 import column_exists, connection
 from app.v38 import MovieStreamIndexInvalidate
 from app.v51 import inspect_extended
 from app.v53 import app
+from app.subtitle_html import MARKUP_VERSION
 
 JOBS = ('core', 'subtitles')
 
@@ -36,7 +37,7 @@ def index_subtitles(item: dict) -> None:
     with connection() as db:
         db.execute('DELETE FROM subtitle_extended_index WHERE path=?', (str(path),))
         db.executemany('INSERT INTO subtitle_extended_index(path,source,type_index,external_path,codec,encoding,markup,damage) VALUES(?,?,?,?,?,?,?,?)', values)
-        db.execute("INSERT OR REPLACE INTO subtitle_extended_media(path,modified,size,markup_version,indexed_at) VALUES(?,?,?,3,datetime('now'))", (str(path), item['modified'], item['size']))
+        db.execute("INSERT OR REPLACE INTO subtitle_extended_media(path,modified,size,markup_version,indexed_at) VALUES(?,?,?,?,datetime('now'))", (str(path), item['modified'], item['size'], MARKUP_VERSION))
 
 
 processors = {'core': index_core, 'subtitles': index_subtitles}

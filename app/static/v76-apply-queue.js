@@ -15,25 +15,30 @@
     // action is the only commit point.
     if(window.activeTvDraftForPath?.(state.selectedPath)?.session_id){
       delete form.dataset.applyModeConfirmed;
-      return await applyNow.call(form,event);
+      window.beginGlobalBusyImmediate?.('Applying stream changes to the TV-show draft');
+      try{return await applyNow.call(form,event)}finally{window.endGlobalBusy?.()}
     }
     if(form.dataset.applyModeConfirmed==="now"){
       delete form.dataset.applyModeConfirmed;
-      const result=await applyNow.call(form,event);
-      if(!$('#stream-dialog')?.open)resetEditorAfterCommit();
-      return result;
+      window.beginGlobalBusyImmediate?.('Applying stream changes');
+      try{const result=await applyNow.call(form,event);if(!$('#stream-dialog')?.open)resetEditorAfterCommit();return result}finally{window.endGlobalBusy?.()}
     }
     const mode=await chooseMode();
     if(!mode)return;
-    if(mode==='now'){
-      const result=await applyNow.call(form,event);
-      if(!$('#stream-dialog')?.open)resetEditorAfterCommit();
-      return result;
-    }
+    // Hold the overlay across request preparation, acknowledgement and the
+    // refreshed editor, not just the HTTP call. A slow signature check must
+    // never look like a missed click. The editor lifecycle also blocks submit.
+    window.beginGlobalBusyImmediate?.(mode==='queue'?'Adding stream changes to the queue':'Applying stream changes');
     try{
-      window.beginGlobalBusy?.('Adding stream changes to the queue');
+      if(mode==='now'){
+        const result=await applyNow.call(form,event);
+        if(!$('#stream-dialog')?.open)resetEditorAfterCommit();
+        return result;
+      }
+      window.setGlobalBusyProgress?.(0,3,'Preparing the queue request','Keeping this edit locked until the server acknowledges it');
       if(typeof window.collectCompleteQueuedEdit!=='function')throw new Error('Could not prepare the complete edit payload');
       const payload=window.collectCompleteQueuedEdit(),label=$('#selected-file')?.textContent||payload.edit.path;
+      window.setGlobalBusyProgress?.(1,3,'Recording stream changes','Checking the source identity and accepting one job for this request');
       const task=await api('/api/v65/queue',{method:'POST',body:JSON.stringify({task_type:'media_edit',payload,label:`Edit ${label}`})});
       if(!task?.id)throw new Error('The queue did not return a task id');
       resetEditorAfterCommit();
@@ -43,13 +48,15 @@
       // proposed values disappear and Close/Next can be used without a stale
       // pending-change prompt.
       try{
+        window.setGlobalBusyProgress?.(2,3,`Task #${task.id} queued`,'Refreshing stream properties; the queued proposal has been cleared');
         await openEditor(queuedPath,label);
       }finally{
         // Queueing is also a commit of the editor proposal.  Reloading the
         // media is informational and must never restore the old dirty state.
         window.markEditorCommittedClean?.();
       }
-      toast(`Stream changes added to queue as task #${task.id}`);
+      window.setGlobalBusyProgress?.(3,3,`Task #${task.id} queued`,'You can close this media, navigate, or make another edit');
+      toast(task.deduplicated?`These changes are already queued as task #${task.id}; no duplicate job created`:`Stream changes added to queue as task #${task.id}`);
     }catch(error){toast(error.message,true)}finally{window.endGlobalBusy?.()}
   };
 })();

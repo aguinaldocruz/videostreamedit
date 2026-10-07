@@ -1,5 +1,30 @@
 # Image subtitle conversion roadmap
 
+## Decision: deferred (2026-10-03)
+
+Image-subtitle OCR conversion is **not approved for routine or automatic use**.
+Keep PGS/VobSub streams in their original form, including when cached for
+future operations. Do not replace a media subtitle with OCR-generated SRT or
+start a catalog-wide conversion. The existing manual conversion/staging code
+is retained for future development, not enabled as a scheduled workflow.
+
+A read-only test on *True Grit* (1969), English PGS subtitle 1, produced
+1,401 SRT cues with the installed English Tesseract model. The official
+`tessdata_best` English model improved some words and punctuation but still
+misread standalone `I` as `|`; pipe-character occurrences fell only from
+370 to 334. Both test SRTs are under `/data`, while the movie and original
+subtitle remain unchanged. Passing SRT syntax and cue counts is not enough to
+establish transcription quality. In this VobSub2SRT build, supplying the best
+model through `--tesseract-data` crashed; placing it at Tesseract's normal
+model path inside a disposable container worked. That workaround is a test
+result, not a production configuration change.
+
+Before reconsidering OCR conversion: compare against manually transcribed
+sample frames, test direct OCR of native PGS images as well as the VobSub
+intermediate, measure errors across languages/fonts, and require explicit
+review of the generated SRT before any media replacement. Keep rollback and
+source verification mandatory. No OCR model change is deployed to the app.
+
 ## Current high-level solution
 
 VideoStreamEdit converts graphical subtitle streams to SRT through format-specific paths. The original media is preserved in `/config/ocr-staging` immediately before remuxing, and the converted media remains reviewable. Approval removes rollback data; rollback restores the original container.

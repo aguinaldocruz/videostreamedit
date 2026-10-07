@@ -4,6 +4,7 @@ import ast
 import shutil
 import subprocess
 import tempfile
+import sys
 from pathlib import Path
 
 
@@ -11,11 +12,14 @@ if not shutil.which("ffmpeg"):
     raise SystemExit("ffmpeg is required for the subtitle batch test")
 
 root = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(root))
+from app.subtitle_text_decode import decode_complete_srt
 cache_tree = ast.parse((root / "app/subtitle_cache.py").read_text())
 track_type = next(node for node in cache_tree.body if isinstance(node, ast.ClassDef) and node.name == "TextSubtitle")
 worker_tree = ast.parse((root / "app/subtitle_cache_worker.py").read_text())
 batch = next(node for node in worker_tree.body if isinstance(node, ast.FunctionDef) and node.name == "_extract_embedded_batch")
 scope = {"dataclass": __import__("dataclasses").dataclass, "Path": Path,
+         "decode_complete_srt": decode_complete_srt,
          "subprocess": subprocess, "tempfile": tempfile, "MAX_TEXT_BYTES": 32 * 1024 * 1024}
 exec(compile(ast.Module(body=[track_type, batch], type_ignores=[]), "subtitle-cache-batch", "exec"), scope)
 

@@ -28,6 +28,8 @@ from app.postgres_store import (
 from app.v11 import column_exists, connection
 from app.v51 import SubtitleCachePending
 from app.v79 import app
+from app.subtitle_html import MARKUP_VERSION
+from app import subtitle_cache as _subtitle_cache  # Register schema upgrades before index workers start.
 
 logger = logging.getLogger("uvicorn.error")
 JOBS = ("core", "subtitles")
@@ -128,13 +130,16 @@ def _indexed_fingerprint_current(db, job: str, path: str) -> bool:
         ).fetchone()
         return bool(row and int(row["modified"] or -1) == int(stat.st_mtime)
                     and int(row["size"] or -1) == int(stat.st_size)
-                    and int(row["markup_version"] or 0) >= 3)
+                    and int(row["markup_version"] or 0) >= MARKUP_VERSION)
     return False
 
 
 SUBTITLE_CACHE_READY_SQL = (
-    "EXISTS (SELECT 1 FROM subtitle_cache_media c WHERE c.path=q.path "
-    "AND c.format_version=? AND c.expected_tracks=c.cached_tracks)"
+    "(EXISTS (SELECT 1 FROM subtitle_cache_media c WHERE c.path=q.path "
+    "AND c.format_version=? AND c.expected_tracks=c.cached_tracks) "
+    "OR (EXISTS (SELECT 1 FROM media_stream_index_state s WHERE s.path=q.path) "
+    "AND NOT EXISTS (SELECT 1 FROM media_stream_index i WHERE i.path=q.path "
+    "AND i.stream_type IN ('subtitle','external'))))"
 )
 
 
@@ -146,15 +151,22 @@ def _verified_subtitle_inspection_cache(media: Path) -> tuple[str, dict, dict] |
 
     metadata = probe(media)
     signature, tracks = text_track_manifest(media, metadata)
+    if not tracks:
+        # Empty inspections require no text cache. Recheck the actual manifest
+        # so a newly arrived sidecar cannot be mistaken for an empty media.
+        return signature, metadata, {}
     cached = get_valid_media(str(media), signature)
     expected = {(track["source"], track["type_index"], track["external_path"]) for track in tracks}
     if cached is None or {track.key for track in cached} != expected:
         return None
     text_cache = {
         (("embedded", track.type_index) if track.source == "embedded" else ("external", track.external_path)):
-        (track.text if track.source == "embedded" else (track.text, "UTF-8 (cached)"))
+        (track.text if track.source == "embedded" else (track.text, track.source_encoding + " (cached)"))
         for track in cached
     }
+    for track in cached:
+        if track.source == "embedded":
+            text_cache[("source_encoding", "embedded", track.type_index)] = track.source_encoding
     return signature, metadata, text_cache
 
 
@@ -291,7 +303,7 @@ def pending_index_items(job: str) -> list[dict]:
         return []
     import app.v79 as tv_index
     table = {"core": "media_stream_index_state", "subtitles": "subtitle_extended_media"}[job]
-    markup_stale = " OR coalesce(cached.markup_version,0) != 3" if job == "subtitles" else ""
+    markup_stale = f" OR coalesce(cached.markup_version,0) != {MARKUP_VERSION}" if job == "subtitles" else ""
     signature_select = ", cached.content_signature AS content_signature" if job == "core" else ""
     if job == "core":
         freshness = "cached.path IS NULL OR (cached.modified_ns / 1000000000) != media.modified OR cached.size != media.size"
@@ -345,8 +357,24 @@ def pending_index_items(job: str) -> list[dict]:
 
 def prune_orphaned_index_entries() -> dict[str, int]:
     """Remove queue/index records for media no longer present in Plex catalog."""
+    from app.job_outcomes import require_media_file, PermanentMediaMissing, finalize_missing_workflow
+    from app.postgres_store import _lock_workflow_mutation
     with connection() as db:
-        queue = db.execute("UPDATE index_task_queue SET status='cancelled',error='Removed from Plex catalog',finished_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE status IN ('pending','failed') AND path NOT IN (SELECT path FROM plex_media)").rowcount
+        _lock_workflow_mutation(db.raw)
+        obsolete = db.execute("SELECT id,job,path,group_id FROM index_task_queue WHERE status IN ('pending','failed') AND COALESCE(error,'') NOT LIKE 'Permanent failure [media_missing]:%' AND path NOT IN (SELECT path FROM plex_media)").fetchall()
+        for item in obsolete:
+            try:
+                require_media_file(item['path'])
+            except PermanentMediaMissing as exc:
+                message = str(exc)
+                fail_task_stage(item['group_id'], f"index:{item['job']}", item['path'], message, item['id'], db=db.raw, allow_pending=True)
+                finalize_missing_workflow(db.raw, item['group_id'], item['path'], message)
+                db.execute("UPDATE index_task_queue SET status='failed',error=?,finished_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE id=?", (message,item['id']))
+            except (OSError, RuntimeError):
+                # Catalog removal isn't proof of filesystem deletion during
+                # a storage outage. Cancel discovery, without a deletion claim.
+                pass
+        queue = db.execute("UPDATE index_task_queue SET status='cancelled',error='Removed from Plex catalog',finished_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE status IN ('pending','failed') AND COALESCE(error,'') NOT LIKE 'Permanent failure [media_missing]:%' AND path NOT IN (SELECT path FROM plex_media)").rowcount
         tables = (
             "media_stream_index", "media_stream_index_state",
             "media_video_title", "external_subtitle_index", "external_sidecar_index_state",
@@ -378,12 +406,12 @@ def migrate_index_paths(changes: dict[str, str], reason: str = "Plex media path 
                 if duplicate:
                     cursor = db.execute(
                         "UPDATE index_task_queue SET status='cancelled',error=?,finished_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP "
-                        "WHERE job=? AND path=? AND status IN ('pending','failed')",
+                        "WHERE job=? AND path=? AND status IN ('pending','failed') AND COALESCE(error,'') NOT LIKE 'Permanent failure [media_missing]:%'",
                         (f"Superseded by current Plex path: {new}", job, old),
                     )
                 else:
                     candidates = db.execute(
-                        "SELECT id FROM index_task_queue WHERE job=? AND path=? AND status IN ('pending','failed') ORDER BY id",
+                        "SELECT id FROM index_task_queue WHERE job=? AND path=? AND status IN ('pending','failed') AND COALESCE(error,'') NOT LIKE 'Permanent failure [media_missing]:%' ORDER BY id",
                         (job, old),
                     ).fetchall()
                     cursor = db.execute(
@@ -504,12 +532,26 @@ def prepare_index_check(task_id: int, payload: dict) -> dict:
     import app.v65 as generic_queue
 
     job = validate_jobs([str(payload.get("job") or "")])[0]
-    generic_queue.update_progress(task_id, 0, 1, f"Checking {job} index fingerprints")
-    items = pending_index_items(job)
-    added = enqueue_many(job, items, "Incremental check") if items else 0
-    generic_queue.update_progress(task_id, 1, 1, f"Check complete; {added} item(s) queued")
-    logger.info("task_queue event=index_check_prepared id=%d index=%s discovered=%d added=%d", task_id, job, len(items), added)
-    return {"job": job, "discovered": len(items), "queued": added}
+    from app import scheduled_job_log as job_log
+    run_id = job_log.begin(job, payload.get('_schedule_source', 'manual'), task_id=task_id)
+    job_log.running(run_id, 'Checking catalog fingerprints; unchanged media is not reprocessed')
+    try:
+        generic_queue.update_progress(task_id, 0, 1, f"Checking {job} index fingerprints")
+        items = pending_index_items(job)
+        reason = f"Incremental check · request #{task_id}"
+        added = enqueue_many(job, items, reason) if items else 0
+        if added:
+            with connection() as db:
+                rows = db.execute('SELECT id,path FROM index_task_queue WHERE job=? AND reason=? ORDER BY id', (job, reason)).fetchall()
+                job_log.record_many(run_id, [{'message': 'Index refresh queued', 'path': row['path'],
+                                             'queue_kind': 'index', 'task_id': row['id']} for row in rows], db=db)
+        generic_queue.update_progress(task_id, 1, 1, f"Check complete; {added} item(s) queued")
+        job_log.finish(run_id, 'completed', f'Discovery complete · {len(items)} media need refresh · {added} queued · {len(items)-added} already pending. Index processing continues in the index queue.')
+        logger.info("task_queue event=index_check_prepared id=%d index=%s discovered=%d added=%d", task_id, job, len(items), added)
+        return {"job": job, "discovered": len(items), "queued": added}
+    except Exception as exc:
+        job_log.finish(run_id, 'failed', str(exc))
+        raise
 
 
 def prepare_index_rebuild(task_id: int, payload: dict) -> dict:
@@ -597,7 +639,7 @@ def detection_scope_for_edit(edit: dict, html_cleanups: list | None = None, remu
     if html_cleanups:
         scope["subtitle_indices"] = "all"
     # A remux without explicit stream information is potentially structural.
-    if remuxed and not scope:
+    if remuxed and not scope and not edit.get('subtitle_color'):
         scope["audio_indices"] = "all"
         scope["subtitle_indices"] = "all"
     normalized = {}
@@ -662,6 +704,11 @@ def invalidate_language_detection(path: str, scope: dict | None = None) -> bool:
                 marks = ",".join("?" for _ in subtitle)
                 removed += db.execute(f"DELETE FROM portuguese_language_detection WHERE path=? AND source='embedded' AND type_index IN ({marks})", [path, *subtitle]).rowcount
                 db.execute(f"DELETE FROM subtitle_detection_stream_state WHERE path=? AND source='embedded' AND type_index IN ({marks})", [path, *subtitle])
+        external = scope.get('subtitle_external_paths') or []
+        if external and not scope.get('subtitle_recompare'):
+            marks = ','.join('?' for _ in external)
+            removed += db.execute(f"DELETE FROM portuguese_language_detection WHERE path=? AND source='external' AND external_path IN ({marks})", [path, *external]).rowcount
+            db.execute(f"DELETE FROM subtitle_detection_stream_state WHERE path=? AND source='external' AND external_path IN ({marks})", [path, *external])
         audio = scope.get("audio_indices")
         if audio and not scope.get('audio_recompare'):
             if audio == "all":
@@ -686,6 +733,11 @@ def invalidate_language_detections(paths: list[str]) -> int:
 def flush_deferred_language_detection(path: str, family: str | None = None) -> dict:
     ensure_queue_tables()
     from app.detection_policy import is_final
+    with connection() as db:
+        current = db.execute('SELECT 1 FROM plex_media WHERE path=?', (path,)).fetchone()
+        if not current:
+            db.execute('DELETE FROM deferred_language_detection WHERE path=?', (path,))
+            return {'path': path, 'queued': False, 'skipped': 'obsolete_catalog_path'}
     if is_final(path):
         with connection() as db:
             db.execute('DELETE FROM deferred_language_detection WHERE path=?', (path,))
@@ -704,7 +756,14 @@ def flush_deferred_language_detection(path: str, family: str | None = None) -> d
     audio_scope = all_audio_scope if family in (None, "audio") else {}
     added = 0
     if subtitle_scope:
-        added += int(enqueue("subtitles", path, "Scheduled targeted subtitle language detection", subtitle_scope))
+        with connection() as db:
+            known = db.execute('SELECT 1 FROM media_stream_index_state WHERE path=?', (path,)).fetchone()
+            has_subtitles = db.execute("SELECT 1 FROM media_stream_index WHERE path=? AND stream_type IN ('subtitle','external') LIMIT 1", (path,)).fetchone()
+        # Broad change scopes can include subtitles even on audio/video-only
+        # media. Do not create a detector job that has nothing to detect.
+        from app.v5 import external_subtitles
+        if not known or has_subtitles or external_subtitles(Path(path)):
+            added += int(enqueue("subtitles", path, "Scheduled targeted subtitle language detection", subtitle_scope))
     from app.v65 import enqueue as enqueue_task
     audio_payload = {"path": path, "stream_indices": audio_scope.get("audio_indices", "all")}
     if audio_scope.get('audio_recompare'): audio_payload['recompare'] = True
@@ -782,12 +841,17 @@ def request_media_indexes(path: str, names: list[str], reason: str, *, defer_det
 def queue_state(job: str) -> dict:
     with connection() as db:
         counts = {row["status"]: row["n"] for row in db.execute("SELECT status,count(*) n FROM index_task_queue WHERE job=? GROUP BY status", (job,))}
-        waiting_cache = 0
+        waiting_cache = blocked_cache = 0
         if job == "subtitles":
             from app.subtitle_cache import CACHE_FORMAT_VERSION
             waiting_cache = int(db.execute(
                 "SELECT count(*) FROM index_task_queue q WHERE q.job=? AND q.status='pending' "
                 f"AND NOT {SUBTITLE_CACHE_READY_SQL}", (job, CACHE_FORMAT_VERSION),
+            ).fetchone()[0])
+            blocked_cache = int(db.execute(
+                "SELECT count(*) FROM index_task_queue q JOIN subtitle_cache_failure f ON f.path=q.path "
+                f"WHERE q.job=? AND q.status='pending' AND NOT {SUBTITLE_CACHE_READY_SQL}",
+                (job, CACHE_FORMAT_VERSION),
             ).fetchone()[0])
         setting = db.execute("SELECT paused,stop_requested FROM index_queue_settings WHERE job=?", (job,)).fetchone()
         # Keep each status visible: a large pending backlog must not crowd all
@@ -804,6 +868,24 @@ def queue_state(job: str) -> dict:
             "FROM index_task_queue WHERE job=?) recent WHERE state_rank<=250 ORDER BY id DESC",
             (job,),
         )]
+        if job == 'subtitles' and waiting_cache:
+            pending_ids = [item['id'] for item in items if item['status'] == 'pending']
+            details = db.execute(
+                "SELECT q.id,f.error AS cache_error FROM index_task_queue q "
+                "LEFT JOIN subtitle_cache_failure f ON f.path=q.path "
+                f"WHERE q.id=ANY(?) AND NOT {SUBTITLE_CACHE_READY_SQL}",
+                (pending_ids, CACHE_FORMAT_VERSION),
+            ).fetchall()
+            by_id = {row['id']: row for row in details}
+            for item in items:
+                if item['id'] in by_id:
+                    error = by_id[item['id']]['cache_error']
+                    item['display_status'] = 'blocked_cache' if error else 'waiting_cache'
+                    item['cache_error'] = error
+                    item['error'] = ('Blocked: subtitle cache failed; review the media or cache failure. ' + str(error)) if error else 'Waiting for the next subtitle cache run; inspection requires a valid cached subtitle.'
+                    item['review_path'] = item['path']
+        for item in items:
+            item['permanent_failure'] = str(item.get('error') or '').startswith('Permanent failure [media_missing]:')
         status_rank = {"running": 0, "pending": 1, "failed": 2, "succeeded": 3, "cancelled": 4}; items.sort(key=lambda row: (status_rank.get(row["status"], 5), -row["id"]))
     # Keep status polling O(1) over the queue.  The legacy status routine
     # rescans the entire media catalog and filesystem on every refresh, which
@@ -824,10 +906,13 @@ def queue_state(job: str) -> dict:
             continue
     remaining = counts.get("pending", 0) + counts.get("running", 0)
     rate = len(durations) / sum(durations) if durations else 0.0
-    eta_seconds = round(remaining / rate) if rate > 0 and remaining else None
+    runnable = max(0, remaining - waiting_cache)
+    eta_seconds = round(runnable / rate) if rate > 0 and runnable else None
     return {"running": running, "paused": bool(setting["paused"]),
             "queued": counts.get("pending", 0), "failed": counts.get("failed", 0),
             "waiting_cache": waiting_cache,
+            "blocked_cache": blocked_cache, "runnable": runnable,
+            "cancelled": counts.get('cancelled', 0),
             "completed": counts.get("succeeded", 0), "indexed": indexed,
             "total": remaining, "eta_seconds": eta_seconds, "rate_per_second": rate,
             "current": "Index queue", "items": items, "queue": True}
@@ -914,21 +999,8 @@ def worker(job: str) -> None:
         stage_started = False
         try:
             media = Path(path)
-            if not media.is_file():
-                recovered = resolve_moved_plex_path(path)
-                if not recovered:
-                    from app.v65 import enqueue as enqueue_task
-                    enqueue_task("plex_sync", {"rebuild": False, "source": "missing-index-media"}, "Plex sync requested for missing indexed media", deduplicate=True)
-                    with connection() as db:
-                        db.execute("UPDATE index_task_queue SET attempts=attempts+1,updated_at=CURRENT_TIMESTAMP WHERE id=?", (row["id"],))
-                    row = dict(row)
-                    row["attempts"] = int(row.get("attempts") or 0) + 1
-                    raise FileNotFoundError(f"Media file is not accessible and Plex has no accessible replacement: {path}")
-                path = recovered
-                media = Path(path)
-                with connection() as db:
-                    db.execute("UPDATE index_task_queue SET path=?,reason=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (path, "Recovered moved Plex media", row["id"]))
-                logger.info("index_queue=%s event=item_path_recovered id=%d file=%s", job, row["id"], path.replace("\n", "\\n"))
+            from app.job_outcomes import require_media_file
+            require_media_file(media)
             cache_signature = None
             inspection_data = None
             if job == "subtitles":
@@ -1022,6 +1094,11 @@ def worker(job: str) -> None:
                 finish_task_stage(row_group_id, f"index:{job}", path, {"job": job, "path": path}, row["id"])
                 if job in {"core", "subtitles"}:
                     _queue_index_dependents(path, job, "Incremental dependency")
+            if not changed:
+                try:
+                    retire_superseded_index_failures(path)
+                except Exception as exc:
+                    logger.warning("index_queue event=old_failure_reconcile_failed path=%s error=%s", path, exc)
             elif stage_started and changed:
                 fail_task_stage(row_group_id, f"index:{job}", path, "Media changed during indexing; retry pending", row["id"])
                 reset_task_stage_for_retry(row_group_id, row["id"])
@@ -1048,23 +1125,78 @@ def worker(job: str) -> None:
             logger.info("index_queue=subtitles event=deferred_for_cache id=%d file=%s", row["id"], path.replace("\n", "\\n"))
         except Exception as exc:
             message = str(getattr(exc, "detail", exc))[-3000:]
-            if stage_started:
+            from app.job_outcomes import PermanentMediaMissing, require_media_file, finalize_missing_workflow
+            permanent_missing = isinstance(exc, PermanentMediaMissing)
+            if isinstance(exc, FileNotFoundError):
                 try:
-                    fail_task_stage(row_group_id, f"index:{job}", path, message, row["id"])
-                except Exception as workflow_exc:
-                    logger.exception("workflow event=index_stage_failure_persist_failed id=%d error=%s", row["id"], workflow_exc)
+                    require_media_file(path)
+                except PermanentMediaMissing as missing:
+                    message, permanent_missing = str(missing), True
+                except (OSError, RuntimeError):
+                    pass
             # Retry transient filesystem/tool/Plex-path failures a bounded
             # number of times.  This prevents a temporary outage from losing
             # the index request while guaranteeing that bad media cannot loop
             # forever; terminal failures remain visible for manual retry.
-            retry = int(row["attempts"]) < 3 and "Not Found" not in message and "404" not in message
+            retry = not permanent_missing and int(row["attempts"]) < 3 and "Not Found" not in message and "404" not in message
             with connection() as db:
+                fail_task_stage(row_group_id, f"index:{job}", path, message, row["id"], db=db.raw, allow_pending=True)
+                if permanent_missing:
+                    finalize_missing_workflow(db.raw, row_group_id, path, message)
                 if retry:
                     db.execute("UPDATE index_task_queue SET status='pending',error=?,started_at=NULL,updated_at=CURRENT_TIMESTAMP WHERE id=?", (f"Retry {row['attempts']}/3: {message}", row["id"]))
                 else:
                     db.execute("UPDATE index_task_queue SET status='failed',error=?,finished_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE id=?", (message, row["id"]))
             logger.warning("index_queue=%s event=item_%s id=%d attempt=%d error=%s file=%s", job, "retry" if retry else "failed", row["id"], row["attempts"], message.replace("\n", " ")[-500:], path.replace("\n", "\\n"))
 
+
+
+def retire_superseded_index_failures(path: str | None = None) -> int:
+    """Retire obsolete failures only when a later success is still current.
+
+    Do not retry/delete history or touch recoverable workflows. A failed index
+    before a catalog sync must not keep a successfully indexed media in error.
+    """
+    if os.getenv("DATABASE_BACKEND", "sqlite").lower() != "postgres":
+        return 0
+    from app.postgres_store import _lock_workflow_mutation
+    with connection() as db:
+        _lock_workflow_mutation(db.raw)
+        rows = db.execute("""SELECT q.id,q.job,q.path,q.group_id,
+                (SELECT max(n.id) FROM index_task_queue n WHERE n.path=q.path
+                    AND n.job=q.job AND n.id>q.id AND n.status='succeeded') AS newer_id
+            FROM index_task_queue q
+            WHERE q.status='failed' AND EXISTS (SELECT 1 FROM plex_media p WHERE p.path=q.path)
+              AND EXISTS (SELECT 1 FROM index_task_queue n WHERE n.path=q.path
+                  AND n.job=q.job AND n.id>q.id AND n.status='succeeded')
+              AND NOT EXISTS (SELECT 1 FROM workflow_artifacts a WHERE a.group_id::text=q.group_id)
+              AND NOT EXISTS (SELECT 1 FROM workflow_luws u WHERE u.group_id::text=q.group_id
+                  AND u.status NOT IN ('committed','rolled_back','cancelled','obsolete'))
+              AND NOT EXISTS (SELECT 1 FROM workflow_stages s WHERE s.group_id::text=q.group_id
+                  AND s.status='running')""" + (" AND q.path=?" if path else ""), (path,) if path else ()).fetchall()
+        retired = 0
+        groups = set()
+        for row in rows:
+            if not _indexed_fingerprint_current(db, row["job"], row["path"]):
+                continue
+            reason = f"Superseded by successful index job #{row['newer_id']}; current index verified"
+            retired += db.execute("UPDATE index_task_queue SET status='cancelled',error=?,"
+                                  "finished_at=COALESCE(finished_at,?),updated_at=CURRENT_TIMESTAMP "
+                                  "WHERE id=? AND status='failed'",
+                                  (reason, datetime.now().astimezone().isoformat(), row["id"])).rowcount
+            db.execute("UPDATE workflow_stages SET status='cancelled',error=?,finished_at=COALESCE(finished_at,now()),updated_at=now() "
+                       "WHERE task_type=? AND payload->>'task_id'=? AND status IN ('failed','blocked','pending')",
+                       (reason, f"index:{row['job']}", str(row["id"])))
+            if row["group_id"]:
+                groups.add(row["group_id"])
+        for group in groups:
+            db.execute("""UPDATE workflow_groups g SET status='cancelled',finished_at=COALESCE(finished_at,now()),updated_at=now()
+                WHERE g.group_id::text=? AND g.status IN ('failed','blocked','pending')
+                  AND NOT EXISTS (SELECT 1 FROM workflow_stages s WHERE s.group_id=g.group_id
+                      AND s.status NOT IN ('succeeded','cancelled'))""", (group,))
+    if retired:
+        logger.info("index_queue event=obsolete_failures_retired items=%d", retired)
+    return retired
 
 
 def reconcile_index_workflow_stages() -> dict[str, int]:
@@ -1166,6 +1298,11 @@ def initialize_index_queues() -> None:
                               (SELECT id::text FROM index_task_queue WHERE status <> 'running')""")
         old = db.execute("SELECT id,payload_json FROM task_queue WHERE task_type='media_reindex' AND status IN ('pending','running','failed')").fetchall()
     reconcile_index_workflow_stages()
+    try:
+        retire_superseded_index_failures()
+    except Exception as exc:
+        # Optional history maintenance must never stop a healthy application.
+        logger.warning("index_queue event=old_failure_reconcile_failed error=%s", exc)
     deduplicate_active_index_paths()
     ensure_active_unique_index()
     inherit_existing_index_expedites()
@@ -1317,6 +1454,8 @@ def check_index_queue(job: str) -> dict:
         f"Check {job} index fingerprints",
         deduplicate=True,
     )
+    from app import scheduled_job_log as job_log
+    job_log.begin(job, 'manual', task_id=task['id'])
     logger.info("index_queue=%s event=check_requested generic_task_id=%d", job, task["id"])
     return task
 
@@ -1355,11 +1494,11 @@ def retry_index_item(job: str, task_id: int) -> dict:
     validate_jobs([job])
     with connection() as db:
         updated = db.execute(
-            "UPDATE index_task_queue SET status='pending',attempts=0,error=NULL,started_at=NULL,finished_at=NULL,updated_at=CURRENT_TIMESTAMP WHERE id=? AND job=? AND status='failed'",
+            "UPDATE index_task_queue SET status='pending',attempts=0,error=NULL,started_at=NULL,finished_at=NULL,updated_at=CURRENT_TIMESTAMP WHERE id=? AND job=? AND status='failed' AND COALESCE(error,'') NOT LIKE 'Permanent failure [media_missing]:%'",
             (task_id, job),
         ).rowcount
     if not updated:
-        raise HTTPException(404, "Failed index item was not found or has already changed state")
+        raise HTTPException(409, "This index item cannot be retried. Permanent missing-media failures require a new job if the media returns.")
     with conditions[job]:
         conditions[job].notify_all()
     logger.info("index_queue=%s event=item_retry_requested task_id=%d", job, task_id)
@@ -1380,7 +1519,7 @@ def control_index_queue(job: str, action: str) -> dict:
         elif action == "resume": db.execute("UPDATE index_queue_settings SET paused=0,stop_requested=0 WHERE job=?", (job,))
         elif action == "stop": db.execute("UPDATE index_queue_settings SET stop_requested=1 WHERE job=?", (job,))
         elif action == "delete-failed": db.execute("DELETE FROM index_task_queue WHERE job=? AND status='failed'", (job,))
-        else: db.execute("UPDATE index_task_queue SET status='pending',attempts=0,error=NULL,started_at=NULL,finished_at=NULL,updated_at=CURRENT_TIMESTAMP WHERE job=? AND status='failed'", (job,))
+        else: db.execute("UPDATE index_task_queue SET status='pending',attempts=0,error=NULL,started_at=NULL,finished_at=NULL,updated_at=CURRENT_TIMESTAMP WHERE job=? AND status='failed' AND COALESCE(error,'') NOT LIKE 'Permanent failure [media_missing]:%'", (job,))
     if action == 'delete-failed':
         from app.postgres_store import cleanup_retired_workflow_recovery
         cleanup_retired_workflow_recovery()

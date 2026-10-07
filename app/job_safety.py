@@ -54,6 +54,21 @@ def reconcile_orphans():
         db.execute("SET LOCAL lock_timeout='3s'")
         db.execute("SET LOCAL statement_timeout='20s'")
         _lock_workflow_mutation(db)
+        # A deleted job's unstarted LUW is not recovery work. Retire only
+        # plans that never recorded a mutation; retain all journals/artifacts.
+        retired_luws = db.execute("""UPDATE workflow_luws l SET status='cancelled',
+            current_step='retired',finished_at=now(),updated_at=now(),
+            error='Queue owner removed; unstarted media plan retired'
+            WHERE l.status IN ('planned','preflighted','waiting')
+            AND l.updated_at < now()-interval '5 minutes'
+            AND NOT EXISTS (SELECT 1 FROM task_queue q WHERE replace(q.group_id,'-','')=replace(l.group_id::text,'-',''))
+            AND NOT EXISTS (SELECT 1 FROM index_task_queue q WHERE replace(q.group_id,'-','')=replace(l.group_id::text,'-',''))
+            AND NOT EXISTS (SELECT 1 FROM workflow_groups g WHERE g.group_id=l.group_id AND g.status NOT IN ('failed','cancelled'))
+            AND NOT EXISTS (SELECT 1 FROM workflow_artifacts a WHERE a.group_id=l.group_id)
+            AND NOT EXISTS (SELECT 1 FROM workflow_locks k WHERE k.group_id=l.group_id)
+            AND NOT EXISTS (SELECT 1 FROM workflow_luw_locks k WHERE k.luw_id=l.luw_id)
+            AND NOT EXISTS (SELECT 1 FROM workflow_stages s WHERE s.group_id=l.group_id AND s.status='running')
+            AND NOT EXISTS (SELECT 1 FROM workflow_luw_journal j WHERE j.luw_id=l.luw_id AND (j.kind<>'operation_plan' OR j.committed))""").rowcount
         # Failed historical groups may retain originals, but a deleted child
         # must not continue to look runnable. Preserve the group and artifacts.
         db.execute("""UPDATE workflow_stages s SET status='cancelled',finished_at=now(),updated_at=now(),
@@ -81,7 +96,31 @@ def reconcile_orphans():
             db.execute("UPDATE workflow_stages SET status='cancelled',error='Retired: owning queue job no longer exists',finished_at=now(),updated_at=now() WHERE group_id=ANY(%s) AND status IN ('pending','blocked')", (ids,))
             db.execute("UPDATE workflow_groups SET status='cancelled',error='Retired: owning queue job no longer exists',finished_at=now(),updated_at=now() WHERE group_id=ANY(%s)", (ids,))
             db.execute("UPDATE workflow_luws SET status='cancelled',current_step='retired',finished_at=now(),updated_at=now() WHERE group_id=ANY(%s) AND status IN ('planned','waiting','preflighted')", (ids,))
-    return len(ids)
+    return len(ids) + retired_luws
+
+
+def reconcile_terminal_owners():
+    """Close phantom unstarted stages using the exact terminal queue owner.
+
+    A stage registered after its worker finished must not strand a workflow.
+    Do not infer success from file existence or reopen failed media work.
+    """
+    from app.postgres_store import _lock_workflow_mutation
+    repaired = 0
+    with connection() as db:
+        db.execute("SET LOCAL lock_timeout='3s'")
+        db.execute("SET LOCAL statement_timeout='20s'")
+        _lock_workflow_mutation(db)
+        for table, kind in (('task_queue', 'q.task_type'), ('index_task_queue', "'index:'||q.job")):
+            repaired += db.execute(f"""UPDATE workflow_stages s SET status=q.status,
+                error=CASE WHEN q.status IN ('failed','cancelled') THEN q.error ELSE NULL END,
+                finished_at=COALESCE(s.finished_at,now()),updated_at=now()
+                FROM {table} q WHERE q.id::text=s.payload->>'task_id'
+                AND {kind}=s.task_type
+                AND replace(q.group_id,'-','')=replace(s.group_id::text,'-','')
+                AND q.status IN ('succeeded','failed','cancelled') AND s.status IN ('pending','blocked')
+                AND NOT EXISTS (SELECT 1 FROM workflow_locks k WHERE k.stage_id=s.stage_id)""").rowcount
+    return repaired
 
 
 def reconcile_terminal_groups():
@@ -162,8 +201,12 @@ def replace_prepared(temporary, target, expected):
         os.fsync(fd)
     finally:
         os.close(fd)
+    committed = stamp(target)
+    if any(committed.get(key) != value for key, value in output.items()):
+        raise RuntimeError('Output changed before commit acknowledgement; review before retrying')
     if task_id:
-        record(task_id, 'file:' + str(target.resolve()), {**data, 'after': stamp(target), 'state': 'applied'})
+        record(task_id, 'file:' + str(target.resolve()), {**data, 'after': committed, 'state': 'applied'})
+    return committed
 
 
 def inplace_checkpoint(path, before, *, applied=False):
@@ -182,15 +225,16 @@ def verify_output(saved):
 
 
 def recovery(task_id, task_type, payload):
-    """Return the completed handler receipt, or validate a partial HTML retry."""
+    """Return handler completion, or validate an interrupted subtitle replacement."""
     completed = receipt(task_id, 'handler')
     if completed:
         if completed.get('signature'):
             verify_output(completed)
         return completed, True
-    html = receipt(task_id, 'html') if task_type == 'subtitle_html_cleanup' else None
-    if html:
-        verify_output(html)
+    mutation = (receipt(task_id, 'html') if task_type == 'subtitle_html_cleanup'
+            else receipt(task_id, 'autofix') if task_type == 'subtitle_autofix' else None)
+    if mutation:
+        verify_output(mutation)
         return None, True
     with connection() as db:
         files = db.execute("SELECT data FROM task_execution_receipts WHERE task_id=%s AND (step LIKE 'file:%%' OR step LIKE 'inplace:%%')", (task_id,)).fetchall()
@@ -202,9 +246,10 @@ def recovery(task_id, task_type, payload):
             changed = True
         elif current != data['before']:
             raise RuntimeError('Media changed after an interrupted commit; review recovery before retrying')
-    if changed and task_type != 'subtitle_html_cleanup':
+    if changed and task_type not in {'subtitle_html_cleanup', 'subtitle_autofix'}:
         raise RuntimeError('Output was committed before interruption; review recovery, do not repeat the edit')
-    # HTML removal is idempotent and stream positions are unchanged by cleanup.
+    # HTML is idempotent. Autofix skips only source-bound confirmed file
+    # receipts; it never reruns replacements against already corrected text.
     return None, changed
 
 
@@ -250,12 +295,21 @@ def output_space(directory, required_bytes):
             fcntl.flock(handle, fcntl.LOCK_UN)
 
 
-def run_write_command(command, directory, timeout=3600):
+class WriteCommandError(subprocess.CalledProcessError):
+    """Keep the tool's actual diagnosis visible in queue errors and logs."""
+
+    def __str__(self):
+        detail = (self.stderr or '').strip()
+        return super().__str__() + (f': {detail}' if detail else '')
+
+
+def run_write_command(command, directory, timeout=3600, accepted_returncodes=(0,)):
     """Stop a growing remux before it consumes the protected free-space floor."""
     floor = max(float(os.getenv('WORKFLOW_RESERVED_GB', '2')),
                 float(os.getenv('WORKFLOW_MIN_FREE_GB', '5'))) * 1024**3
     with tempfile.TemporaryFile() as errors:
-        process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=errors)
+        # mkvmerge writes warnings to stdout, unlike FFmpeg. Never discard them.
+        process = subprocess.Popen(command, stdout=errors, stderr=subprocess.STDOUT)
         deadline = time.monotonic() + timeout
         try:
             while process.poll() is None:
@@ -263,11 +317,15 @@ def run_write_command(command, directory, timeout=3600):
                     raise RuntimeError('Output stopped at disk safety reserve; original media retained')
                 if time.monotonic() > deadline:
                     raise subprocess.TimeoutExpired(command, timeout)
+                if os.fstat(errors.fileno()).st_size > 16 * 1024**2:
+                    raise RuntimeError('Output stopped: excessive tool diagnostics; original media retained')
                 time.sleep(0.25)
-            errors.seek(max(0, errors.tell() - 8000))
+            length = os.fstat(errors.fileno()).st_size
+            errors.seek(max(0, length - 8000))
             message = errors.read().decode('utf-8', errors='replace')
-            if process.returncode:
-                raise subprocess.CalledProcessError(process.returncode, command, stderr=message)
+            if process.returncode not in accepted_returncodes:
+                raise WriteCommandError(process.returncode, command, stderr=message)
+            return {'returncode': process.returncode, 'output': message, 'truncated': length > 8000}
         finally:
             if process.poll() is None:
                 process.kill()

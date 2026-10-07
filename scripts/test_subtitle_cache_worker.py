@@ -40,12 +40,15 @@ def connection():
 
 
 scope = {"connect": connection, "hashlib": hashlib, "json": json, "dataclass": dataclass, "Callable": Callable,
-         "CACHE_FORMAT_VERSION": 1, "Path": Path, "MAX_TEXT_BYTES": 32 * 1024 * 1024,
+         "CACHE_FORMAT_VERSION": 1, "IMAGE_CACHE_FORMAT_VERSION": 1,
+         "Path": Path, "MAX_TEXT_BYTES": 32 * 1024 * 1024,
          "TEXT_CODECS": {"subrip"}, "TEXT_SIDECAR_SUFFIXES": {".srt"}}
-extract_names("app/subtitle_cache.py", {"TextSubtitle", "ensure_subtitle_cache_schema", "invalidate_media", "enqueue_media", "enqueue_media_many", "cache_record_complete", "pending_revision", "complete_pending_media", "publish_media", "publish_track", "get_valid_media", "get_valid_track", "manifest_complete"}, scope)
-extract_names("app/subtitle_cache_worker.py", {"_file_identity", "text_track_manifest", "_indexed_text_track_presence", "cache_media", "cached_or_extract_track", "publish_edited_track", "ordered_catalog_candidates"}, scope)
+extract_names("app/subtitle_cache.py", {"TextSubtitle", "ensure_subtitle_cache_schema", "invalidate_media", "enqueue_media", "enqueue_media_many", "cache_record_complete", "pending_revision", "complete_pending_media", "publish_media", "publish_track", "publish_replacement_cache", "get_valid_media", "get_valid_track", "manifest_complete"}, scope)
+extract_names("app/subtitle_cache_worker.py", {"_file_identity", "text_track_manifest", "_indexed_text_track_presence", "cache_media", "cached_or_extract_track", "ordered_catalog_candidates"}, scope)
 extract_names("app/subtitle_cache_worker.py", {"cache_status"}, scope)
 scope["ensure_subtitle_cache_schema"]()
+scope["image_cache_work_required"] = lambda _path: False
+scope["image_track_manifest"] = lambda _media, _metadata=None: ("empty-image-manifest", [])
 
 with TemporaryDirectory() as temp:
     media = Path(temp) / "episode.mkv"
@@ -84,7 +87,11 @@ with TemporaryDirectory() as temp:
     assert scope["cache_status"](media, metadata)["status"] == "needs_refresh"
     scope["invalidate_media"](str(media))  # The sidecar index owns invalidation.
     assert scope["cache_status"](media, metadata)["status"] == "not_cached"
-    scope["publish_edited_track"](media, "embedded", 0, "", "1\n00:00:00,000 --> 00:00:01,000\nEdited\n")
+    signature, tracks = scope["text_track_manifest"](media, metadata)
+    scope["publish_replacement_cache"](str(media), signature, {(t['source'], t['type_index'], t['external_path']) for t in tracks},
+        [scope['TextSubtitle']('embedded', 0, '', 'subrip', "1\n00:00:00,000 --> 00:00:01,000\nEdited\n")],
+        image_before_signature='', image_after_signature='', expected_images=set())
+    scope['enqueue_media'](str(media))  # The caller queues only genuinely missing tracks.
     assert scope["cache_status"](media, metadata)["status"] == "partial"
     assert scope["pending_revision"](str(media)) is not None
     signature, _ = scope["text_track_manifest"](media, metadata)

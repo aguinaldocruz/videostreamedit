@@ -35,6 +35,7 @@ with store.connection() as db, tempfile.TemporaryDirectory() as folder:
         saved = safety.receipt(1, 'file:' + str(path.resolve()))
         assert saved['state'] == 'applied' and path.read_bytes() == b'replacement'
         assert safety.recovery(1, 'subtitle_html_cleanup', {}) == (None, True)
+        assert safety.recovery(1, 'subtitle_autofix', {}) == (None, True)
         try:
             safety.recovery(1, 'media_edit', {})
         except RuntimeError as exc:
@@ -89,14 +90,19 @@ with store.connection() as db, tempfile.TemporaryDirectory() as folder:
         def cleanup(*args, **kwargs):
             calls.append('cleanup')
             return {'changed': True, 'path': str(path)}
-        with patch.object(v68, 'apply_subtitle_cleanup', cleanup), patch.object(v65, 'update_progress'), patch.object(v65, 'media_configuration_signature', return_value=signature), patch.object(v80, 'request_media_indexes'), patch.object(v68, 'register_internal_change_scope', side_effect=RuntimeError('bookkeeping outage')):
+        with patch.object(v68, 'apply_subtitle_cleanups', cleanup), patch.object(v65, 'update_progress'), patch.object(v65, 'media_configuration_signature', return_value=signature), patch.object(v80, 'request_media_indexes'), patch.object(v68, 'register_internal_change_scope', side_effect=RuntimeError('bookkeeping outage')):
             try:
                 v68.process_subtitle_html(1, {'path': str(path), 'cleanups': [{'type_index': 0}]})
             except RuntimeError:
                 pass
-        with patch.object(v68, 'apply_subtitle_cleanup', cleanup), patch.object(v65, 'update_progress'), patch.object(v65, 'media_configuration_signature', return_value=signature), patch.object(v80, 'request_media_indexes'), patch.object(v68, 'register_internal_change_scope'):
+        with patch.object(v68, 'apply_subtitle_cleanups', cleanup), patch.object(v65, 'update_progress'), patch.object(v65, 'media_configuration_signature', return_value=signature), patch.object(v80, 'request_media_indexes'), patch.object(v68, 'register_internal_change_scope'):
             assert v68.process_subtitle_html(1, {'path': str(path), 'cleanups': [{'type_index': 0}]})['cleaned'] == 1
         assert calls == ['cleanup']
+        # Verified HTML replacement needs one output, not an extra full-media
+        # workflow snapshot. Other edit types retain their recovery strategy.
+        with patch.object(store, '_stage_root', side_effect=AssertionError('Unexpected full-size HTML staging')):
+            store.prepare_task_artifact(str(uuid.uuid4()), 1, 'subtitle_html_cleanup', str(path), {})
+            store.prepare_task_artifact(str(uuid.uuid4()), 1, 'subtitle_autofix', str(path), {})
         # Completed index stages must not leave their group marked pending.
         gid = uuid.uuid4()
         db.execute("INSERT INTO workflow_groups(group_id,kind,status) VALUES(%s,'index:core','pending')", (gid,))
@@ -109,6 +115,19 @@ with store.connection() as db, tempfile.TemporaryDirectory() as folder:
         @contextmanager
         def adapted_connection():
             yield adapter
+        from app import subtitle_cache as cache
+        with patch.object(cache, 'connect', adapted_connection):
+            cache.ensure_subtitle_cache_schema()
+            item = cache.TextSubtitle('embedded', 0, '', 'subrip', '1\n00:00:00,000 --> 00:00:01,000\nHello\n')
+            cache.enqueue_media(str(path))
+            revision = cache.pending_revision(str(path))
+            cache.publish_replacement_cache(str(path), 'fresh', {item.key}, [item], image_before_signature='',
+                                            image_after_signature='', expected_images=set())
+            assert cache.reconcile_source_cache(str(path), 'fresh', {item.key: item.codec}, '', set(), revision)
+            assert cache.get_valid_media(str(path), 'fresh') == [item]
+            assert cache.pending_revision(str(path)) is None
+            assert not cache.reconcile_source_cache(str(path), 'changed', {item.key: item.codec}, '', set(), None)
+            assert cache.get_valid_tracks(str(path), 'changed') == [] and cache.pending_revision(str(path)) == 1
         db.execute('CREATE TABLE task_queue_expedite(task_id bigint,expires_at timestamptz)')
         db.execute("INSERT INTO task_queue_expedite VALUES(1,now()+interval '1 hour')")
         db.execute("INSERT INTO index_task_queue(id,job,status,path,expedite_until) VALUES(45,'core','pending','/fixture','2000-01-01T00:00:00+00:00')")

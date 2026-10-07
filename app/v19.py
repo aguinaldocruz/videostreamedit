@@ -35,6 +35,7 @@ from app.preflight_dispatcher import enqueue_bulk_preflight, register_approval_h
 logger = logging.getLogger("videostreamedit")
 _listing_cache: dict[str, tuple[float, object]] = {}
 from app.subtitle_detector_config import SUBTITLE_DETECTOR_VERSION
+from app.subtitle_html import MARKUP_VERSION
 from app.plex_secret import decrypt_token, encrypt_token
 
 
@@ -235,6 +236,8 @@ def edit_video_title(request: VideoTitleEditRequest) -> dict:
         raise HTTPException(503, "mkvpropedit is not installed") from exc
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
         raise HTTPException(422, (getattr(exc, "stderr", None) or "Video track title update failed")[-2000:]) from exc
+    from app.matroska_remux import ensure_front_track_headers
+    ensure_front_track_headers(path, live=True)
     title = request.title.strip(); stat = path.stat()
     with connection() as db:
         db.execute("INSERT OR REPLACE INTO media_video_title(path,title,video_index,modified_ns,size,indexed_at) VALUES(?,?,?,?,?,CURRENT_TIMESTAMP)", (str(path), title, 0, stat.st_mtime_ns, stat.st_size))
@@ -326,7 +329,7 @@ def queued_change_summary(task_type: str, label: str, payload_json: str) -> str:
             changes.append(f"integrate {integrated} external subtitle{'s' if integrated != 1 else ''}")
         return "; ".join(changes[:5]) or label or "Media stream change"
     if task_type == "movie_import":
-        return label or "Import movie and apply stream changes"
+        return label or "Import media and apply stream changes"
     if task_type == "subtitle_html_cleanup":
         return "Remove subtitle HTML tags"
     return label or task_type.replace("_", " ").title()
@@ -402,21 +405,11 @@ def report_blocked_paths() -> set[str]:
                 collect(json.loads(row["payload_json"] or "{}"))
             except (TypeError, ValueError, json.JSONDecodeError):
                 pass
-        # Final Version media remain indexed and viewable, but are excluded from actionable reports.
-        final_notes = db.execute("SELECT entity_type,entity_key FROM media_notes WHERE final_version=1").fetchall()
-        final_entities = {(str(row["entity_type"]), str(row["entity_key"])) for row in final_notes}
-        for row in db.execute("SELECT path,kind,library_key,show_title FROM plex_media WHERE kind IN ('movie','episode')").fetchall():
-            path = str(row["path"])
-            if row["kind"] == "movie":
-                if ("movie", path) in final_entities:
-                    blocked.add(path)
-                continue
-            if ("tv", "episode:" + path) in final_entities:
-                blocked.add(path)
-                continue
-            parent_key = f"{row['library_key']}:{row['show_title'] or 'Unknown show'}"
-            if ("tv", parent_key) in final_entities:
-                blocked.add(path)
+        # Share the same approval rule with detection; avoid loading the whole
+        # catalog just to hide the approved subset. Findings are retained so
+        # unfreezing restores eligibility without needing a catalog rescan.
+        from app.detection_policy import final_paths
+        blocked.update(final_paths(db=db))
     return blocked
 
 
@@ -680,12 +673,13 @@ def image_subtitle_report(kind: str) -> dict:
     placeholders = ",".join("?" for _ in IMAGE_SUBTITLE_CODECS)
     with connection() as db:
         rows = db.execute(
-            f"SELECT path,type_index,stream_type,external_path,language,region,track_name,codec FROM media_stream_index "
+            f"SELECT path,source,type_index,stream_type,external_path,language,region,track_name,codec FROM media_stream_index "
             f"WHERE stream_type IN ('subtitle','external') AND lower(trim(codec)) IN ({placeholders}) "
-            "ORDER BY subtitle_extended_index.path,type_index,external_path",
+            "ORDER BY path,type_index,external_path",
             IMAGE_SUBTITLE_CODECS,
         ).fetchall()
-    rows = [row for row in rows if _detection_row_current(row) and str(row["path"]) not in blocked_paths]
+    # Image membership is a codec finding, not a language-detection finding.
+    rows = [row for row in rows if str(row["path"]) not in blocked_paths]
     active_paths = set()
     with connection() as db:
         active = db.execute("SELECT payload_json FROM preflight_requests WHERE operation_type=? AND status IN ('pending','running')", ("image_subtitle_convert_bulk",)).fetchall()
@@ -758,7 +752,7 @@ def html_subtitle_report(kind: str) -> dict:
         rows = db.execute(
             "SELECT subtitle_extended_index.path,source,type_index,external_path,codec FROM subtitle_extended_index "
             "JOIN subtitle_extended_media inspected ON inspected.path=subtitle_extended_index.path "
-            "WHERE inspected.markup_version>=3 AND markup LIKE ? AND lower(codec) IN (" + placeholders + ") "
+            "WHERE inspected.markup_version>=? AND markup LIKE ? AND lower(codec) IN (" + placeholders + ") "
             "AND NOT EXISTS (SELECT 1 FROM task_queue t "
             "WHERE t.task_type='subtitle_html_cleanup' AND t.status IN ('pending','running') "
             "AND CAST(t.payload_json AS JSONB)->>'path'=subtitle_extended_index.path) "
@@ -766,7 +760,7 @@ def html_subtitle_report(kind: str) -> dict:
             "WHERE p.operation_type='subtitle_html_cleanup' AND p.status IN ('pending','running') "
             "AND p.media_path=subtitle_extended_index.path) "
             "ORDER BY path,type_index,external_path",
-            ("%HTML tags%", *text_codecs),
+            (MARKUP_VERSION, "%HTML tags%", *text_codecs),
         ).fetchall()
     rows = [row for row in rows if str(row["path"]) not in blocked_paths]
     refs_by_path = {}
@@ -838,7 +832,43 @@ def damaged_subtitle_report(kind: str) -> dict:
                               "paths": [ep["path"] for ep in episodes], "episodes": episodes,
                               "streams": [stream for ep in episodes for stream in ep["streams"]]})
     items.sort(key=lambda item: item["title"].casefold())
-    return {"kind": kind, "items": items, "title_count": len(items), "media_count": sum(item["media_count"] for item in items)}
+    from app.subtitle_damage_report import reason_summary
+    return {"kind": kind, "items": items, "title_count": len(items), "media_count": sum(item["media_count"] for item in items),
+            "damage_summary": reason_summary(items)}
+
+
+@app.get('/api/v19/reports/damaged-subtitles/examples')
+def damaged_subtitle_examples(kind: str, reason: str) -> dict:
+    """On-demand evidence, strictly from the current report and complete caches."""
+    from app.subtitle_damage_report import EvidenceRanking, report_tracks, reasons, reason_matches
+    from app.subtitle_cache import CACHE_FORMAT_VERSION
+    from app.v51 import damage_kind
+    report = damaged_subtitle_report(kind)
+    selected = [t for t in report_tracks(report['items']) if reason in reasons(t['damage'])]
+    if not selected:
+        return EvidenceRanking(reason).result(0)
+    ranking = EvidenceRanking(reason)
+    # Small batches bound memory use. No probe/stat/extraction or new jobs.
+    for offset in range(0, len(selected), 64):
+        batch = selected[offset:offset + 64]
+        identities = {(t['path'], t['source'], t['type_index'], t['external_path']): t for t in batch}
+        with connection() as db:
+            db.execute("SET LOCAL statement_timeout='15s'")
+            cached = db.execute('''SELECT c.path,c.source,c.type_index,c.external_path,c.text_content,c.source_encoding
+                FROM jsonb_to_recordset(CAST(? AS jsonb)) AS wanted(path text,source text,type_index int,external_path text)
+                JOIN subtitle_cache_track c ON (c.path,c.source,c.type_index,c.external_path)=
+                    (wanted.path,wanted.source,wanted.type_index,wanted.external_path)
+                JOIN subtitle_cache_media m ON m.path=c.path
+                WHERE m.format_version=? AND m.expected_tracks=m.cached_tracks
+                  AND c.extraction_status IN ('ready','empty')
+                  AND NOT EXISTS (SELECT 1 FROM subtitle_cache_pending p WHERE p.path=c.path)
+                  AND NOT EXISTS (SELECT 1 FROM subtitle_cache_failure f WHERE f.path=c.path)''',
+                (json.dumps(batch), CACHE_FORMAT_VERSION)).fetchall()
+        for row in cached:
+            track = identities[(row['path'], row['source'], row['type_index'], row['external_path'])]
+            current = [reason] if reason_matches(row['text_content'], reason, row['source'], row['source_encoding'], damage_kind) else []
+            ranking.add(track, row['text_content'], row['source_encoding'], current)
+    return ranking.result(len(selected))
 
 
 @app.post("/api/v19/reports/html-subtitles/revalidate")
@@ -1170,7 +1200,15 @@ def duplicate_language_report(kind: str, stream_type: str) -> dict:
                     if groups: episodes.append({"episode": episode.get("name") or Path(path).stem, "path": path, "duplicates": detail(path, groups)})
             if episodes: items.append({"title": str(show["name"]), "root_name": str(show.get("root_name") or ""), "media_count": len(episodes), "episodes": episodes})
     items.sort(key=lambda item: item["title"].casefold())
-    return {"kind": kind, "stream_type": stream_type, "languages": sorted(allowed), "items": items, "title_count": len(items), "media_count": sum(item.get("media_count",1) for item in items)}
+    language_totals = {}
+    for item in items:
+        media_items = item.get("episodes") or [item]
+        for media in media_items:
+            for duplicate in media.get("duplicates", []):
+                bucket = language_totals.setdefault(duplicate["language"], {"language": duplicate["language"], "media_count": 0, "stream_count": 0})
+                bucket["media_count"] += 1
+                bucket["stream_count"] += int(duplicate.get("count", 0))
+    return {"kind": kind, "stream_type": stream_type, "languages": sorted(allowed), "language_counts": sorted(language_totals.values(), key=lambda value: value["language"].casefold()), "items": items, "title_count": len(items), "media_count": sum(item.get("media_count",1) for item in items)}
 
 @app.get("/api/v19/reports/forced-streams")
 def forced_stream_report(kind: str) -> dict:
@@ -1418,6 +1456,8 @@ def report_availability() -> dict:
             "SELECT c.path,c.size,c.modified_ns,p.kind FROM matroska_layout_check c JOIN plex_media p ON p.path=c.path "
             "WHERE c.status='tracks_after_cluster'"
         ).fetchall()
+        layout_rows = [row for row in layout_rows if str(row["path"]) not in blocked
+                       and str(row["path"]) not in pending and str(row["path"]) not in active_layout_remux]
         current_layout_warnings = revalidate_warning_rows(layout_rows)
         for row in layout_rows:
             if str(row["path"]) in current_layout_warnings and str(row["path"]) not in pending and str(row["path"]) not in active_layout_remux:
@@ -1521,7 +1561,7 @@ def report_availability() -> dict:
             (*codecs, "%HTML tags%"),
         ).fetchall():
             path = str(row["path"])
-            if int(row["markup_version"] or 0) >= 3 and "HTML tags" in str(row["markup"] or ""):
+            if int(row["markup_version"] or 0) >= MARKUP_VERSION and "HTML tags" in str(row["markup"] or ""):
                 mark("html", path, row["kind"])
             if row["damage"] and row["damage"] != "None" and path not in pending_subtitles:
                 mark("damaged", path, row["kind"])

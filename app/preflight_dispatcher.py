@@ -27,6 +27,7 @@ logger = logging.getLogger("uvicorn.error")
 _dispatcher_shutdown = threading.Event()
 _dispatcher_condition = threading.Condition()
 _dispatcher_thread: threading.Thread | None = None
+_cleanup_lock = threading.Lock()
 _handlers: dict[str, Callable[[dict[str, Any], dict[str, Any]], dict[str, Any]]] = {}
 _approval_handlers: dict[str, Callable[[dict[str, Any], dict[str, Any]], dict[str, Any]]] = {}
 LEASE_SECONDS = 120
@@ -265,6 +266,9 @@ def _process_bulk(request_id: int, row: Any, payload: dict[str, Any], operation:
         fingerprint = _fingerprint(path)
         fingerprints.append(fingerprint)
         try:
+            if path and not fingerprint.get('exists'):
+                from app.job_outcomes import require_media_file
+                require_media_file(path)
             result = handler(item_payload, fingerprint) if handler else _default_validate(item_payload, fingerprint)
         except Exception as exc:
             result = {"decision": "invalid", "reason": str(exc)}
@@ -304,6 +308,9 @@ def _process(request_id: int) -> None:
         return
     media_path = str(row["media_path"] or payload.get("path") or "")
     fingerprint = _fingerprint(media_path) if media_path else {"path": "", "exists": True}
+    if media_path and not fingerprint.get('exists'):
+        from app.job_outcomes import require_media_file
+        require_media_file(media_path)
     key = _cache_key(operation, media_path, fingerprint, payload)
     result: dict[str, Any] | None = None
     with connection() as db:
@@ -330,10 +337,10 @@ def _process(request_id: int) -> None:
     logger.info("preflight event=completed id=%d operation=%s status=%s cache=%s", request_id, operation, status, bool(result.get("cache_hit")))
 
 
-def _cleanup_if_due() -> None:
+def _cleanup_if_due(force: bool = False, log_id: str | None = None) -> dict | None:
     with connection() as db:
         values = {str(row["key"]): str(row["value"]) for row in db.execute("SELECT key,value FROM preflight_settings").fetchall()}
-    if values.get("cleanup_enabled") != "1":
+    if not force and values.get("cleanup_enabled") != "1":
         return
     try:
         interval = max(1, int(values.get("cleanup_interval_hours", "24")))
@@ -346,17 +353,27 @@ def _cleanup_if_due() -> None:
             due = time.time() - calendar.timegm(time.strptime(last, "%Y-%m-%dT%H:%M:%SZ")) >= interval * 3600
         except ValueError:
             due = True
-    if not due:
+    if not force and not due:
         return
     try:
         days = max(1, int(values.get("retention_days", "30")))
     except ValueError:
         days = 30
     cutoff = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - days * 86400))
-    with connection() as db:
-        deleted = int(db.execute("DELETE FROM preflight_requests WHERE status IN ('approved','skipped','failed','cancelled') AND finished_at IS NOT NULL AND finished_at < ?", (cutoff,)).rowcount or 0)
-        db.execute("INSERT OR REPLACE INTO preflight_settings(key,value) VALUES('last_cleanup_at',?)", (_now(),))
+    from app import scheduled_job_log as job_log
+    with _cleanup_lock:
+        identity = log_id or job_log.begin('preflight_cleanup', 'schedule', status='running')
+        job_log.record(identity, f'Removing finished requests older than {days} days; active requests and media jobs are kept')
+        try:
+            with connection() as db:
+                deleted = int(db.execute("DELETE FROM preflight_requests WHERE status IN ('approved','skipped','failed','cancelled') AND finished_at IS NOT NULL AND finished_at < ?", (cutoff,)).rowcount or 0)
+                db.execute("INSERT OR REPLACE INTO preflight_settings(key,value) VALUES('last_cleanup_at',?)", (_now(),))
+            job_log.finish(identity, 'completed', f'{deleted} old validation records removed · retention {days} days · active work unchanged')
+        except Exception as exc:
+            job_log.finish(identity, 'failed', str(exc))
+            raise
     logger.info("preflight event=scheduled_retention_cleanup deleted=%d retention_days=%d", deleted, days)
+    return {'deleted': deleted, 'retention_days': days}
 
 
 def _worker() -> None:
@@ -501,6 +518,8 @@ def retry_preflight(request_id: int) -> dict[str, Any]:
             raise HTTPException(404, "Preflight request not found")
         if row["status"] not in {"failed", "skipped", "cancelled"}:
             raise HTTPException(409, "Only failed, skipped, or cancelled preflight requests can be retried")
+        if str(row['error'] or '').startswith('Permanent failure [media_missing]:'):
+            raise HTTPException(409, 'This request permanently failed because its media is missing. Create a new request if the media returns.')
         db.execute("UPDATE preflight_requests SET status='pending',error=NULL,result_json=NULL,fingerprint_json=NULL,attempts=0,lease_until=NULL,started_at=NULL,finished_at=NULL,updated_at=? WHERE id=?", (now, request_id))
     with _dispatcher_condition:
         _dispatcher_condition.notify_all()

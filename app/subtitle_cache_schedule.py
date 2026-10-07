@@ -15,8 +15,10 @@ from pydantic import BaseModel, Field
 
 from app.pg_compat import connect
 from app.subtitle_cache import CACHE_FORMAT_VERSION, complete_pending_media, failed_media, invalidate_media, missing_cache_paths, next_pending_media, pending_revision, prioritize_final_media, record_media_failure, retry_failed_media
+from app.subtitle_image_cache import IMAGE_CACHE_FORMAT_VERSION
 from app.subtitle_cache_worker import cache_media, ordered_catalog_candidates
 from app.v2 import app
+from app import scheduled_job_log as job_log
 
 
 logger = logging.getLogger("uvicorn.error")
@@ -130,15 +132,20 @@ def _remaining_work_count() -> int:
             catalog = db.execute("""
                 SELECT count(*) AS n FROM plex_media p
                 LEFT JOIN subtitle_cache_media c ON c.path=p.path
+                LEFT JOIN subtitle_image_cache_media g ON g.path=p.path
                 LEFT JOIN media_stream_index_state s ON s.path=p.path
                 LEFT JOIN subtitle_cache_failure f ON f.path=p.path
                 WHERE f.path IS NULL
-                  AND (c.path IS NULL OR c.format_version!=? OR c.expected_tracks!=c.cached_tracks
+                  AND ((c.path IS NULL OR c.format_version!=? OR c.expected_tracks!=c.cached_tracks
                        OR c.cached_tracks!=(SELECT count(*) FROM subtitle_cache_track t WHERE t.path=p.path))
+                       OR (EXISTS (SELECT 1 FROM media_stream_index i WHERE i.path=p.path
+                           AND i.stream_type='subtitle' AND i.codec IN ('HDMV PGS','VobSub'))
+                           AND (g.path IS NULL OR g.format_version!=? OR g.expected_tracks!=
+                               (SELECT count(*) FROM subtitle_image_cache_track gt WHERE gt.path=p.path))))
                   AND (s.path IS NULL OR EXISTS (
                        SELECT 1 FROM media_stream_index i WHERE i.path=p.path
                          AND i.stream_type IN ('subtitle','external')))
-            """, (CACHE_FORMAT_VERSION,)).fetchone()["n"]
+            """, (CACHE_FORMAT_VERSION, IMAGE_CACHE_FORMAT_VERSION)).fetchone()["n"]
             pending_outside_catalog = db.execute("""
                 SELECT count(*) AS n FROM subtitle_cache_pending q
                 LEFT JOIN plex_media p ON p.path=q.path
@@ -158,14 +165,40 @@ def _final_uncached_paths(db) -> list[str]:
         LEFT JOIN media_notes sn ON p.kind='episode' AND sn.entity_type='tv'
           AND sn.entity_key=p.library_key||':'||COALESCE(p.show_title,'Unknown show')
         LEFT JOIN subtitle_cache_media c ON c.path=p.path
+        LEFT JOIN subtitle_image_cache_media g ON g.path=p.path
         WHERE (COALESCE(n.final_version,0)=1 OR COALESCE(sn.final_version,0)=1)
-          AND (c.path IS NULL OR c.format_version!=? OR c.expected_tracks!=c.cached_tracks)
+          AND ((c.path IS NULL OR c.format_version!=? OR c.expected_tracks!=c.cached_tracks)
+               OR (EXISTS (SELECT 1 FROM media_stream_index i WHERE i.path=p.path
+                           AND i.stream_type='subtitle' AND i.codec IN ('HDMV PGS','VobSub'))
+                   AND (g.path IS NULL OR g.format_version!=? OR g.expected_tracks!=
+                       (SELECT count(*) FROM subtitle_image_cache_track gt WHERE gt.path=p.path))))
           AND (NOT EXISTS (SELECT 1 FROM media_stream_index_state s WHERE s.path=p.path)
                OR EXISTS (SELECT 1 FROM media_stream_index i WHERE i.path=p.path
                           AND i.stream_type IN ('subtitle','external')))
           AND NOT EXISTS (SELECT 1 FROM subtitle_cache_failure f WHERE f.path=p.path)
-    """, (CACHE_FORMAT_VERSION,)).fetchall()
+    """, (CACHE_FORMAT_VERSION, IMAGE_CACHE_FORMAT_VERSION)).fetchall()
     return [str(row["path"]) for row in rows]
+
+
+def _enqueue_uncached_image_media(db) -> int:
+    """Catch image tracks indexed before image caching was introduced.
+
+    The normal catalog cursor may already have passed these files. Enqueue
+    only indexed image media missing a complete image cache, without changing
+    existing pending requests or retrying quarantined failures.
+    """
+    return db.execute("""
+        INSERT INTO subtitle_cache_pending(path)
+        SELECT DISTINCT i.path FROM media_stream_index i
+        JOIN plex_media p ON p.path=i.path
+        LEFT JOIN subtitle_image_cache_media g ON g.path=i.path
+        LEFT JOIN subtitle_cache_failure f ON f.path=i.path
+        WHERE i.stream_type='subtitle' AND i.codec IN ('HDMV PGS','VobSub')
+          AND f.path IS NULL
+          AND (g.path IS NULL OR g.format_version!=? OR g.expected_tracks!=
+              (SELECT count(*) FROM subtitle_image_cache_track gt WHERE gt.path=i.path))
+        ON CONFLICT(path) DO NOTHING
+    """, (IMAGE_CACHE_FORMAT_VERSION,)).rowcount
 
 
 def _worker(run_id: str, budget_minutes: int) -> None:
@@ -180,6 +213,7 @@ def _worker(run_id: str, budget_minutes: int) -> None:
             raise RuntimeError("Another subtitle cache worker already owns the run lease")
         with connect() as db:
             db.execute("UPDATE subtitle_cache_run SET status='running' WHERE run_id=?", (run_id,))
+        job_log.running(run_id, f'Incremental subtitle caching started · {budget_minutes} minute limit · Final Revision first, then newest media')
         deadline = time.monotonic() + budget_minutes * 60
         offset = int(_configuration()["cursor_offset"])
         failed_paths = {item["path"] for item in failed_media()}
@@ -208,6 +242,7 @@ def _worker(run_id: str, budget_minutes: int) -> None:
                         outcome = "skipped" if result["status"] in {"cached", "no_subtitles"} else "processed"
                 except InterruptedError:
                     status = "time_limit" if time.monotonic() >= deadline else "cancelled"
+                    job_log.record(run_id, 'Run stopped safely; this media remains eligible for a later run', path=pending_path)
                     break
                 except Exception as exc:
                     outcome = "failed"
@@ -218,6 +253,8 @@ def _worker(run_id: str, budget_minutes: int) -> None:
                 with connect() as db:
                     db.execute(f"UPDATE subtitle_cache_run SET {outcome}={outcome}+1,last_error=?,current_path='' WHERE run_id=?",
                                (error, run_id))
+                    job_log.record(run_id, error if outcome=='failed' else (f"Subtitle cache saved · {result['tracks']} track(s)" if outcome=='processed' else 'Subtitle cache skipped; already valid or unavailable'),
+                                   level='error' if outcome=='failed' else 'info', path=pending_path, db=db)
                 continue
             paths = ordered_catalog_candidates(limit=100, offset=offset)
             if not paths:
@@ -230,6 +267,7 @@ def _worker(run_id: str, budget_minutes: int) -> None:
                 with connect() as db:
                     db.execute("UPDATE subtitle_cache_schedule SET cursor_offset=? WHERE id=1", (offset,))
                     db.execute("UPDATE subtitle_cache_run SET skipped=skipped+?,cursor_offset=?,current_path='' WHERE run_id=?", (len(paths), offset, run_id))
+                    job_log.record(run_id, f'{len(paths)} catalog items skipped together; cached, no subtitle work, or quarantined', db=db)
                 if len(paths) < 100:
                     with connect() as db:
                         db.execute("UPDATE subtitle_cache_schedule SET cursor_offset=0 WHERE id=1")
@@ -258,6 +296,7 @@ def _worker(run_id: str, budget_minutes: int) -> None:
                     outcome = "skipped" if result["status"] in {"cached", "no_subtitles"} else "processed"
                 except InterruptedError:
                     status = "time_limit" if time.monotonic() >= deadline else "cancelled"
+                    job_log.record(run_id, 'Run stopped safely; this media remains eligible for a later run', path=path)
                     page_completed = False
                     break
                 except Exception as exc:
@@ -270,6 +309,8 @@ def _worker(run_id: str, budget_minutes: int) -> None:
                 with connect() as db:
                     db.execute("UPDATE subtitle_cache_schedule SET cursor_offset=? WHERE id=1", (offset,))
                     db.execute(f"UPDATE subtitle_cache_run SET {outcome}={outcome}+1,cursor_offset=?,last_error=?,current_path='' WHERE run_id=?", (offset, error, run_id))
+                    job_log.record(run_id, error if outcome=='failed' else (f"Subtitle cache saved · {result['tracks']} track(s)" if outcome=='processed' else 'Subtitle cache skipped; already valid or no subtitles'),
+                                   level='error' if outcome=='failed' else 'info', path=path, db=db)
             if page_completed and len(paths) < 100:
                 with connect() as db:
                     db.execute("UPDATE subtitle_cache_schedule SET cursor_offset=0 WHERE id=1")
@@ -289,6 +330,8 @@ def _worker(run_id: str, budget_minutes: int) -> None:
             with connect() as db:
                 db.execute("UPDATE subtitle_cache_run SET status=?,finished_at=?,current_path='',last_error=? WHERE run_id=?",
                            (status, datetime.now(timezone.utc).isoformat(timespec="microseconds"), error, run_id))
+                totals = db.execute('SELECT processed,skipped,failed FROM subtitle_cache_run WHERE run_id=?', (run_id,)).fetchone()
+            job_log.finish(run_id, status, f"{status} · {totals['processed']} media cached · {totals['skipped']} skipped · {totals['failed']} failed" + (f' · Last error: {error}' if error else ''))
         except Exception:
             logger.exception("subtitle_cache event=run_status_save_failed id=%s", run_id)
         if lease:
@@ -312,6 +355,7 @@ def start_run(manual: bool = True) -> dict:
         run_id = uuid.uuid4().hex
         now = datetime.now(timezone.utc).isoformat(timespec="microseconds")
         with connect() as db:
+            image_queued = _enqueue_uncached_image_media(db)
             final_uncached = _final_uncached_paths(db)
             db.execute("INSERT INTO subtitle_cache_run(run_id,status,started_at,run_minutes,cursor_offset) VALUES(?,'pending',?,?,?)",
                        (run_id, now, budget, int(config["cursor_offset"])))
@@ -319,6 +363,9 @@ def start_run(manual: bool = True) -> dict:
             db.execute("DELETE FROM subtitle_cache_run WHERE run_id NOT IN "
                        "(SELECT run_id FROM subtitle_cache_run ORDER BY started_at::timestamptz DESC LIMIT 250) "
                        "AND status NOT IN ('pending','running')")
+        job_log.begin('subtitle_cache', 'manual' if manual else 'schedule', run_id=run_id)
+        if image_queued:
+            logger.info("subtitle_cache event=uncached_images_prioritized media=%d", image_queued)
         if final_uncached:
             prioritized = prioritize_final_media(final_uncached)
             logger.info("subtitle_cache event=final_revision_prioritized media=%d", prioritized)

@@ -1,3 +1,15 @@
 1
 00:00:00,000 --> 00:01:29,000
 <i>Test subtitle overlay</i>
+
+2
+00:00:06,000 --> 00:00:08,000
+At six seconds
+
+3
+00:00:09,000 --> 00:00:11,000
+At nine seconds
+
+4
+00:00:43,000 --> 00:00:47,000
+At forty-three seconds

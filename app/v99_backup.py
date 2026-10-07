@@ -28,6 +28,7 @@ from app.v2 import CONFIG_DIR
 from app import db_bootstrap
 from app.v11 import app, connection
 from app.plex_secret import KEY_PATH
+from app import scheduled_job_log as job_log
 
 logger = logging.getLogger("uvicorn.error")
 _backup_lock = threading.Lock()
@@ -229,12 +230,14 @@ def _set_state(**values) -> None:
     _backup_state.update(values)
 
 
-def _run_create() -> None:
+def _run_create(log_id: str | None = None) -> None:
     global _backup_running
     started = _now().isoformat(timespec="seconds")
     settings = _settings()
     location = Path(settings["location"]).expanduser()
     path_text = ""
+    log_id = log_id or job_log.begin('backup')
+    job_log.running(log_id, 'Checking backup location and free-space reserve')
     try:
         location.mkdir(parents=True, exist_ok=True)
         if not os.access(location, os.W_OK):
@@ -246,6 +249,7 @@ def _run_create() -> None:
         archive = location / f"videostreamedit-backup-{stamp}.tar.gz"
         path_text = str(archive)
         args, env = _connection_parts()
+        job_log.record(log_id, 'Creating a consistent PostgreSQL dump; media files and temporary workflows are excluded')
         with tempfile.TemporaryDirectory(prefix="vse-backup-") as temp:
             dump = Path(temp) / "database.dump"
             merged_env = os.environ.copy(); merged_env.update(env)
@@ -253,6 +257,7 @@ def _run_create() -> None:
             if dump_result.returncode:
                 detail = (dump_result.stderr or dump_result.stdout or "pg_dump failed").strip()
                 raise RuntimeError(detail[-4000:])
+            job_log.record(log_id, f'Database dump completed · {dump.stat().st_size} bytes; packaging protected configuration')
             manifest = {"format": 1, "created_at": started, "database": "videostreamedit", "contains": ["postgresql_dump", "application_encryption_key"], "connection": "not included", "media": "not included", "transient_workflows": "not included"}
             temporary_archive = archive.with_suffix(archive.suffix + ".partial")
             with tarfile.open(temporary_archive, "w:gz") as tar:
@@ -264,6 +269,7 @@ def _run_create() -> None:
                     tar.add(str(KEY_PATH), arcname="config/plex-token.key")
             os.replace(temporary_archive, archive)
         files = _backup_files(str(location))
+        job_log.record(log_id, 'Backup archive saved', path=str(archive))
         for stale in files[10:]:
             try: Path(stale["path"]).unlink()
             except OSError: pass
@@ -273,11 +279,13 @@ def _run_create() -> None:
         with connection() as db:
             db.execute("UPDATE backup_settings SET last_run=?,updated_at=CURRENT_TIMESTAMP WHERE id=1", (finished,))
         logger.info("backup event=created path=%s retained=%d", str(archive), min(len(files), 10))
+        job_log.finish(log_id, 'completed', f'Backup created · {archive.stat().st_size} bytes · {min(len(files),10)} archives retained · {max(0,len(files)-10)} expired archives removed')
     except Exception as exc:
         finished = _now().isoformat(timespec="seconds")
         _record_run("create", path_text, "failed", str(exc), started, finished)
         _set_state(running=False, kind="create", path=path_text, message=str(exc), finished_at=finished)
         logger.exception("backup event=create_failed path=%s", path_text)
+        job_log.finish(log_id, 'failed', str(exc))
     finally:
         _backup_running = False
 
@@ -324,7 +332,7 @@ def _run_restore(path: str) -> None:
         _backup_running = False
 
 
-def _start(kind: str, path: str = "", request: RemoteMigrationRequest | None = None) -> dict:
+def _start(kind: str, path: str = "", request: RemoteMigrationRequest | None = None, source: str = 'manual') -> dict:
     global _backup_running
     with _backup_lock:
         if _backup_running:
@@ -333,7 +341,8 @@ def _start(kind: str, path: str = "", request: RemoteMigrationRequest | None = N
         started = _now().isoformat(timespec="seconds")
         _set_state(running=True, kind=kind, path=path, message="Preparing…", started_at=started, finished_at=None)
         if kind == "create":
-            worker = _run_create
+            log_id = job_log.begin('backup', source)
+            worker = lambda: _run_create(log_id)
         elif kind == "restore":
             worker = lambda: _run_restore(path)
         else:
@@ -430,7 +439,7 @@ def run_backup_scheduler() -> None:
             else:
                 due = frequency != "disabled" and _now().strftime("%H:%M") >= settings["time"]
             if due and not _backup_running:
-                _start("create")
+                _start("create", source='schedule')
         except Exception as exc:
             logger.warning("backup event=scheduler_failed error=%s", str(exc).replace("\n", " ")[-500:])
         threading.Event().wait(30)

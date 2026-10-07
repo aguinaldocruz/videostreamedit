@@ -1,14 +1,18 @@
 let movieImportMode = null, importBrowsePath = '/', importConfig = null;
+let movieImportBusy = false;
+window.isMovieImportBusy = () => movieImportBusy;
 
 function ensureMovieImportUi() {
   if (!$('#movie-import-page-button')) {
-    document.querySelector('header nav').insertAdjacentHTML('beforeend', '<button id="movie-import-page-button" data-page="movie-import" type="button">Import Movies</button>');
+    document.querySelector('header nav').insertAdjacentHTML('beforeend', '<button id="movie-import-page-button" data-page="movie-import" type="button">Import Media</button>');
     $('#movie-import-page-button').onclick = () => {document.querySelectorAll('.page').forEach(page => page.classList.add('hidden'));document.querySelectorAll('header nav button').forEach(button => button.classList.remove('active'));$('#movie-import').classList.remove('hidden');$('#movie-import-page-button').classList.add('active');resetChangedEpisodeSession();loadMovieImport()};
   }
-  if (!$('#movie-import')) document.querySelector('main').insertAdjacentHTML('beforeend', '<section id="movie-import" class="page hidden"><div class="page-title"><div><h2>Import Movies</h2><p>Copy a new movie into a synchronized Plex folder and edit the copied media streams.</p></div><button id="refresh-movie-import">Refresh</button></div><div class="movie-import-layout"><article><h3>1. Choose source movie</h3><p id="import-current-folder" class="import-path"></p><div id="import-browser" class="import-browser"></div></article><article><h3>2. Choose Plex destination</h3><div id="import-destinations" class="import-destinations"></div><div id="import-selection-summary" class="import-selection-summary">Choose a source movie and destination.</div><button type="button" id="import-edit-copy" class="primary" disabled>Edit streams and copy</button></article></div></section>');
-  if (!$('#import-folder-dialog')) document.body.insertAdjacentHTML('beforeend', '<dialog id="import-folder-dialog"><div class="dialog-title"><div><h2>Default movie input folder</h2><code id="import-folder-current">/</code></div><button type="button" class="icon-close" data-close-import-folder>×</button></div><div id="import-folder-list" class="import-folder-list"></div><div class="dialog-actions"><button type="button" data-close-import-folder>Cancel</button><button type="button" id="save-import-folder" class="primary">Use this folder</button></div></dialog>');
-  if (!$('#import-processing-dialog')) document.body.insertAdjacentHTML('beforeend', '<dialog id="import-processing-dialog"><div class="dialog-title"><div><h2>Start movie import</h2><p>Choose how the complete copy and stream-edit operation will be processed.</p></div><button type="button" class="icon-close" data-import-processing="cancel" aria-label="Cancel">×</button></div><div class="dialog-body"><label><input type="checkbox" id="import-remove-original"> Remove the original movie and matching external subtitles only after a successful import</label></div><div class="dialog-actions"><button type="button" data-import-processing="cancel">Cancel</button><button type="button" data-import-processing="queue">Add whole import to queue</button><button type="button" class="primary" data-import-processing="now">Process whole import now</button></div></dialog>');
+  if (!$('#movie-import')) document.querySelector('main').insertAdjacentHTML('beforeend', '<section id="movie-import" class="page hidden"><div class="page-title"><div><h2>Import Media</h2><p>Import a movie or TV episode into its destination folder and edit the copied streams.</p></div><button id="refresh-movie-import">Refresh</button></div><div class="movie-import-layout"><article><h3>1. Choose source media</h3><p id="import-current-folder" class="import-path"></p><div id="import-browser" class="import-browser"></div></article><article><h3>2. Choose Plex destination</h3><div id="import-destinations" class="import-destinations"></div><div id="import-selection-summary" class="import-selection-summary">Choose a source media file and destination.</div><button type="button" id="import-edit-copy" class="primary" disabled>Edit streams and copy</button></article></div></section>');
+  if (!$('#import-folder-dialog')) document.body.insertAdjacentHTML('beforeend', '<dialog id="import-folder-dialog"><div class="dialog-title"><div><h2>Default media input folder</h2><code id="import-folder-current">/</code></div><button type="button" class="icon-close" data-close-import-folder>×</button></div><div id="import-folder-list" class="import-folder-list"></div><div class="dialog-actions"><button type="button" data-close-import-folder>Cancel</button><button type="button" id="save-import-folder" class="primary">Use this folder</button></div></dialog>');
+  if (!$('#import-processing-dialog')) document.body.insertAdjacentHTML('beforeend', '<dialog id="import-processing-dialog"><div class="dialog-title"><div><h2>Start media import</h2><p>Choose how the complete copy and stream-edit operation will be processed.</p></div><button type="button" class="icon-close" data-import-processing="cancel" aria-label="Cancel">×</button></div><div class="dialog-body"><label><input type="checkbox" id="import-remove-original"> Remove the original media and matching external subtitles only after a successful import</label></div><div class="dialog-actions"><button type="button" data-import-processing="cancel">Cancel</button><button type="button" data-import-processing="queue">Add whole import to queue</button><button type="button" class="primary" data-import-processing="now">Process whole import now</button></div></dialog>');
   $('#refresh-movie-import').onclick = loadMovieImport;
+  if (!$('#import-media-kind')) $('#movie-import .page-title').insertAdjacentHTML('afterend', '<label class="import-media-kind">Import type <select id="import-media-kind"><option value="movie">Movie</option><option value="episode">TV episode</option></select><small>For episodes, select the show/season destination and keep SxxExx in the filename.</small></label>');
+  $('#import-media-kind').onchange=()=>{if(movieImportMode)movieImportMode.mediaKind=$('#import-media-kind').value;updateImportSelection()};
   $('#import-edit-copy').onclick = beginMovieImportEdit;
   document.querySelectorAll('[data-close-import-folder]').forEach(button => button.onclick = () => $('#import-folder-dialog').close());
   $('#save-import-folder').onclick = saveImportInputFolder;
@@ -17,7 +21,7 @@ function ensureMovieImportUi() {
 
 function ensureImportSetupCards() {
   const setup = $('#setup');
-  if (!$('#movie-import-settings')) setup.insertAdjacentHTML('beforeend', '<div class="import-setup-grid"><article id="movie-import-settings"><h3>Movie import</h3><p>Choose the folder where new movies arrive inside this container.</p><div id="movie-import-input-path" class="import-path">Not configured</div><button type="button" id="browse-import-input">Choose input folder</button></article><article id="template-maintenance"><h3>Saved change templates</h3><p>Manage durable stream change templates; local history remains a fallback.</p><div id="template-maintenance-list"></div><details class="setup-advanced"><summary>Advanced template maintenance</summary><button type="button" id="clear-change-templates" class="danger">Delete all templates</button></details></article><article id="saved-property-maintenance"><h3>Saved track names</h3><p>Reusable audio and subtitle track names. Language and region values are managed in the Language / region order tab.</p><div id="saved-property-list"></div></article></div>');
+  if (!$('#movie-import-settings')) setup.insertAdjacentHTML('beforeend', '<div class="import-setup-grid"><article id="movie-import-settings"><h3>Media import</h3><p>Choose the folder where new movies and episodes arrive inside this container.</p><div id="movie-import-input-path" class="import-path">Not configured</div><button type="button" id="browse-import-input">Choose input folder</button></article><article id="template-maintenance"><h3>Saved change templates</h3><p>Manage durable stream change templates; local history remains a fallback.</p><div id="template-maintenance-list"></div><details class="setup-advanced"><summary>Advanced template maintenance</summary><button type="button" id="clear-change-templates" class="danger">Delete all templates</button></details></article><article id="saved-property-maintenance"><h3>Saved track names</h3><p>Reusable audio and subtitle track names. Language and region values are managed in the Language / region order tab.</p><div id="saved-property-list"></div></article></div>');
   $('#browse-import-input').onclick = () => openImportFolderPicker(importConfig?.input_folder || '/');
   $('#clear-change-templates').onclick = async () => {if(!window.confirm('Delete all saved change templates?')) return; try { await api('/api/v25/templates', {method:'DELETE'}); if(typeof durableTemplateCache !== 'undefined') durableTemplateCache=[]; } catch (error) { console.warn('Could not clear durable templates', error); } localStorage.removeItem(CHANGE_HISTORY_KEY); localStorage.removeItem(LAST_CHANGE_KEY); renderTemplateMaintenance(); scheduleBulkCloneInspection()};
 }
@@ -72,7 +76,7 @@ async function openImportFolderPicker(path) {
 }
 
 async function saveImportInputFolder() {
-  try {importConfig=await api('/api/v28/import/config',{method:'PUT',body:JSON.stringify({input_folder:importBrowsePath})});$('#movie-import-input-path').textContent=importConfig.input_folder;$('#import-folder-dialog').close();toast('Movie input folder saved')}catch(error){toast(error.message,true)}
+  try {importConfig=await api('/api/v28/import/config',{method:'PUT',body:JSON.stringify({input_folder:importBrowsePath})});$('#movie-import-input-path').textContent=importConfig.input_folder;$('#import-folder-dialog').close();toast('Media input folder saved')}catch(error){toast(error.message,true)}
 }
 
 async function loadMovieImport() {
@@ -88,9 +92,9 @@ async function browseImportMovies(path) {
   try {const data=await api(`/api/v28/import/browse?path=${encodeURIComponent(path)}`);$('#import-current-folder').textContent=data.path;const parent=data.parent?`<button type="button" class="import-browser-row folder" data-import-folder="${attr(data.parent)}">↰ ..</button>`:'';$('#import-browser').innerHTML=parent+data.directories.map(item=>`<button type="button" class="import-browser-row folder" data-import-folder="${attr(item.path)}">📁 ${esc(item.name)}</button>`).join('')+data.files.map(item=>`<button type="button" class="import-browser-row movie" data-import-file="${attr(item.path)}" data-name="${attr(item.name)}"><span>🎬 ${esc(item.name)}</span><small>${bytes(item.size)}</small></button>`).join('');document.querySelectorAll('[data-import-folder]').forEach(button=>button.onclick=()=>browseImportMovies(button.dataset.importFolder));document.querySelectorAll('[data-import-file]').forEach(button=>button.onclick=()=>selectImportMovie(button))}catch(error){toast(error.message,true)}
 }
 
-function selectImportMovie(button) {document.querySelectorAll('[data-import-file]').forEach(item=>item.classList.toggle('active',item===button));movieImportMode={source:button.dataset.importFile,sourceName:button.dataset.name,filename:button.dataset.name,editing:false};updateImportSelection()}
+function selectImportMovie(button) {document.querySelectorAll('[data-import-file]').forEach(item=>item.classList.toggle('active',item===button));movieImportMode={source:button.dataset.importFile,sourceName:button.dataset.name,filename:button.dataset.name,mediaKind:$('#import-media-kind').value,editing:false};updateImportSelection()}
 
-function updateImportSelection(){const destination=document.querySelector("[name=import-destination]:checked")?.value;if(movieImportMode)movieImportMode.destination=destination;const valid=Boolean(movieImportMode?.source&&destination);$("#import-edit-copy").disabled=!valid;$("#import-selection-summary").textContent=valid?`${movieImportMode.sourceName} → ${destination}`:"Choose a source movie and destination."}
+function updateImportSelection(){const destination=document.querySelector("[name=import-destination]:checked")?.value;if(movieImportMode)movieImportMode.destination=destination;const valid=Boolean(movieImportMode?.source&&destination);$("#import-edit-copy").disabled=!valid;$("#import-selection-summary").textContent=valid?`${movieImportMode.sourceName} → ${destination}`:"Choose a source media file and destination."}
 async function beginMovieImportEdit() {updateImportSelection();if(!movieImportMode?.destination)return;movieImportMode.editing=true;await openEditor(movieImportMode.source,movieImportMode.sourceName);updateQueuedChangeLabels()}
 
 function collectImportEditPayload() {
@@ -105,10 +109,69 @@ function collectImportUsedValues(){const values=[];document.querySelectorAll("#s
 
 function chooseImportProcessing(){return new Promise(resolve=>{const dialog=$('#import-processing-dialog');$('#import-remove-original').checked=false;let finished=false;const finish=mode=>{if(finished)return;finished=true;dialog.close();dialog.removeEventListener('cancel',cancel);resolve(mode?{mode,removeOriginal:$('#import-remove-original').checked}:null)};const cancel=event=>{event.preventDefault();finish(null)};dialog.querySelectorAll('[data-import-processing]').forEach(button=>button.onclick=()=>finish(button.dataset.importProcessing==='cancel'?null:button.dataset.importProcessing));dialog.addEventListener('cancel',cancel);dialog.showModal();dialog.querySelector('[data-import-processing=now]').focus()})}
 
-$('#stream-form').addEventListener('submit',async event=>{if(!movieImportMode?.editing)return;event.preventDefault();event.stopImmediatePropagation();const choice=await chooseImportProcessing();if(!choice)return;const mode={...movieImportMode},button=event.target.querySelector('[type=submit]'),queued=queuedChangeCount(),usedValues=collectImportUsedValues();button.disabled=true;try{mode.filename=validateStreamFilename();const request={source:mode.source,destination:mode.destination,filename:mode.filename,edit:collectImportEditPayload(),remove_original:choice.removeOriginal};if(choice.mode==='queue'){setApplyProgress(1,2,'Queueing movie import','Saving the complete copy and stream-edit operation');const task=await api('/api/v65/queue',{method:'POST',body:JSON.stringify({task_type:'movie_import',payload:request,label:`Import ${mode.filename}`})});await offerSavedValues(usedValues);setApplyProgress(2,2,'Import queued',`Task #${task.id}`);$('#stream-dialog').close();movieImportMode=null;toast(`Whole movie import added to queue as task #${task.id}`);await loadMovieImport();return}setApplyProgress(1,4,'Copying movie','Creating the destination media file');const result=await api('/api/v28/import/movie',{method:'POST',body:JSON.stringify(request)});let removed=false;if(choice.removeOriginal){setApplyProgress(3,4,'Removing original','Import completed successfully');try{await api('/api/v28/import/cleanup',{method:'POST',body:JSON.stringify({source:mode.source})});removed=true}catch(cleanupError){toast(`Movie imported, but originals were retained: ${cleanupError.message}`,true)}}await offerSavedValues(usedValues);setApplyProgress(4,4,'Import complete',result.target);$('#stream-dialog').close();movieImportMode=null;toast(removed?'Movie imported and originals removed':'Movie copied and stream changes applied');if(queued)document.dispatchEvent(new CustomEvent('media-properties-applied',{detail:{path:result.target}}));await loadMovieImport()}catch(error){setApplyProgress(4,4,'Import failed',error.message);toast(error.message,true)}finally{button.disabled=false;updateQueuedChangeLabels()}},true);
+function followMovieImportProgress(operationId,total){
+  let stopped=false,timer=null;
+  async function poll(){
+    try{
+      const result=await api(`/api/v28/import/progress/${operationId}`);
+      if(stopped)return;
+      const detail=[result.detail,result.copy_total?`${result.copy_percent}% copied · ${bytes(result.copy_current)} of ${bytes(result.copy_total)}`:''].filter(Boolean).join(' · ');
+      setApplyProgress(result.step,total,result.message,detail);
+    }catch(_){/* Initial registration can race the first read; do not interrupt the import. */}
+    if(!stopped)timer=setTimeout(poll,750);
+  }
+  timer=setTimeout(poll,250);
+  return ()=>{stopped=true;clearTimeout(timer)};
+}
+
+$('#stream-form').addEventListener('submit',async event=>{
+  if(!movieImportMode?.editing)return;
+  event.preventDefault();event.stopImmediatePropagation();if(movieImportBusy)return;
+  const choice=await chooseImportProcessing();if(!choice)return;
+  const mode={...movieImportMode},button=event.target.querySelector('[type=submit]'),usedValues=collectImportUsedValues();
+  const total=choice.mode==='queue'?2:choice.removeOriginal?7:6;
+  let stopProgress=()=>{},busyOwned=true,committed=false;
+  movieImportBusy=true;applyProgressBusy=true;button.disabled=true;
+  window.beginGlobalBusyImmediate?.(choice.mode==='queue'?'Queueing media import':'Importing media');
+  setApplyProgress(1,total,choice.mode==='queue'?'Queueing media import':'Validating media import',mode.sourceName);
+  const releaseBusy=()=>{if(!busyOwned)return;busyOwned=false;window.endGlobalBusyOperation?.()};
+  try{
+    // Paint the modal before validation, serialization, copying or remuxing.
+    await new Promise(resolve=>requestAnimationFrame(()=>resolve()));
+    mode.filename=validateStreamFilename();
+    const request={source:mode.source,destination:mode.destination,filename:mode.filename,media_kind:mode.mediaKind||'movie',edit:collectImportEditPayload(),remove_original:choice.removeOriginal};
+    if(choice.mode==='queue'){
+      const task=await api('/api/v65/queue',{method:'POST',body:JSON.stringify({task_type:'movie_import',payload:request,label:`Import ${mode.filename}`})});
+      if(!task?.id)throw new Error('The queue did not return an import task id');
+      committed=true;setApplyProgress(2,2,'Import queued',`Task #${task.id}`);
+      $('#stream-dialog').close();movieImportMode=null;releaseBusy();
+      toast(`Whole media import added to queue as task #${task.id}`);
+    }else{
+      request.operation_id=Array.from(crypto.getRandomValues(new Uint8Array(16)),value=>value.toString(16).padStart(2,'0')).join('');
+      stopProgress=followMovieImportProgress(request.operation_id,total);
+      const result=await api('/api/v28/import/movie',{method:'POST',body:JSON.stringify(request)});
+      stopProgress();committed=true;
+      const removed=result.source_cleanup_status==='removed';
+      if(choice.removeOriginal&&!removed&&!result.warnings?.length)result.warnings=['Import completed, but source removal was not confirmed. Check the source folder.'];
+      setApplyProgress(total,total,'Import complete',result.target);
+      $('#stream-dialog').close();movieImportMode=null;releaseBusy();
+      toast(result.warnings?.length?result.warnings.join(' '):removed?'Media imported and originals removed':'Media copied and stream changes applied',Boolean(result.warnings?.length));
+      document.dispatchEvent(new CustomEvent('media-properties-applied',{detail:{path:result.target}}));
+    }
+    // Learning prompts are user decisions, not part of a locked busy phase.
+    await offerSavedValues(usedValues);
+    await loadMovieImport();
+  }catch(error){
+    setApplyProgress(0,0,committed?'Import completed; display refresh failed':'Import failed',error.message);
+    toast(committed?`Import already completed. ${error.message}`:error.message,true);
+  }finally{
+    stopProgress();releaseBusy();movieImportBusy=false;applyProgressBusy=false;
+    button.disabled=false;updateQueuedChangeLabels();window.updateStreamEditorContext?.();
+  }
+},true);
 
 const importUpdateQueuedChangeLabels=updateQueuedChangeLabels;
-updateQueuedChangeLabels=function(){importUpdateQueuedChangeLabels();if(!movieImportMode?.editing)return;const count=queuedChangeCount(),button=$('#stream-form [type=submit]'),close=$('#stream-form .dialog-actions [data-close-stream]');button.disabled=false;button.textContent=count?`Copy movie with ${count} change${count===1?'':'s'}`:'Copy movie';close.textContent='Cancel'};
+updateQueuedChangeLabels=function(){importUpdateQueuedChangeLabels();if(!movieImportMode?.editing)return;const count=queuedChangeCount(),button=$('#stream-form [type=submit]'),close=$('#stream-form .dialog-actions [data-close-stream]');button.disabled=movieImportBusy;button.textContent=movieImportBusy?'Importing…':count?`Copy media with ${count} change${count===1?'':'s'}`:'Copy media';close.textContent='Cancel'};
 
 document.querySelectorAll('[data-close-stream]').forEach(button=>button.addEventListener('click',()=>{if(movieImportMode){movieImportMode=null;updateQueuedChangeLabels()}}));
 ensureMovieImportUi();loadImportConfig();renderTemplateMaintenance();

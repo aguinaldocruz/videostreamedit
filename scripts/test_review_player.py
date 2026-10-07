@@ -1,5 +1,6 @@
 """Exercise the disposable review_test_server (not the production application)."""
 import json
+import os
 import time
 import urllib.request
 import urllib.error
@@ -14,7 +15,7 @@ def api(path,body=None,method=None):
 
 fixture=api('/test/fixture')
 with sync_playwright() as p:
-    browser=p.chromium.launch(headless=True)
+    browser=p.chromium.launch(headless=True, executable_path=os.getenv('PLAYWRIGHT_CHROMIUM_EXECUTABLE'))
     page=browser.new_page(viewport={'width':1280,'height':900})
     errors=[]
     page.on('pageerror',lambda error:errors.append(str(error)))

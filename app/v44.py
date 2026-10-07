@@ -7,6 +7,7 @@ from pydantic import BaseModel
 
 from app.v11 import connection
 from app.v43 import app
+from app import subtitle_autofix as _subtitle_autofix  # Register durable rule settings and sample preview.
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -66,3 +67,25 @@ def update_prompt_setting(request: PromptSettingUpdate) -> dict[str, bool]:
         )
     logger.info("change=prompt_setting key=%s enabled=%s", request.key, str(request.enabled).lower())
     return prompt_settings()
+
+
+class SubtitleColorSetting(BaseModel):
+    color: str
+
+
+@app.get('/api/settings/subtitle-color')
+def get_subtitle_color() -> dict:
+    with connection() as db:
+        row = db.execute("SELECT value FROM application_settings WHERE key='subtitle_color'").fetchone()
+    return {'color': row['value'] if row else '#FFFF00'}
+
+
+@app.put('/api/settings/subtitle-color')
+def save_subtitle_color(request: SubtitleColorSetting) -> dict:
+    from fastapi import HTTPException
+    from app.subtitle_color import COLOR
+    if not COLOR.fullmatch(request.color):
+        raise HTTPException(422, 'Use a six-digit hexadecimal color: #RRGGBB')
+    with connection() as db:
+        db.execute("INSERT INTO application_settings(key,value) VALUES('subtitle_color',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (request.color.upper(),))
+    return {'color': request.color.upper()}

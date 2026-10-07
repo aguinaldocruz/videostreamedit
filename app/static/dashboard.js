@@ -2,6 +2,7 @@
   const root=document.querySelector('#dashboard'),body=document.querySelector('#dashboard-content');
   if(!root||!body)return;
   let data=null,pending=null,last=0,findings=null,findingTime=0,previousWork=null;
+  let findingPending=null,findingRevision=0;
   let scope=localStorage.getItem('vse.dashboard.scope')||'all';
   if(!['all','movies','tv'].includes(scope))scope='all';
   root.querySelector('.page-title').innerHTML='<div><h2>Your collection</h2><p>Review progress, findings and background work.</p></div><div class="dashboard-tools"><label>Collection <select id="dashboard-scope"><option value="all">All media</option><option value="movies">Movies</option><option value="tv">TV Shows</option></select></label><button type="button" id="dashboard-refresh">Refresh</button><small data-dashboard-updated role="status"></small></div>';
@@ -49,7 +50,14 @@
     const details=body.querySelector('[data-insights]');details.ontoggle=()=>{if(details.open)loadInsights()};if(expanded)loadInsights();loadFindings();
   }
   async function loadFindings(){
-    try{if(!findings||Date.now()-findingTime>60000){findings=await api('/api/v19/reports/availability');findingTime=Date.now()}
+    try{if(!findings||Date.now()-findingTime>60000){
+      findingPending??=(async()=>{
+        let result,revision;
+        do{revision=findingRevision;result=await api('/api/v19/reports/availability')}while(revision!==findingRevision);
+        findings=result;findingTime=Date.now();
+      })().finally(()=>{findingPending=null});
+      await findingPending;
+    }
       const target=body.querySelector('[data-findings]');if(!target)return;
       const labels={image:'Image subtitles',damaged:'Damaged subtitles',html:'HTML subtitles',confidence:'Uncertain subtitles',language:'Language discrepancies',duplicate_audio:'Duplicate audio',duplicate_subtitle:'Duplicate subtitles',uncommon:'Uncommon languages',forced:'Forced streams',audio_only:'No subtitles',english_only:'English-only streams',external_only:'External subtitles',video_titles:'Video titles',matroska_layout:'Matroska headers'};
       target.innerHTML=Object.entries(labels).filter(([key])=>localStorage.getItem('vse.report.'+key)!=='hidden').flatMap(([key,label])=>(scope==='all'?['movies','tv']:[scope]).map(kind=>{const n=findings.counts?.[key]?.[kind]||0;return n?`<button type="button" data-finding="${key}:${kind}" title="Open ${esc(label)} report"><strong>${number(n)}</strong><span>${label}</span><small>${kind==='tv'?'Episodes':'Movies'} →</small></button>`:''})).join('')||'<p>No enabled reports have current findings.</p>';
@@ -63,6 +71,12 @@
     root.querySelector('[data-dashboard-updated]').textContent='Updating…';root.querySelector('#dashboard-refresh').disabled=true;
     pending=api('/api/dashboard/overview').then(result=>{if(data)previousWork={at:data.updated_at,waiting:[...data.work.tasks,...data.work.indexes].filter(r=>r.status==='pending').reduce((n,r)=>n+r.count,0)};data=result;last=Date.now();draw()}).catch(e=>{root.querySelector('[data-dashboard-updated]').textContent='Could not refresh: '+e.message;if(!data)body.textContent='Dashboard unavailable. Use Refresh to retry; other pages remain available.'}).finally(()=>{pending=null;root.querySelector('#dashboard-refresh').disabled=false});return pending;
   };
+  ['media-final-version-changed','media-properties-applied','media-properties-queued'].forEach(name=>{
+    document.addEventListener(name,()=>{
+      findingRevision++;findings=null;findingTime=0;last=0;
+      if(!root.classList.contains('hidden'))loadFindings();
+    });
+  });
   scopeSelect.onchange=()=>{scope=scopeSelect.value;localStorage.setItem('vse.dashboard.scope',scope);draw()};
   root.querySelector('#dashboard-refresh').onclick=()=>{findingTime=0;insightData=null;insightPending=null;window.loadCollectionDashboard(true)};
   let dashboardScroll=0;

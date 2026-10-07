@@ -4,6 +4,7 @@ import hashlib
 import json
 import logging
 import re
+import subprocess
 import time
 import uuid
 from contextvars import ContextVar
@@ -28,7 +29,7 @@ from app.v7 import ReorderEditRequest
 from app.v11 import connection
 from app.v13 import media_details_with_ietf
 from app.v43 import optimized_media_edit
-from app.v51 import cached_subtitle_text, damage_kind, decode_external, extracted_text
+from app.v51 import cached_subtitle_text, damage_kind, decode_external
 from app.v78 import app
 from app.preflight_dispatcher import enqueue_bulk_preflight, register_approval_handler, register_handler
 
@@ -37,6 +38,25 @@ _legacy_processors = dict(indexes.processors)
 from app.subtitle_detector_config import SUBTITLE_DETECTOR_VERSION
 
 _audio_language_code = tasks._audio_language_code
+
+
+def extract_subtitle_text_for_detection(media: Path, selector: str) -> str:
+    """Extract a bounded text sample without disguising tool failures as empty subtitles."""
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-i", str(media),
+             "-map", selector, "-t", "900", "-f", "srt", "pipe:1"],
+            capture_output=True, timeout=50, check=False,
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError("FFmpeg is unavailable; subtitle text could not be extracted") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("FFmpeg timed out while extracting subtitle text") from exc
+    text = (result.stdout or b"").decode("utf-8", errors="replace")
+    if result.returncode and not text.strip():
+        detail = (result.stderr or b"").decode("utf-8", errors="replace").strip().replace("\n", " ")
+        raise RuntimeError("FFmpeg could not extract subtitle text" + (f": {detail[-240:]}" if detail else ""))
+    return text
 
 
 class LanguageDetectionSettings(BaseModel):
@@ -370,7 +390,7 @@ class VoiceDetectionSettings(BaseModel):
     service_url: str = Field(default="http://language-id:9000", max_length=500)
     sample_seconds: int = Field(default=30, ge=10, le=120)
     sample_positions: list[float] = Field(default_factory=lambda: [0.1, 0.5, 0.9], min_length=1, max_length=9)
-    sample_count: int = Field(default=3, ge=1, le=9)
+    sample_count: int = Field(default=3, ge=2, le=9)
 
 
 def voice_detection_settings() -> dict:
@@ -380,7 +400,7 @@ def voice_detection_settings() -> dict:
     values = {str(row["key"]): str(row["value"]) for row in rows}
     try: positions = [max(0.0, min(1.0, float(x))) for x in json.loads(values.get("voice_detection_positions", "[0.1,0.5,0.9]"))]
     except (TypeError, ValueError, json.JSONDecodeError): positions = defaults["sample_positions"]
-    try: count = max(1, min(9, int(values.get("voice_detection_sample_count", str(len(positions) or 3)))))
+    try: count = max(2, min(9, int(values.get("voice_detection_sample_count", str(len(positions) or 3)))))
     except (TypeError, ValueError): count = defaults["sample_count"]
     return {"enabled": values.get("voice_detection_enabled", "1") == "1", "service_url": values.get("voice_detection_url", defaults["service_url"]), "sample_seconds": max(10, min(120, int(values.get("voice_detection_sample_seconds", "30")))), "sample_positions": positions or defaults["sample_positions"], "sample_count": count}
 
@@ -444,7 +464,7 @@ def queue_language_detection(request: DetectionQueueRequest) -> dict:
 @app.put("/api/v79/audio-language-detection/settings")
 def save_voice_detection_settings(request: VoiceDetectionSettings) -> dict:
     url = request.service_url.strip().rstrip("/") or "http://language-id:9000"
-    count = max(1, min(9, int(request.sample_count)))
+    count = max(2, min(9, int(request.sample_count)))
     # Keep positions deterministic and evenly distributed; this makes the
     # sample count setting authoritative while retaining the positions field
     # for older clients.
@@ -510,16 +530,14 @@ def detect_stream_language(request: StreamLanguageDetectionRequest) -> dict:
         else:
             text = cached_subtitle_text(Path(path), "embedded", request.type_index)
             if text is None:
-                text = extracted_text(Path(path), f"0:s:{request.type_index}")
+                text = extract_subtitle_text_for_detection(Path(path), f"0:s:{request.type_index}")
         allowed = {value.casefold().split("-", 1)[0].split("_", 1)[0] for value in common_detection_languages()}
-        detected, confidence, evidence = detect_common_variant(text, allowed)
-    except (OSError, ValueError, TypeError) as exc:
+    except (OSError, ValueError, TypeError, RuntimeError) as exc:
         raise HTTPException(422, f"Subtitle language detection failed: {exc}") from exc
 
     # An interactive check is authoritative evidence for this exact stream.
     # Persist it so a correct manual result does not reappear as a stale
     # no-confidence marker when the editor or report is reopened.
-    confidence = float(confidence or 0.0)
     if is_final(path) or source_stamp(path) != initial_stamp or (external_stamp and source_stamp(row['external_path']) != external_stamp):
         raise HTTPException(409, 'Media changed or became Final Version during detection; result discarded')
     with connection() as db:
@@ -532,9 +550,12 @@ def detect_stream_language(request: StreamLanguageDetectionRequest) -> dict:
         metadata_region = str(metadata["region"] if metadata else "")
         external_path = str(metadata["external_path"] if metadata else "")
         from app.detection_policy import subtitle_assessment
-        detected, confidence, evidence, assessment = subtitle_assessment(text, metadata['codec'] if metadata else '', metadata_language, metadata_region, allowed)
-        # The same assessment is used by scheduled inspection and Evaluate.
-        status, reason = assessment, evidence
+        detected, confidence, lexical_evidence = detect_common_variant(text, allowed)
+        detected, confidence, reason, status = subtitle_assessment(text, metadata['codec'] if metadata else '', metadata_language, metadata_region, allowed)
+        confidence = float(confidence or 0.0)
+        # Persist the policy explanation, not just the positive-evidence terms.
+        # Otherwise no-confidence findings lose their useful reason at the API.
+        evidence = lexical_evidence or reason
         signature = _subtitle_analysis_signature(path, {'source': source, 'type_index': request.type_index, 'external_path': external_path, 'codec': metadata['codec'] if metadata else '', 'language': metadata_language, 'region': metadata_region}, common_detection_languages(), Path(path).stat())
         db.execute(
             "DELETE FROM portuguese_language_detection WHERE path=? AND source=? AND type_index=? AND external_path=?",
@@ -963,7 +984,8 @@ def inspect_portuguese_language(path: str, detection_scope: dict | None = None, 
         return
     detection_scope = detection_scope or {}
     requested = detection_scope.get("subtitle_indices")
-    force_targeted = bool(requested)
+    requested_external = set(detection_scope.get('subtitle_external_paths') or [])
+    force_targeted = bool(requested or requested_external)
     stat = media.stat()
     initial_stamp = source_stamp(path)
     configured = common_detection_languages()
@@ -984,8 +1006,10 @@ def inspect_portuguese_language(path: str, detection_scope: dict | None = None, 
     wanted = {int(item) for item in requested} if requested and requested != "all" else None
     streams = [dict(row) for row in stream_rows]
     external_stamps = {str(s['external_path']): source_stamp(s['external_path']) for s in streams if s['source'] == 'external' and s['external_path'] and Path(s['external_path']).is_file()}
-    if wanted is not None:
-        streams = [stream for stream in streams if stream["source"] == "embedded" and int(stream["type_index"]) in wanted]
+    if requested != 'all' and (wanted is not None or requested_external):
+        streams = [stream for stream in streams
+                   if (stream['source'] == 'embedded' and int(stream['type_index']) in (wanted or set()))
+                   or (stream['source'] == 'external' and stream['external_path'] in requested_external)]
     cache = text_cache if text_cache is not None else {}
     results: list[dict] = []
     for stream in streams:
@@ -1041,7 +1065,7 @@ def inspect_portuguese_language(path: str, detection_scope: dict | None = None, 
                         continue
                     text = cached_subtitle_text(media, "embedded", key[1])
                     if text is None:
-                        text = extracted_text(media, f"0:s:{key[1]}")
+                        text = extract_subtitle_text_for_detection(media, f"0:s:{key[1]}")
                     cache[text_key] = text
             else:
                 text = ""
@@ -1050,9 +1074,10 @@ def inspect_portuguese_language(path: str, detection_scope: dict | None = None, 
             base["evidence_sample"] = normalized_evidence_sample(text)
             sdh_label, sdh_confidence, sdh_evidence = analyze_sdh(text)
             base.update(sdh_label=sdh_label, sdh_confidence=sdh_confidence, sdh_evidence=sdh_evidence)
-            detected, confidence, evidence, assessment = subtitle_assessment(text, codec, stream['language'], stream['region'], bases)
-            base.update(detected_language=detected, confidence=confidence, evidence=evidence, analysis_status=assessment, analysis_reason=evidence)
-        except (OSError, ValueError, TypeError) as exc:
+            detected, confidence, lexical_evidence = detect_common_variant(text, bases)
+            detected, confidence, analysis_reason, assessment = subtitle_assessment(text, codec, stream['language'], stream['region'], bases)
+            base.update(detected_language=detected, confidence=confidence, evidence=lexical_evidence or analysis_reason, analysis_status=assessment, analysis_reason=analysis_reason)
+        except (OSError, ValueError, TypeError, RuntimeError) as exc:
             base.update(analysis_status="unreadable", analysis_reason=f"Subtitle text could not be read: {str(exc)[:240]}")
         results.append(base)
     columns = ["path", "source", "type_index", "external_path", "metadata_language", "metadata_region", "detected_language", "confidence", "evidence", "sdh_label", "sdh_confidence", "sdh_evidence", "evidence_sample", "analysis_status", "analysis_reason", "analysis_signature", "detector_version", "cue_count", "text_chars", "text_coverage", "markup_count", "damage"]
@@ -1061,10 +1086,15 @@ def inspect_portuguese_language(path: str, detection_scope: dict | None = None, 
         logger.info('language_detection event=discarded_stale_or_final file=%s', path)
         return
     with connection() as db:
-        if wanted is not None:
-            marks = ",".join("?" for _ in wanted)
-            db.execute(f"DELETE FROM portuguese_language_detection WHERE path=? AND source='embedded' AND type_index IN ({marks})", [path, *wanted])
-            db.execute(f"DELETE FROM subtitle_detection_stream_state WHERE path=? AND source='embedded' AND type_index IN ({marks})", [path, *wanted])
+        if requested != 'all' and (wanted is not None or requested_external):
+            if wanted:
+                marks = ",".join("?" for _ in wanted)
+                db.execute(f"DELETE FROM portuguese_language_detection WHERE path=? AND source='embedded' AND type_index IN ({marks})", [path, *wanted])
+                db.execute(f"DELETE FROM subtitle_detection_stream_state WHERE path=? AND source='embedded' AND type_index IN ({marks})", [path, *wanted])
+            if requested_external:
+                marks = ','.join('?' for _ in requested_external)
+                db.execute(f"DELETE FROM portuguese_language_detection WHERE path=? AND source='external' AND external_path IN ({marks})", [path, *requested_external])
+                db.execute(f"DELETE FROM subtitle_detection_stream_state WHERE path=? AND source='external' AND external_path IN ({marks})", [path, *requested_external])
         else:
             db.execute("DELETE FROM portuguese_language_detection WHERE path=?", (path,))
             db.execute("DELETE FROM subtitle_detection_stream_state WHERE path=?", (path,))
@@ -1463,7 +1493,7 @@ def episode_bulk_edit(path: str, request: SeasonStreamBulkEdit) -> tuple[dict, i
 
 
 def edit_has_effective_changes(edit: dict) -> bool:
-    return bool(edit.get("tracks") or edit.get("external_subtitles") or edit.get("remove") or any(edit.get(name) != "__preserve__" for name in ("default_audio", "forced_audio", "default_subtitle", "forced_subtitle")))
+    return bool(edit.get("tracks") or edit.get("external_subtitles") or edit.get("remove") or edit.get('subtitle_color') or any(edit.get(name) != "__preserve__" for name in ("default_audio", "forced_audio", "default_subtitle", "forced_subtitle")))
 
 
 def process_tv_filtered_stream_edit(task_id: int, payload: dict) -> dict:
@@ -1697,6 +1727,7 @@ def consolidated_tv_edit(path: str, journal: list[dict]) -> tuple[dict, int]:
     tags = original_tags.copy()
     removed: set[str] = set()
     final_version = None
+    subtitle_color = None
     audio_compatibility = []
     matched_total = 0
     for operation in journal:
@@ -1706,6 +1737,8 @@ def consolidated_tv_edit(path: str, journal: list[dict]) -> tuple[dict, int]:
             continue
         direct = operation.get("direct_edit")
         if direct:
+            if direct.get('subtitle_color'):
+                subtitle_color = direct['subtitle_color']
             for change in direct.get("tracks") or []:
                 key = f"embedded:{change.get('codec_type')}:{change.get('type_index')}"
                 if key in streams:
@@ -1773,11 +1806,11 @@ def consolidated_tv_edit(path: str, journal: list[dict]) -> tuple[dict, int]:
     external_changes = [{field: stream[field] for field in ("path", "embed", "language", "region", "title", "forced")} for key, stream in streams.items() if stream["source"] == "external" and (key in removed or any(stream[field] != original[key][field] for field in ("embed", "language", "region", "title")))]
     ordered = [{"source": streams[key]["source"], "codec_type": "subtitle" if streams[key]["source"] == "external" else streams[key]["codec_type"], **({"path": streams[key]["path"]} if streams[key]["source"] == "external" else {"type_index": streams[key]["type_index"]})} for key in order]
     changed_tags = {name: tags[name] if tags[name] != original_tags[name] else "__preserve__" for name in tags}
-    edit = {"path": path, "tracks": track_changes, "external_subtitles": external_changes, "order": ordered, **changed_tags, "remove": sorted(removed), "final_version": final_version}
+    edit = {"path": path, "tracks": track_changes, "external_subtitles": external_changes, "order": ordered, **changed_tags, "remove": sorted(removed), "final_version": final_version, "subtitle_color": subtitle_color}
     if audio_compatibility:
         edit['audio_compatibility'] = audio_compatibility
     structural = removed or order != original_order or any(item["embed"] for item in external_changes)
-    if not (audio_compatibility or track_changes or external_changes or structural or any(value != "__preserve__" for value in changed_tags.values()) or final_version is not None):
+    if not (audio_compatibility or track_changes or external_changes or structural or any(value != "__preserve__" for value in changed_tags.values()) or final_version is not None or subtitle_color):
         return {}, matched_total
     return edit, matched_total
 

@@ -52,6 +52,7 @@ from app.v11 import column_exists, connection
 from app.v37 import MediaRenameRequest, rename_media
 from app.v43 import optimized_media_edit
 from app.v59 import app
+from app.job_outcomes import MISSING_PREFIX, PermanentMediaMissing, require_media_file, finalize_missing_workflow
 
 logger = logging.getLogger("uvicorn.error")
 queue_condition = threading.Condition()
@@ -59,7 +60,7 @@ queue_thread: threading.Thread | None = None
 queue_light_thread: threading.Thread | None = None
 queue_bulk_threads: list[threading.Thread] = []
 queue_shutdown = threading.Event()
-LIGHT_TASK_TYPES = ("index_check_prepare", "index_rebuild_prepare")
+LIGHT_TASK_TYPES = ("index_check_prepare", "index_rebuild_prepare", "scheduled_task_dispatch")
 BULK_EDIT_TASK_TYPES = ("tv_filtered_stream_edit_batch", "tv_filtered_stream_edit", "filtered_stream_edit", "tv_filtered_stream_edit_now", "filtered_stream_edit_now")
 # Bulk edits are independent after preflight, but remain bounded so concurrent
 # Matroska rewrites cannot exhaust disk bandwidth or staging space.
@@ -73,7 +74,7 @@ bulk_edit_semaphore = threading.BoundedSemaphore(BULK_EDIT_WORKERS)
 # allowance so it cannot be starved indefinitely.
 SYSTEM_TASK_TYPES = frozenset({
     "plex_sync", "audio_language_detection", "media_reindex",
-    "index_check_prepare", "index_rebuild_prepare",
+    "index_check_prepare", "index_rebuild_prepare", "scheduled_task_dispatch",
 })
 SYSTEM_AGING_SECONDS = 600
 
@@ -115,13 +116,25 @@ def queue_paused() -> bool:
     return bool(row and row[0] == "1")
 
 
+def public_task_payload(task_type: str, payload: dict) -> dict:
+    if task_type != 'subtitle_autofix':
+        return payload
+    # Corrected full texts belong in durable execution data, not every queue
+    # refresh or task-details response. Keep the readable plan lightweight.
+    return {**payload, 'replacements': [
+        {**{key: value for key, value in item.items() if key != 'text'}, 'text_characters': len(item.get('text') or '')}
+        for item in payload.get('replacements') or []]}
+
+
 def task_row(task_id: int) -> dict:
     with connection() as db:
         row = db.execute("SELECT * FROM task_queue WHERE id=?", (task_id,)).fetchone()
     if not row:
         raise HTTPException(404, "Queue item not found")
     result = dict(row)
-    result["payload"] = json.loads(result.pop("payload_json"))
+    result["payload"] = public_task_payload(result['task_type'], json.loads(result.pop("payload_json")))
+    result['failure_code'] = 'media_missing' if str(result.get('error') or '').startswith(MISSING_PREFIX) else None
+    result['retryable'] = result['status'] == 'failed' and not result['failure_code']
     return result
 
 
@@ -157,7 +170,7 @@ def _active_expedite_expiry(db, group_id: str | None = None, path: str | None = 
 def affected_media_path(task_type: str, payload: dict) -> str:
     if task_type == "media_edit":
         return str((payload.get("edit") or payload).get("path") or "")
-    if task_type == "subtitle_html_cleanup":
+    if task_type in {"subtitle_html_cleanup", "subtitle_autofix"}:
         return str(payload.get("path") or "")
     if task_type == "matroska_layout_remux":
         return str(payload.get("path") or "")
@@ -172,7 +185,7 @@ def affected_media_path(task_type: str, payload: dict) -> str:
     return ""
 
 
-SIGNATURE_EXCLUDED_TASKS = {"audio_language_detection", "media_reindex", "index_check_prepare", "index_rebuild_prepare", "plex_sync", "plex_import_refresh"}
+SIGNATURE_EXCLUDED_TASKS = {"audio_language_detection", "media_reindex", "index_check_prepare", "index_rebuild_prepare", "scheduled_task_dispatch", "plex_sync", "plex_import_refresh"}
 
 def media_configuration_signature(path: str) -> dict:
     media = Path(path).resolve()
@@ -236,7 +249,7 @@ def validate_media_signature(task_type: str, payload: dict) -> None:
         raise RuntimeError("Media changed between queueing and execution; job refused for safety")
 
 def _create_media_luw(task_id: int, task_type: str, payload: dict, path: str) -> str | None:
-    destructive_types = {"media_edit", "filtered_stream_edit", "filtered_stream_edit_now", "tv_filtered_stream_edit", "tv_filtered_stream_edit_now", "movie_import", "subtitle_html_cleanup", "image_subtitle_convert", "ocr_rollback", "plex_import_refresh", "matroska_layout_remux"}
+    destructive_types = {"media_edit", "filtered_stream_edit", "filtered_stream_edit_now", "tv_filtered_stream_edit", "tv_filtered_stream_edit_now", "movie_import", "subtitle_html_cleanup", "subtitle_autofix", "image_subtitle_convert", "ocr_rollback", "plex_import_refresh", "matroska_layout_remux"}
     if os.getenv("DATABASE_BACKEND", "sqlite").lower() != "postgres" or task_type not in destructive_types or not path:
         return None
     existing = payload.get("_luw_id")
@@ -249,11 +262,11 @@ def _create_media_luw(task_id: int, task_type: str, payload: dict, path: str) ->
     edit = payload.get("edit") or payload
     if task_type == "movie_import":
         rollback_strategy = "atomic-copy-target-and-retain-source"
-    elif task_type == "matroska_layout_remux":
+    elif task_type in {"matroska_layout_remux", "subtitle_html_cleanup", "subtitle_autofix"}:
         rollback_strategy = "verified-stream-copy-then-atomic-replacement"
     elif edit.get('audio_compatibility'):
         rollback_strategy = 'atomic-remux-with-audio-stage-commit-intent'
-    elif task_type in {"image_subtitle_convert", "ocr_rollback", "subtitle_html_cleanup"}:
+    elif task_type in {"image_subtitle_convert", "ocr_rollback"}:
         rollback_strategy = "staged-original-until-review-or-commit"
     elif edit.get("remove") or edit.get("order") or edit.get("external_subtitles"):
         rollback_strategy = "full-original-until-verified"
@@ -297,8 +310,16 @@ def advance_media_signature(payload: dict) -> None:
         db.execute("UPDATE task_queue_group SET signature_json=?,updated_at=? WHERE group_id=?", (json.dumps(signature, ensure_ascii=False), utc_now(), group_id))
 
 def enqueue(task_type: str, payload: dict, label: str = "", *, deduplicate: bool = False) -> dict:
+    # Editor retries/double clicks must not create several mutations against
+    # the same snapshot. Different proposals or source snapshots remain
+    # independent requests; never weaken the execution signature check.
+    deduplicate = deduplicate or task_type == 'media_edit'
     if task_type == 'audio_language_detection':
         from app.detection_policy import is_final
+        with connection() as db:
+            current = db.execute('SELECT 1 FROM plex_media WHERE path=?', (str(payload.get('path') or ''),)).fetchone()
+        if not current:
+            return {'id': None, 'status': 'failed', 'skipped': 'obsolete_catalog_path', 'error': 'Media no longer belongs to the current catalog; no detection job created'}
         if is_final(str(payload.get('path') or '')):
             return {'id': None, 'status': 'cancelled', 'skipped': 'final_version'}
     affected = affected_media_path(task_type, payload)
@@ -319,15 +340,19 @@ def enqueue(task_type: str, payload: dict, label: str = "", *, deduplicate: bool
             # transaction lock closes the concurrent check-then-insert race.
             public_payload = {k: v for k, v in payload.items() if not k.startswith('_')}
             identity = json.dumps(public_payload, sort_keys=True, separators=(',', ':'))
+            if task_type == 'media_edit':
+                identity += ':' + str((payload.get('_media_signature') or {}).get('digest') or '')
             db.execute("SELECT pg_advisory_xact_lock(hashtext(?))", ('vse:enqueue:' + task_type + ':' + identity,))
             candidates = db.execute(
-                "SELECT id,payload_json FROM task_queue WHERE task_type=? AND status IN ('pending','running') AND payload_json::jsonb->>'path' IS NOT DISTINCT FROM ? ORDER BY id",
-                (task_type, public_payload.get('path')),
+                "SELECT id,payload_json FROM task_queue WHERE task_type=? AND status IN ('pending','running') AND COALESCE(payload_json::jsonb->>'path',payload_json::jsonb->'edit'->>'path') IS NOT DISTINCT FROM ? ORDER BY id",
+                (task_type, affected or public_payload.get('path')),
             ).fetchall()
             for candidate in candidates:
                 previous = {k: v for k, v in json.loads(candidate['payload_json']).items() if not k.startswith('_')}
-                if previous == public_payload:
-                    return task_row(candidate['id'])
+                same_snapshot = (task_type != 'media_edit' or
+                                 json.loads(candidate['payload_json']).get('_media_signature') == payload.get('_media_signature'))
+                if previous == public_payload and same_snapshot:
+                    return {**task_row(candidate['id']), 'deduplicated': True}
         cursor = db.execute(
             "INSERT INTO task_queue(task_type,label,payload_json,group_id,status,progress_message,created_at,updated_at) VALUES(?,?,?,?, 'pending','Waiting',?,?)",
             (task_type, label.strip() or task_type.replace("_", " ").title(), encoded, payload.get("_queue_group"), utc_now(), utc_now()),
@@ -447,7 +472,8 @@ def _language_service_request(wav: str, service_url: str | None = None) -> dict:
                 time.sleep(0.5 * (attempt + 1))
                 continue
             logger.warning("audio_language_detection event=language_service_sample_failed status=%s attempt=%d detail=%s", exc.code, attempt + 1, body.replace("\n", " ")[-300:])
-            return {"language_code": "", "confidence": 0.0, "error": f"language-id HTTP {exc.code}"}
+            detail = " ".join(body.split())[:240]
+            return {"language_code": "", "confidence": 0.0, "error": f"language-id HTTP {exc.code}" + (f": {detail}" if detail else "")}
         except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
             if attempt < 2:
                 time.sleep(0.5 * (attempt + 1))
@@ -483,6 +509,7 @@ def process_audio_language_detection(task_id: int, payload: dict) -> dict:
     from app.detection_policy import is_final, source_stamp, voice_consensus, language_matches
     if is_final(path):
         return {'path': path, 'streams': 0, 'mismatches': 0, 'skipped': 'final_version'}
+    require_media_file(path)
     initial_stamp = source_stamp(path)
     # Eligibility errors fail closed; never bypass a final lock.
     if not path or not Path(path).is_file():
@@ -508,9 +535,17 @@ def process_audio_language_detection(task_id: int, payload: dict) -> dict:
         sample_positions = tuple(max(0.0, min(1.0, float(value))) for value in parsed_positions) or sample_positions
     except (ValueError, TypeError, json.JSONDecodeError):
         pass
+    # A single sample cannot satisfy the consensus policy. Older setup values
+    # could save one position despite the detector requiring two agreeing
+    # samples, producing a guaranteed "unable to detect" result.
+    if len(sample_positions) < 2:
+        first = sample_positions[0] if sample_positions else 0.1
+        second = 0.9 if abs(first - 0.9) > 0.01 else 0.5
+        sample_positions = (first, second)
     if not streams:
         return {'path': path, 'streams': 0, 'mismatches': 0}
     results = []
+    diagnostics = []
     cached_samples = {}
     if payload.get('recompare'):
         with connection() as db:
@@ -526,13 +561,33 @@ def process_audio_language_detection(task_id: int, payload: dict) -> dict:
                 wav = str(Path(work) / f'audio-{index}-{number}.wav')
                 extract_audio_sample(path, index, start, sample_seconds, wav)
                 detected = _language_service_request(wav, service_url)
-                samples.append({'language': str(detected.get('language_code') or '').strip().lower(), 'confidence': float(detected.get('confidence') or 0), 'position': round(start, 2)})
+                try:
+                    sample_confidence = float(detected.get('confidence') or 0)
+                except (TypeError, ValueError):
+                    sample_confidence = 0.0
+                sample = {'language': str(detected.get('language_code') or '').strip().lower(), 'confidence': sample_confidence, 'position': round(start, 2)}
+                if detected.get('error'):
+                    sample['error'] = str(detected['error'])
+                samples.append(sample)
                 update_progress(task_id, (stream_number * len(sample_positions)) + number, len(streams) * len(sample_positions), f'Detecting selected audio {stream_number + 1}/{len(streams)} (stream {index + 1}) sample {number}/{len(sample_positions)}')
             # Failed and disagreeing samples reduce consensus strength.
             detected_code, confidence, agreement = voice_consensus(samples)
+            service_errors = [str(sample['error']) for sample in samples if sample.get('error')]
+            accepted_samples = [sample for sample in samples if sample.get('language') and float(sample.get('confidence') or 0) >= .60]
+            if detected_code:
+                analysis_reason = f"{agreement}/{len(samples)} samples agree; confidence {confidence * 100:.1f}%"
+            elif service_errors and not accepted_samples:
+                analysis_reason = "Language-ID service failed: " + "; ".join(dict.fromkeys(service_errors))
+            elif len(accepted_samples) < 2:
+                analysis_reason = f"Only {len(accepted_samples)}/{len(samples)} samples met the 60% confidence threshold; at least 2 agreeing samples are required"
+            else:
+                analysis_reason = f"Samples did not agree on one language ({agreement}/{len(samples)} agreed)"
             metadata_code = _audio_language_code(metadata)
             mismatch = bool(detected_code and not language_matches(detected_code, metadata))
             results.append((path, index, metadata, '', detected_code, confidence, json.dumps(samples, ensure_ascii=False), 1 if mismatch else 0))
+            diagnostics.append({'type_index': index, 'metadata_language': metadata, 'detected_language': detected_code,
+                                'confidence': confidence, 'mismatch': mismatch, 'analysis_reason': analysis_reason,
+                                'sample_agree': agreement, 'sample_total': len(samples), 'samples': samples})
     if is_final(path) or source_stamp(path) != initial_stamp:
         return {'path': path, 'skipped': 'final_version_or_source_changed', 'results': []}
     with connection() as db:
@@ -546,9 +601,9 @@ def process_audio_language_detection(task_id: int, payload: dict) -> dict:
             VALUES(?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)""", results)
     update_progress(task_id, len(streams) * len(sample_positions), len(streams) * len(sample_positions), 'Audio language detection completed')
     mark_read_models_fresh(path, "voice", {"modified": int(Path(path).stat().st_mtime), "size": Path(path).stat().st_size})
-    mismatches = sum(row[-1] for row in results)
+    mismatches = sum(row[7] for row in results)
     logger.info('audio_language_detection event=completed path=%s streams=%d mismatches=%d', path.replace('\n', '\\n'), len(results), mismatches)
-    return {'path': path, 'streams': len(results), 'mismatches': mismatches, 'results': [{'type_index': row[1], 'metadata_language': row[2], 'detected_language': row[4], 'confidence': row[5], 'mismatch': bool(row[7])} for row in results]}
+    return {'path': path, 'streams': len(results), 'mismatches': mismatches, 'results': diagnostics}
 
 
 TASK_HANDLERS = {"media_edit": process_media_edit, "media_reindex": process_media_reindex, "audio_language_detection": process_audio_language_detection}
@@ -557,8 +612,8 @@ TASK_HANDLERS = {"media_edit": process_media_edit, "media_reindex": process_medi
 DEFAULT_TASK_PRIORITIES = [
     "media_edit", "matroska_layout_remux", "tv_filtered_stream_edit_batch", "tv_filtered_stream_edit_now", "filtered_stream_edit_now",
     "tv_filtered_stream_edit", "filtered_stream_edit", "movie_import",
-    "audio_language_detection", "subtitle_html_cleanup", "image_subtitle_convert", "review_audio_prepare",
-    "media_reindex", "plex_sync", "plex_import_refresh", "index_check_prepare", "index_rebuild_prepare",
+    "audio_language_detection", "subtitle_html_cleanup", "subtitle_autofix", "image_subtitle_convert", "review_audio_prepare",
+    "media_reindex", "plex_sync", "plex_import_refresh", "index_check_prepare", "index_rebuild_prepare", "scheduled_task_dispatch",
 ]
 
 def task_priority_order() -> list[str]:
@@ -640,7 +695,7 @@ def run_queue(lane: str = "main") -> None:
             # 0/N behind hundreds of older maintenance tasks.
             if light_lane:
                 row = db.execute(f"""SELECT * FROM task_queue
-                    WHERE status='pending' AND {runnable} AND task_type IN ('index_check_prepare','index_rebuild_prepare')
+                    WHERE status='pending' AND {runnable} AND task_type IN ('index_check_prepare','index_rebuild_prepare','scheduled_task_dispatch')
                     ORDER BY {priority_case}, id LIMIT 1""", [wait_cutoff, *priorities]).fetchone()
             elif lane == "bulk":
                 row = db.execute(f"""SELECT * FROM task_queue
@@ -649,8 +704,8 @@ def run_queue(lane: str = "main") -> None:
                              {priority_case}, id LIMIT 1""", [wait_cutoff, utc_now(), *priorities]).fetchone()
             else:
                 row = db.execute(f"""SELECT * FROM task_queue
-                    WHERE status='pending' AND {runnable} AND task_type NOT IN ('media_reindex','index_check_prepare','index_rebuild_prepare','tv_filtered_stream_edit_batch','tv_filtered_stream_edit','filtered_stream_edit','tv_filtered_stream_edit_now','filtered_stream_edit_now')
-                    ORDER BY CASE WHEN task_type IN ('tv_filtered_stream_edit_now','filtered_stream_edit_now') THEN 0 WHEN task_type='audio_language_detection' THEN 2 ELSE ({workflow_stage_case}) END, CASE WHEN EXISTS (SELECT 1 FROM task_queue_expedite boost WHERE boost.task_id=task_queue.id AND boost.expires_at > ?) THEN 0 ELSE 1 END, CASE WHEN task_type IN ({system_marks}) AND created_at < ? THEN 0 ELSE 1 END, {workflow_wait_case}, {priority_case}, CASE WHEN task_type IN ('tv_filtered_stream_edit_now','filtered_stream_edit_now') THEN 0
+                    WHERE status='pending' AND {runnable} AND task_type NOT IN ('media_reindex','index_check_prepare','index_rebuild_prepare','scheduled_task_dispatch','tv_filtered_stream_edit_batch','tv_filtered_stream_edit','filtered_stream_edit','tv_filtered_stream_edit_now','filtered_stream_edit_now')
+                    ORDER BY CASE WHEN task_type='subtitle_autofix' AND payload_json::jsonb->>'mode'='now' THEN 0 ELSE 1 END, CASE WHEN task_type IN ('tv_filtered_stream_edit_now','filtered_stream_edit_now') THEN 0 WHEN task_type='audio_language_detection' THEN 2 ELSE ({workflow_stage_case}) END, CASE WHEN EXISTS (SELECT 1 FROM task_queue_expedite boost WHERE boost.task_id=task_queue.id AND boost.expires_at > ?) THEN 0 ELSE 1 END, CASE WHEN task_type IN ({system_marks}) AND created_at < ? THEN 0 ELSE 1 END, {workflow_wait_case}, {priority_case}, CASE WHEN task_type IN ('tv_filtered_stream_edit_now','filtered_stream_edit_now') THEN 0
                                   WHEN task_type IN ('tv_filtered_stream_edit','filtered_stream_edit') THEN 1 ELSE 2 END,
                              CASE WHEN task_type IN ('tv_filtered_stream_edit_now','filtered_stream_edit_now','tv_filtered_stream_edit','filtered_stream_edit') THEN id END DESC,
                              id LIMIT 1""", [wait_cutoff, utc_now(), *SYSTEM_TASK_TYPES, scheduler_system_cutoff(), *priorities]).fetchone()
@@ -668,7 +723,6 @@ def run_queue(lane: str = "main") -> None:
         task_id, task_type = row["id"], row["task_type"]
         logger.info("task_queue event=task_started lane=%s id=%d type=%s attempt=%d", lane, task_id, task_type, row["attempts"] + 1)
         started = time.monotonic()
-        stage_started = False
         bulk_slot = False
         task_payload = {}
         luw_id = None
@@ -676,7 +730,10 @@ def run_queue(lane: str = "main") -> None:
         try:
             from app.job_safety import recovery, record, task_context
             task_payload = json.loads(row["payload_json"])
+            source_path = affected_media_path(task_type, task_payload)
             completed_receipt, resuming = recovery(task_id, task_type, task_payload)
+            if source_path and not completed_receipt:
+                require_media_file(source_path)
             if not resuming:
                 validate_media_signature(task_type, task_payload)
             stage_path = affected_media_path(task_type, task_payload)
@@ -707,7 +764,6 @@ def run_queue(lane: str = "main") -> None:
                 # from malformed/orphaned workflow groups.
                 time.sleep(0.5)
                 continue
-            stage_started = True
             if lane == "bulk":
                 bulk_edit_semaphore.acquire()
                 bulk_slot = True
@@ -762,15 +818,27 @@ def run_queue(lane: str = "main") -> None:
                 bulk_edit_semaphore.release()
                 bulk_slot = False
             message = str(getattr(exc, "detail", exc))
+            permanent_missing = isinstance(exc, PermanentMediaMissing)
+            if isinstance(exc, FileNotFoundError) and luw_path:
+                try:
+                    require_media_file(luw_path)
+                except PermanentMediaMissing as missing:
+                    message, permanent_missing = str(missing), True
+                except OSError:
+                    pass
+                except RuntimeError:
+                    pass
             # Make the failed phase visible: a bookkeeping retry is not an
             # instruction to repeat an already-recorded media mutation.
             progress_message = 'Failed'
+            if permanent_missing:
+                progress_message = 'Permanent failure: media missing'
             try:
                 from app.job_safety import receipt
                 if receipt(task_id, 'handler'):
                     progress_message = 'Media operation completed; completion bookkeeping needs retry'
                     message = progress_message + ': ' + message
-                elif receipt(task_id, 'html'):
+                elif receipt(task_id, 'html') or receipt(task_id, 'autofix'):
                     progress_message = 'Subtitle changes recorded; retry resumes verified progress'
                     message = progress_message + ': ' + message
             except Exception:
@@ -789,18 +857,23 @@ def run_queue(lane: str = "main") -> None:
                     db.execute("UPDATE task_queue SET status='cancelled',error=?,progress_message='Discarded: media changed',finished_at=?,updated_at=? WHERE id=?", (message, utc_now(), utc_now(), task_id))
                 logger.info("audio_language_detection event=discarded_obsolete task=%d", task_id)
                 continue
-            if stage_started:
-                try:
-                    fail_task_stage(task_payload.get("_queue_group"), task_type, affected_media_path(task_type, task_payload), message, task_id)
-                except Exception as workflow_exc:
-                    logger.exception("workflow event=stage_failure_persist_failed id=%d error=%s", task_id, workflow_exc)
             with connection() as db:
+                # A signature/recovery check may fail before begin_task_stage.
+                # Publish both terminal projections in one transaction; do not
+                # leave an unexecutable "Pending" stage blocking deletion or
+                # dependent work. Keep all recovery evidence intact.
+                fail_task_stage(task_payload.get("_queue_group"), task_type,
+                                affected_media_path(task_type, task_payload), message,
+                                task_id, db=db.raw, allow_pending=True)
+                if permanent_missing:
+                    finalize_missing_workflow(db.raw, task_payload.get('_queue_group'),
+                                              affected_media_path(task_type, task_payload), message)
                 db.execute(
                     "UPDATE task_queue SET status='failed',error=?,progress_message=?,finished_at=?,updated_at=? WHERE id=?",
                     (message[-4000:], progress_message, utc_now(), utc_now(), task_id),
                 )
             failed_path = affected_media_path(task_type, json.loads(row["payload_json"]))
-            if failed_path:
+            if failed_path and not permanent_missing and task_type != 'audio_language_detection':
                 try:
                     from app.v80 import request_media_indexes
                     request_media_indexes(failed_path, ["core"], "Queued media change failed; refresh subtitle detection")
@@ -953,7 +1026,9 @@ def list_queue(limit: int = 200, status: str | None = None, task_type: str | Non
     items = []
     for row in rows:
         item = dict(row)
-        item["payload"] = json.loads(item.pop("payload_json"))
+        item["payload"] = public_task_payload(item['task_type'], json.loads(item.pop("payload_json")))
+        item['failure_code'] = 'media_missing' if str(item.get('error') or '').startswith(MISSING_PREFIX) else None
+        item['retryable'] = item['status'] == 'failed' and not item['failure_code']
         raw_result = item.pop("result_json", None)
         item["result"] = json.loads(raw_result) if raw_result else None
         items.append(item)
@@ -1173,7 +1248,7 @@ def retry_tasks_atomically(db, where: str, params: list) -> int:
     # Publish pending only in the same commit that reopens the exact stage.
     # A failure rolls back both records; workers never see a half-retried job.
     _lock_workflow_mutation(db.raw)
-    rows = db.execute(f"SELECT id,group_id FROM task_queue WHERE {where} FOR UPDATE", params).fetchall()
+    rows = db.execute(f"SELECT id,group_id FROM task_queue WHERE {where} AND COALESCE(error,'') NOT LIKE 'Permanent failure [media_missing]:%' FOR UPDATE", params).fetchall()
     for row in rows:
         reset_task_stage_for_retry(row['group_id'], row['id'], db=db.raw)
         db.execute("UPDATE task_queue SET status='pending',error=NULL,started_at=NULL,finished_at=NULL,progress_current=0,progress_total=0,progress_message='Waiting',updated_at=? WHERE id=?", (utc_now(), row['id']))
@@ -1234,7 +1309,7 @@ def retry_queue_item(task_id: int) -> dict:
     with connection() as db:
         changed = retry_tasks_atomically(db, "id=? AND status='failed'", [task_id])
     if not changed:
-        raise HTTPException(409, "Only failed queue items can be retried")
+        raise HTTPException(409, "This job cannot be retried. Permanent missing-media failures require a new job if the media returns.")
     logger.info("task_queue event=retry_requested id=%d", task_id)
     wake_queue()
     return task_row(task_id)

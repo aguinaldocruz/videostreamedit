@@ -53,8 +53,8 @@ def monitor_performance() -> None:
         try:
             snapshot = performance_snapshot()
             repaired = index_queues.reconcile_index_workflow_stages()
-            from app.job_safety import reconcile_orphans, reconcile_terminal_groups
-            retired = reconcile_orphans() + reconcile_terminal_groups()
+            from app.job_safety import reconcile_orphans, reconcile_terminal_groups, reconcile_terminal_owners
+            retired = reconcile_terminal_owners() + reconcile_orphans() + reconcile_terminal_groups()
             if retired:
                 logger.info('workflow event=abandoned_groups_retired count=%s', retired)
             if monitor_shutdown.is_set():

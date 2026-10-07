@@ -30,7 +30,7 @@ from app.v51 import (
     has_removable_html,
     TEXT_SUBTITLE_CODECS,
     SubtitleCleanup,
-    apply_subtitle_cleanup,
+    apply_subtitle_cleanups,
     cached_subtitle_text,
     complete_extracted_text,
 )
@@ -281,6 +281,7 @@ def persist_library(library: dict, records: list[tuple], aliases: list[tuple], w
         retired_paths.update(moved_paths)
         if retired_paths:
             db.executemany("DELETE FROM subtitle_cache_media WHERE path=?", [(path,) for path in retired_paths])
+            db.executemany("DELETE FROM subtitle_image_cache_media WHERE path=?", [(path,) for path in retired_paths])
             db.executemany("DELETE FROM subtitle_cache_pending WHERE path=?", [(path,) for path in retired_paths])
             db.executemany("DELETE FROM subtitle_cache_failure WHERE path=?", [(path,) for path in retired_paths])
         db.execute("INSERT INTO plex_sync_state(library_key,watermark,last_check,last_rebuild) VALUES(?,?,CAST(CURRENT_TIMESTAMP AS TEXT),CASE WHEN ? THEN CAST(CURRENT_TIMESTAMP AS TEXT) ELSE NULL END) ON CONFLICT(library_key) DO UPDATE SET watermark=excluded.watermark,last_check=CAST(CURRENT_TIMESTAMP AS TEXT),last_rebuild=CASE WHEN ? THEN CAST(CURRENT_TIMESTAMP AS TEXT) ELSE plex_sync_state.last_rebuild END", (library["library_key"], watermark, bool(rebuild), bool(rebuild)))
@@ -358,6 +359,9 @@ def process_plex_sync(task_id: int, payload: dict) -> dict:
     rebuild = bool(payload.get("rebuild"))
     if not plex_sync_lock.acquire(blocking=False):
         raise RuntimeError("Another Plex synchronization is already running")
+    from app import scheduled_job_log as job_log
+    run_id = job_log.begin('plex_sync', payload.get('source', 'manual'), task_id=task_id)
+    job_log.running(run_id, 'Reading selected Plex libraries; media processing remains incremental')
     try:
         libraries = selected_libraries()
         if not libraries:
@@ -366,6 +370,7 @@ def process_plex_sync(task_id: int, payload: dict) -> dict:
         changed = 0
         catalog_records = 0
         for number, library in enumerate(libraries, 1):
+            job_log.record(run_id, 'Checking library: '+library['title'])
             tasks.update_progress(task_id, number - 1, len(libraries), f"Checking {library['title']}")
             since = 0 if rebuild else initial_watermark(library["library_key"])
             # A full, metadata-only catalog pass is required to detect Plex
@@ -449,6 +454,8 @@ def process_plex_sync(task_id: int, payload: dict) -> dict:
                     mark_read_models_fresh(changed_path, "plex", {"modified": record[10] or 0, "size": int(record[9] or 0)})
             changed += len(changed_records)
             catalog_records += len(records)
+            job_log.record(run_id, f"{library['title']} · {len(all_items)} Plex items · {len(records)} catalog records refreshed · {len(changed_records)} new/changed media · {len(internal_scopes)} project changes ignored")
+            job_log.record_many(run_id, [{'message': 'New/changed media discovered; core indexing requested', 'path': record[0]} for record in changed_records])
             logger.info("plex_sync event=library_processed mode=%s library=%s items=%d catalog_items=%d media=%d file_changes=%d step=%d total=%d", "rebuild" if rebuild else "incremental", library["title"].replace("\n", "\\n"), len(items), len(all_items), len(records), len(changed_records), number, len(libraries))
         from app.v80 import prune_orphaned_index_entries
         prune_orphaned_index_entries()
@@ -457,18 +464,23 @@ def process_plex_sync(task_id: int, payload: dict) -> dict:
             total = db.execute("SELECT count(*) FROM plex_media").fetchone()[0]
         tasks.update_progress(task_id, len(libraries), len(libraries), "Plex catalog updated")
         logger.info("plex_sync event=completed mode=%s libraries=%d scanned_media=%d changed_media=%d catalog_media=%d", "rebuild" if rebuild else "incremental", len(libraries), catalog_records, changed, total)
+        job_log.finish(run_id, 'completed', f'{len(libraries)} libraries checked · {catalog_records} records refreshed · {changed} media changed · {total} catalog media')
         return {"mode": "rebuild" if rebuild else "incremental", "libraries": len(libraries), "changed_media": changed, "scanned_media": catalog_records, "media": total}
+    except Exception as exc:
+        job_log.finish(run_id, 'failed', str(exc))
+        raise
     finally:
         plex_sync_lock.release()
 
 
 def process_subtitle_html(task_id: int, payload: dict) -> dict:
     # A bulk report request can contain several HTML streams from one media.
-    # They must be one media-level task: each remux changes the file signature,
-    # so separate child tasks would make every later stream fail its safety
-    # check even though the requested changes are compatible.
-    cleanups = payload.get("cleanups") or []
-    total = len(cleanups) or 1
+    # Prepare all of them together; one atomic replacement is this media's LUW.
+    # Old partially completed receipts remain resumable without remuxing the
+    # subtitles that were already committed by an earlier worker version.
+    path = str(payload.get("path") or "")
+    cleanups = payload.get("cleanups") or [{"type_index": payload.get("type_index"), "external_path": payload.get("external_path")}]
+    total = len(cleanups)
     from app.job_safety import receipt, record, verify_output
     saved = receipt(task_id, 'html')
     if saved:
@@ -476,31 +488,37 @@ def process_subtitle_html(task_id: int, payload: dict) -> dict:
     def checkpoint(result, count):
         record(task_id, 'html', {'result': result, 'count': count,
                                 'signature': tasks.media_configuration_signature(result['path'])})
-    tasks.update_progress(task_id, 0, total + 1, "Removing subtitle HTML tags")
-    if cleanups:
-        result = saved['result'] if saved else {"changed": False, "path": str(payload.get("path") or ""), "cleaned": 0}
-        for position, cleanup in enumerate(cleanups, 1):
-            if saved and position <= saved['count']:
-                continue
-            request = SubtitleCleanup(path=result["path"], type_index=cleanup.get("type_index"), external_path=cleanup.get("external_path"))
-            item_result = apply_subtitle_cleanup(request, operation_id=f"task-{task_id}-{position}")
-            result["changed"] = result["changed"] or bool(item_result.get("changed"))
-            result["cleaned"] += 1
-            checkpoint(result, position)
-            tasks.update_progress(task_id, position, total + 1, f"Cleaning subtitle {position} of {total}")
-    else:
-        result = saved['result'] if saved else apply_subtitle_cleanup(SubtitleCleanup.model_validate(payload), operation_id=f"task-{task_id}")
-        checkpoint(result, 1)
-        tasks.update_progress(task_id, 1, total + 1, "Subtitle cleanup completed")
+    done = int(saved['count']) if saved else 0
+    result = dict(saved['result']) if saved else {"changed": False, "path": path, "cleaned": 0}
+    if not saved:
+        # A rename may have committed immediately before power/DB loss, before
+        # the aggregate HTML receipt was written. Recovery has validated these
+        # durable file receipts; finish follow-up even if cleanup is now a no-op.
+        targets = {str(Path(path).resolve())} | {str(Path(item["external_path"]).resolve()) for item in cleanups if item.get("external_path")}
+        from app.job_safety import stamp
+        for target in targets:
+            committed = receipt(task_id, 'file:' + target)
+            if committed and committed.get('after') and all(stamp(target).get(key) == value for key, value in committed['after'].items()):
+                result['changed'] = True
+                break
+    if done < total:
+        requests = [SubtitleCleanup(path=result["path"], type_index=item.get("type_index"), external_path=item.get("external_path"))
+                    for item in cleanups[done:]]
+        item_result = apply_subtitle_cleanups(
+            result["path"], requests, operation_id=f"task-{task_id}",
+            progress=lambda step, message: tasks.update_progress(task_id, step, 8, message),
+        )
+        result.update({**item_result, "changed": result["changed"] or bool(item_result.get("changed")), "cleaned": total})
+        checkpoint(result, total)
     if result["changed"]:
-        tasks.update_progress(task_id, total, total + 1, "Queueing subtitle indexes")
+        tasks.update_progress(task_id, 7, 8, "Queueing metadata refresh, then subtitle inspection")
         from app.v80 import request_media_indexes
         # HTML/ASS markup cleanup changes presentation only. Preserve existing
         # subtitle language detection; refresh HTML and damage metadata only
         # when the cleanup actually changed a subtitle.
         register_internal_change_scope(result["path"], {"subtitle_indices": "all"}, "Subtitle HTML removed")
-        request_media_indexes(result["path"], ["subtitles"], "Subtitle HTML removed")
-    tasks.update_progress(task_id, total + 1, total + 1, "Subtitle cleanup completed")
+        request_media_indexes(result["path"], ["core", "subtitles"], "Subtitle HTML removed")
+    tasks.update_progress(task_id, 8, 8, "Subtitle cleanup completed")
     return result
 
 
@@ -959,8 +977,12 @@ def process_image_subtitle_convert(task_id: int, payload: dict) -> dict:
     try:
         with output_space(media.parent, int(original_stamp['size'] * 1.1) + 64 * 1024**2):
             run_write_command(command, media.parent)
+            from app.matroska_remux import ensure_front_track_headers
+            ensure_front_track_headers(temporary)
             os.chmod(temporary, media.stat().st_mode)
             replace_prepared(temporary, media, original_stamp)
+            from app.matroska_layout import safe_checkpoint
+            safe_checkpoint(media, force=True)
         _ocr_stage_update(stage_id, "converted")
         with plex.connection() as db:
             db.execute("UPDATE ocr_staged_backups SET converted_path=?,converted_signature=? WHERE id=?", (str(media), json.dumps(stamp(media)), stage_id))
@@ -1081,14 +1103,18 @@ def finalize_ocr_converted(stage_id: int) -> dict:
         return {"id": stage_id, "status": "converted", "path": str(original), "already_final": True}
     if not artifact or artifact.parent != OCR_STAGE_ROOT.resolve() or not artifact.is_file():
         raise HTTPException(404, "Preserved converted candidate is missing")
-    temporary = original.with_name(f".{original.name}.vse-finalize")
+    temporary = original.with_name(f".{original.stem}.vse-finalize{original.suffix}")
     try:
         from app.job_safety import stamp, output_space, copy_recovery, replace_prepared
         before = stamp(original)
         with output_space(original.parent, artifact.stat().st_size):
             copy_recovery(artifact, temporary)
+            from app.matroska_remux import ensure_front_track_headers
+            ensure_front_track_headers(temporary)
             os.chmod(temporary, original.stat().st_mode)
             replace_prepared(temporary, original, before)
+            from app.matroska_layout import safe_checkpoint
+            safe_checkpoint(original, force=True)
     finally:
         temporary.unlink(missing_ok=True)
     # The candidate now lives at its final media path. Keep only the original
@@ -1199,7 +1225,7 @@ def run_plex_scheduler() -> None:
         try:
             value = plex_schedule_data()
             if plex_schedule_due(value):
-                tasks.enqueue("plex_sync", {"rebuild": False, "source": "schedule"}, "Scheduled Plex incremental check", deduplicate=True)
+                queue_logged_plex_check('schedule')
                 now = datetime.now().astimezone().isoformat(timespec="seconds")
                 with plex.connection() as db:
                     db.execute("UPDATE plex_sync_schedule SET last_run=?,updated_at=CURRENT_TIMESTAMP WHERE id=1", (now,))
@@ -1226,6 +1252,8 @@ def reconcile_startup_artifacts() -> None:
             if value:
                 parent_dirs.add(str(Path(value).resolve().parent))
     patterns = (".*.subtitle-clean.vse-*.mkv", ".*.subtitle-clean.vse-*.mp4", ".*.subtitle-clean.vse.mkv", ".*.subtitle-clean.vse.mp4", ".*.vse-ocr-*.mkv", ".*.vse-ocr-*.mp4", ".*.vse-ocr.mkv", ".*.vse-ocr.mp4", ".*.vse-rollback-*", ".*.vse-rollback", ".*.vse-finalize", ".*.vse-*.tmp", ".*.vse-remux-*.mkv")
+    patterns += (".*.vse-layout-*.mkv", ".*.vse-finalize.mkv", ".*.vse-finalize.mka", ".*.vse-finalize.mks", ".*.vse-finalize.mk3d")
+    patterns += tuple(f".*.subtitle-clean.vse-*{suffix}" for suffix in (".mka", ".mks", ".mk3d", ".webm", ".mov", ".m4v"))
     active_payload = " ".join(str(row["payload_json"] or "") for row in rows)
     removed = 0
     cutoff = time.time() - 600
@@ -1303,7 +1331,14 @@ def start_plex_scheduler() -> None:
 
 @app.post("/api/v68/plex/check")
 def queue_plex_check() -> dict:
-    return tasks.enqueue("plex_sync", {"rebuild": False, "source": "manual"}, "Plex incremental check", deduplicate=True)
+    return queue_logged_plex_check('manual')
+
+
+def queue_logged_plex_check(source: str) -> dict:
+    task = tasks.enqueue("plex_sync", {"rebuild": False, "source": source}, "Plex incremental check", deduplicate=True)
+    from app import scheduled_job_log as job_log
+    job_log.begin('plex_sync', source, task_id=task['id'])
+    return task
 
 
 @app.post("/api/v68/plex/rebuild")

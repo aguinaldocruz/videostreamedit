@@ -3,7 +3,7 @@
   const dialog=document.querySelector('#stream-dialog'),form=document.querySelector('#stream-form');
   if(!dialog||!form)return;
   let phase='ready',opening=Promise.resolve(),generation=0,submitting=false;
-  const busy=()=>phase==='loading'||phase==='saving';
+  const busy=()=>phase==='loading'||phase==='saving'||Boolean(window.streamFinalVersionOpening)||Boolean(window.isMovieImportBusy?.())||Boolean(window.isStreamQueueSubmissionBusy?.());
   window.isStreamEditorBusy=busy;
   const draft=()=>Boolean(window.activeTvDraftForPath?.(state.selectedPath)?.session_id);
   const header=dialog.querySelector('.dialog-title>div');
@@ -13,7 +13,8 @@
   if(!reset.isConnected)footer?.insertBefore(reset,footer.querySelector('[data-close-stream]'));
   window.updateStreamEditorContext=function(count=queuedChangeCount()){
     const context=dialog.querySelector('.stream-editor-context');
-    if(context)context.textContent=phase==='loading'?'Loading stream properties…':draft()?'TV-show draft · Apply now updates the draft only. Save the show to change files.':'Direct media editing · Apply now or add changes to the queue.';
+    const importing=Boolean(movieImportMode?.editing);
+    if(context)context.textContent=phase==='loading'?'Loading stream properties…':window.streamFinalVersionOpening?'Checking Final Version status…':importing?'Media import · Changes apply to the copied movie or episode; the source is kept unless you explicitly request removal.':draft()?'TV-show draft · Apply now updates the draft only. Save the show to change files.':'Direct media editing · Apply now or add changes to the queue.';
     dialog.dataset.editorMode=draft()?'draft':'direct';
     dialog.dataset.editorPhase=phase;
     const content=dialog.querySelector('#stream-content');if(content)content.inert=busy();
@@ -21,7 +22,7 @@
     if(draft()&&final)final.title='Final-version changes are applied to this TV-show draft only';
     reset.classList.remove('hidden');reset.hidden=!count;reset.disabled=busy();
     const submit=form.querySelector('[type=submit]');
-    if(submit){submit.disabled=busy()||!count;submit.textContent=phase==='saving'?'Processing…':draft()?'Apply now':count?`Apply ${count} change${count===1?'':'s'}`:'Apply changes';}
+    if(submit){submit.disabled=busy()||(!importing&&!count);submit.textContent=busy()?'Processing…':importing?count?`Copy media with ${count} change${count===1?'':'s'}`:'Copy media':draft()?'Apply now':count?`Apply ${count} change${count===1?'':'s'}`:'Apply changes';}
     dialog.querySelector('#selected-file')?.setAttribute('title',dialog.querySelector('#selected-file').textContent);
   };
   const previousOpen=openEditor;
@@ -49,7 +50,7 @@
   };
   reset.onclick=async()=>{
     if(busy()||!confirm('Discard the unapplied edits on this screen? Previously applied TV-show draft changes are kept.'))return;
-    await openEditor(state.selectedPath,dialog.querySelector('#selected-file').textContent);
+    await openEditor(state.selectedPath,dialog.querySelector('#selected-file').textContent,{preserveFinal:true});
   };
   // Block navigation/close while an operation owns the editor. Read-only
   // tools and the Apply/Queue choice dialog retain their normal behavior.

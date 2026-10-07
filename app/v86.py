@@ -704,4 +704,7 @@ def order_startup_hooks() -> None:
     shutdown[:] = monitors + [hook for hook in shutdown if hook not in monitors]
 
 
+# Explicit subtitle review is registered after the queue/editor layers exist.
+from app import subtitle_autofix_media as _subtitle_autofix_media  # noqa: E402,F401
+
 order_startup_hooks()

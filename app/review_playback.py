@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import shutil
@@ -58,31 +59,88 @@ def close_session(identity: str):
                     pass
 
 
-def _pump(session: dict):
-    process = session['process']
-    for line in process.stdout:
-        if line.startswith('out_time_us='):
-            try:
-                session['produced'] = max(0, int(line.split('=', 1)[1]) / 1000000)
-            except ValueError:
-                pass
-
-
 def playback_command(request: PlaybackRequest, media: Path, directory: Path, plan: dict, staged: Path | None):
     command = ['nice', '-n', '10', 'ffmpeg', '-nostdin', '-hide_banner', '-loglevel', 'error',
-               '-threads', '2', '-readrate', '3', '-ss', str(request.start), '-i', str(media)]
+               '-threads', '2', '-copyts', '-readrate', '3']
+    if request.start:
+        command += ['-ss', str(request.start)]
+    command += ['-i', str(media)]
     if staged:
-        command += ['-ss', str(request.start), '-i', str(staged)]
+        command += ['-itsoffset', str(plan['source_origin']), '-ss', str(request.start), '-i', str(staged)]
     if request.mode in ('av', 'video'):
         command += ['-map', '0:v:0']
         command += ['-c:v', 'copy'] if plan['video_copy'] else ['-c:v', 'libx264', '-threads', '2', '-preset', 'veryfast', '-crf', '23', '-pix_fmt', 'yuv420p', '-force_key_frames', 'expr:gte(t,n_forced*4)']
     if request.mode in ('av', 'audio'):
         command += ['-map', '1:a:0' if staged else f'0:a:{request.audio_index}']
+        # Accurate audio trimming against a keyframe-preroll video would remove
+        # its matching audio. Keep both on the same source clock when copying.
         command += ['-c:a', 'copy'] if plan['audio_copy'] and not request.force_aac else ['-c:a', 'aac', '-profile:a', 'aac_low', '-ac', '2', '-ar', '48000', '-b:a', '192k', '-threads', '2']
-    command += ['-sn', '-dn', '-avoid_negative_ts', 'make_zero', '-progress', 'pipe:1', '-stats_period', '0.5',
-                '-f', 'hls', '-hls_time', '4', '-hls_list_size', '18', '-hls_delete_threshold', '3',
-                '-hls_flags', 'delete_segments+temp_file', '-hls_segment_filename', str(directory / 'part_%06d.ts'), str(directory / 'index.m3u8')]
+    command += ['-sn', '-dn', '-avoid_negative_ts', 'disabled',
+                '-f', 'hls', '-hls_time', '4', '-hls_list_size', '18', '-hls_delete_threshold', '3']
+    if request.mode=='audio':
+        # Audio-only MPEG-TS/PES can repeat packet timestamps and create gaps.
+        # A single-track MP4 fragment preserves AAC configuration/continuity.
+        command += ['-hls_segment_type', 'fmp4', '-hls_fmp4_init_filename', 'init.mp4']
+        suffix = 'm4s'
+    else:
+        command += ['-hls_segment_options', 'avoid_negative_ts=disabled:mpegts_copyts=1:mpegts_flags=+resend_headers']
+        suffix = 'ts'
+    command += ['-hls_flags', 'delete_segments+temp_file', '-hls_segment_filename', str(directory / f'part_%06d.{suffix}'), str(directory / 'index.m3u8')]
     return command
+
+
+def _buffer_state(session: dict):
+    """Measure completed segments, not FFmpeg's rebased progress clock.
+
+    copyts progress is not a reliable source position after a seek. Counting
+    newly published segments also keeps read-ahead bounded when the playlist
+    slides, independently of encoder delay and B-frame presentation order.
+    """
+    directory = session['directory']
+    playlist = directory / 'index.m3u8'
+    try:
+        lines = playlist.read_text().splitlines()
+    except FileNotFoundError:
+        return
+    sequence = next((int(line.split(':', 1)[1]) for line in lines if line.startswith('#EXT-X-MEDIA-SEQUENCE:')), 0)
+    durations = [float(line.split(':', 1)[1].split(',')[0]) for line in lines if line.startswith('#EXTINF:')]
+    for index, duration in enumerate(durations, sequence):
+        if index > session.get('last_segment', -1):
+            session['buffer_duration'] = session.get('buffer_duration', 0) + duration
+            session['last_segment'] = index
+    if not durations:
+        return
+    if session.get('timeline_origin') is None:
+        # Inspect only the first complete fragment. No second catalog scan and
+        # no media decoding. This is also an anchor for native-HLS browsers.
+        mp4 = session['mode']=='audio'
+        first = directory / f'part_{sequence:06d}.{"m4s" if mp4 else "ts"}'
+        source = f'concat:{directory / "init.mp4"}|{first}' if mp4 else str(first)
+        probe = ['ffprobe', '-v', 'error', '-read_intervals', '%+#12',
+                 '-show_packets', '-show_entries', 'packet=pts_time,dts_time', '-of', 'json']
+        result = subprocess.run(probe + [source],
+                                capture_output=True, timeout=10)
+        timestamps = json.loads(result.stdout or b'{}').get('packets', []) if not result.returncode else []
+        dts = [float(item['dts_time']) for item in timestamps if 'dts_time' in item]
+        pts = [float(item['pts_time']) for item in timestamps if 'pts_time' in item]
+        if not dts or not pts or not all(math.isfinite(value) for value in dts + pts):
+            raise RuntimeError('Could not establish a reliable playback/subtitle timeline')
+        timeline_origin = min(dts) - session['source_origin']
+        presentation_start = min(pts) - session['source_origin']
+        if mp4:
+            # HLS.js ignores MP4 edit lists. Measure their constant offset for
+            # this ONE audio track instead of trusting a guessed seek origin.
+            raw = subprocess.run(probe + ['-ignore_editlist', '1', source], capture_output=True, timeout=10)
+            raw_packets = json.loads(raw.stdout or b'{}').get('packets', []) if not raw.returncode else []
+            raw_dts = [float(item['dts_time']) for item in raw_packets if 'dts_time' in item]
+            if not raw_dts or not all(math.isfinite(value) for value in raw_dts):
+                raise RuntimeError('Could not establish the audio-only fragment clock')
+            session['container_offset'] = min(dts) - min(raw_dts)
+        session['presentation_start'] = presentation_start
+        # Publish readiness last: clients must not read a partly calibrated
+        # audio-only clock while the second packet probe is still running.
+        session['timeline_origin'] = timeline_origin
+    session['produced'] = session['timeline_origin'] + session['buffer_duration']
 
 
 def _worker(session: dict, request: PlaybackRequest, media: Path, plan: dict, staged: Path | None):
@@ -98,21 +156,26 @@ def _worker(session: dict, request: PlaybackRequest, media: Path, plan: dict, st
         if not acquired:
             return
         session['phase'] = 'buffering'
-        session['message'] = ('Copying compatible video' if plan['video_copy'] else 'Converting video for browser playback') + ('; copying audio' if plan['audio_copy'] else '; converting audio to AAC stereo') + '; waiting for first complete segment/keyframe'
+        actions = []
+        if request.mode in ('av', 'video'):
+            actions.append('Copying compatible video' if plan['video_copy'] else 'Converting video for browser playback')
+        if request.mode in ('av', 'audio'):
+            actions.append('Copying AAC-LC audio' if plan['audio_copy'] else 'Converting audio to AAC-LC stereo')
+        session['message'] = '; '.join(actions) + '; checking synchronized timestamps and first complete segment/keyframe'
         if shutil.disk_usage(ROOT).free < RESERVE:
             raise RuntimeError('Playback paused: insufficient temporary disk space')
         directory.mkdir(mode=0o700)
         with (directory / 'error.log').open('w') as error:
-            process = subprocess.Popen(playback_command(request, media, directory, plan, staged), stdout=subprocess.PIPE,
+            process = subprocess.Popen(playback_command(request, media, directory, plan, staged), stdout=subprocess.DEVNULL,
                                        stderr=error, text=True, start_new_session=True)
             session['process'] = process
-            threading.Thread(target=_pump, args=(session,), daemon=True).start()
             paused = False
             while process.poll() is None:
                 if session['cancel'].wait(.25) or time.monotonic() - session['access'] > 90:
                     break
                 if shutil.disk_usage(ROOT).free < RESERVE or sum(p.stat().st_size for p in directory.iterdir() if p.is_file()) > SESSION_LIMIT:
                     raise RuntimeError('Playback stopped at the temporary-space safety limit')
+                _buffer_state(session)
                 want_pause = session['produced'] > session['position'] + 45
                 if want_pause != paused:
                     os.killpg(process.pid, signal.SIGSTOP if want_pause else signal.SIGCONT)
@@ -130,6 +193,7 @@ def _worker(session: dict, request: PlaybackRequest, media: Path, plan: dict, st
         if acquired:
             SLOTS.release()
             acquired = False
+        _buffer_state(session)
         # Finished producers still have a short buffer the viewer may use.
         while not session['cancel'].wait(2) and time.monotonic() - session['access'] < 90:
             pass
@@ -169,6 +233,10 @@ def create_playback(request: PlaybackRequest):
     if request.force_aac:
         plan['audio_copy'] = False
     total = float((metadata.get('format') or {}).get('duration') or 0)
+    source_origin = float((metadata.get('format') or {}).get('start_time') or 0)
+    if not math.isfinite(source_origin):
+        raise HTTPException(422, 'Media has an invalid source timestamp origin')
+    plan['source_origin'] = source_origin
     request.start = min(request.start, max(0, total - .5)) if total else request.start
     ROOT.mkdir(parents=True, exist_ok=True)
     with LOCK:
@@ -184,11 +252,16 @@ def create_playback(request: PlaybackRequest):
         if request.session_id in SESSIONS or sum(not s.get('done') for s in SESSIONS.values()) >= 6:
             raise HTTPException(429, 'Review capacity is busy; close another player and retry')
         session = {'directory': ROOT / request.session_id, 'cancel': threading.Event(), 'access': time.monotonic(),
-                   'position': 0, 'produced': 0, 'error': None, 'done': False, 'start': request.start,
+                   'position': request.start, 'produced': request.start, 'buffer_duration': 0,
+                   'timeline_origin': None, 'presentation_start': None,
+                   'source_origin': source_origin,
+                   'mode': request.mode, 'container_offset': 0,
+                   'error': None, 'done': False, 'start': request.start,
                    'phase': 'waiting', 'message': 'Waiting for an available playback worker (bounded server capacity)'}
         SESSIONS[request.session_id] = session
     threading.Thread(target=_worker, args=(session, request, media, plan, staged), daemon=True).start()
-    return {'session_id': request.session_id, 'duration': total, 'start': request.start, 'plan': plan,
+    return {'session_id': request.session_id, 'duration': total, 'start': request.start,
+            'source_origin': source_origin, 'plan': plan,
             'manifest_url': f'/api/review/playback/{request.session_id}/index.m3u8'}
 
 
@@ -201,10 +274,13 @@ def playback_status(identity: str):
     session['access'] = time.monotonic()
     playlist = session['directory'] / 'index.m3u8'
     try:
-        ready = playlist.exists() and '#EXTINF:' in playlist.read_text()
+        ready = session['timeline_origin'] is not None and playlist.exists() and '#EXTINF:' in playlist.read_text()
     except FileNotFoundError:
         ready = False
-    return {'ready': ready, 'error': session['error'], 'done': session['done'], 'buffered_seconds': round(session['produced'], 1),
+    return {'ready': ready, 'error': session['error'], 'done': session['done'],
+            'timeline_origin': session['timeline_origin'], 'presentation_start': session['presentation_start'],
+            'container_offset': session['container_offset'],
+            'buffered_seconds': round(session['buffer_duration'], 1),
             'phase': session['phase'], 'message': session['message']}
 
 
@@ -214,7 +290,7 @@ def heartbeat(identity: str, request: Heartbeat):
     if session:
         session['access'] = time.monotonic()
         session['position'] = request.position
-    return {'active': bool(session and not session['done'])}
+    return {'active': bool(session and not session['done']), 'error': session.get('error') if session else 'Playback session expired'}
 
 
 @app.delete('/api/review/playback/{identity}')
@@ -228,13 +304,14 @@ def cancel_playback(identity: str):
 @app.get('/api/review/playback/{identity}/{filename}')
 def playback_file(identity: str, filename: str):
     session = SESSIONS.get(identity)
-    if not session or not re.fullmatch(r'(index\.m3u8|part_\d+\.ts)', filename):
+    if not session or not re.fullmatch(r'(index\.m3u8|init\.mp4|part_\d+\.(ts|m4s))', filename):
         raise HTTPException(404, 'Playback buffer expired')
     session['access'] = time.monotonic()
     target = session['directory'] / filename
     if not target.is_file():
         raise HTTPException(404, 'Playback buffer no longer contains this position; seek again')
-    return FileResponse(target, media_type='application/vnd.apple.mpegurl' if filename.endswith('m3u8') else 'video/mp2t', headers={'Cache-Control': 'no-store'})
+    media_type = 'application/vnd.apple.mpegurl' if filename.endswith('m3u8') else 'video/mp2t' if filename.endswith('ts') else 'audio/mp4'
+    return FileResponse(target, media_type=media_type, headers={'Cache-Control': 'no-store'})
 
 
 @app.get('/api/review/subtitle')

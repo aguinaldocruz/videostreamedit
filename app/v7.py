@@ -56,6 +56,7 @@ class ReorderEditRequest(BaseModel):
     remove: list[str] = []
     defer_language_detection: bool = False
     audio_compatibility: list[AudioCompatibility] = []
+    subtitle_color: str | None = Field(default=None, pattern=r'^#[0-9a-fA-F]{6}$')
 
 
 def episode_key(episode: dict) -> tuple:
@@ -315,6 +316,8 @@ def _reorder_edit_impl(request: ReorderEditRequest) -> dict:
         else:
             run_write_command(command, source.parent)
         persist_remux_language_tags(temporary, request, ordered, external_by_path)
+        from app.matroska_remux import ensure_front_track_headers
+        ensure_front_track_headers(temporary)
         if audio_integrations:
             output = probe(temporary)
             audio_streams = [s for s in output.get('streams', []) if s.get('codec_type') == 'audio']
@@ -335,6 +338,8 @@ def _reorder_edit_impl(request: ReorderEditRequest) -> dict:
                 os.fsync(prepared.fileno())
             integration_intent(request.audio_compatibility, temporary)
         replace_prepared(temporary, source, original_stamp)
+        from app.matroska_layout import safe_checkpoint
+        safe_checkpoint(source, force=True)
         if audio_integrations:
             from app.review_audio import integration_complete
             try:

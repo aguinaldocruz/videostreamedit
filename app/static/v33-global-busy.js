@@ -26,9 +26,18 @@ function busyContext(resource, options) {
     const payload = options?.body && typeof options.body === 'string' ? JSON.parse(options.body) : null;
     mediaPath = payload?.path || payload?.edit?.path || payload?.request?.path || payload?.paths?.[0] || payload?.request?.paths?.[0] || '';
   } catch (_) { /* Non-JSON request bodies have no media context. */ }
-  const operation = endpoint.includes('language-detection/stream') ? 'Detecting stream language'
+  const operation = endpoint.includes('/import/movie') ? 'Importing media'
+    : endpoint === '/api/subtitle-autofix/prepare' ? 'Preparing subtitle autofix previews'
+    : endpoint === '/api/subtitle-autofix/options' ? 'Loading subtitle autofix rules'
+    : endpoint.startsWith('/api/subtitle-autofix/reviews/') && endpoint.endsWith('/apply') ? 'Submitting approved subtitle autofix'
+    : endpoint.includes('/subtitle-autofix/preview') ? 'Previewing subtitle autofix replacements'
+    : endpoint.includes('/subtitle-autofix/rules') ? 'Saving subtitle autofix configuration'
+    : endpoint.includes('/import/cleanup') ? 'Removing verified import source files'
+    : endpoint.includes('language-detection/stream') ? 'Detecting stream language'
     : endpoint.includes('evaluate-forced') ? 'Evaluating subtitles'
     : endpoint.includes('/media/edit') ? 'Applying stream changes'
+    : endpoint === '/api/v65/queue' ? 'Adding changes to the task queue'
+    : endpoint.includes('/api/v89/preflight') ? 'Validating queued changes'
     : endpoint.includes('/stream-preview/') ? 'Preparing stream preview'
     : endpoint.includes('/index/request') ? 'Updating media indexes'
     : endpoint.includes('/media/rename') ? 'Renaming media'
@@ -55,11 +64,12 @@ function revealGlobalBusy() {
 
 function beginGlobalBusy(context = '', immediate = false) {
   clearTimeout(globalBusyReleaseTimer);
+  if (!globalBusyRequests) globalBusyProgress = null;
   globalBusyRequests++;
   if (context) globalBusyContext = context;
   // Fast requests remain invisible; operations lasting beyond this threshold
   // use the same progress overlay and animated ring as bulk processing.
-  if (globalBusyRequests === 1 && !document.getElementById('global-busy-overlay')) {
+  if ((immediate || globalBusyRequests === 1) && !document.getElementById('global-busy-overlay')) {
     clearTimeout(globalBusyRevealTimer);
     if (immediate) { globalBusyRevealTimer = null; revealGlobalBusy(); }
     else globalBusyRevealTimer = setTimeout(() => { globalBusyRevealTimer = null; revealGlobalBusy(); }, 350);
@@ -69,6 +79,9 @@ function beginGlobalBusy(context = '', immediate = false) {
     const context = globalBusyContext || 'Processing…';
     document.querySelector('#global-busy-overlay .busy-card strong')?.replaceChildren(context);
     document.querySelector('[data-busy-context]')?.replaceChildren(context);
+    // A nested HTTP request is part of the explicitly tracked operation;
+    // do not hide its step/progress explanation behind generic fetch text.
+    applyGlobalBusyProgress();
   }
 }
 
@@ -157,7 +170,9 @@ window.waitForGlobalTasks = async function (taskIds) {
 
 window.fetch = async function (resource, options) {
   const tracked = isApplicationRequest(resource, options);
-  if (tracked) beginGlobalBusy(busyContext(resource, options));
+  // State-changing actions need acknowledgement immediately. Read-only
+  // browsing/polling endpoints remain excluded above and stay non-blocking.
+  if (tracked) beginGlobalBusy(busyContext(resource, options), true);
   try { return await originalFetch(resource, options); }
   finally { if (tracked) endGlobalBusy(); }
 };

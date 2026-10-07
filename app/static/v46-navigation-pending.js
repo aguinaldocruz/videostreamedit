@@ -1,6 +1,13 @@
 (function () {
   let pendingNavigation = null;
 
+  window.completePendingStreamNavigation = () => {
+    const action = pendingNavigation;
+    pendingNavigation = null;
+    $('#pending-navigation-dialog')?.close();
+    return action?.();
+  };
+
   function ensurePendingNavigationDialog() {
     if ($('#pending-navigation-dialog')) return;
     document.body.insertAdjacentHTML('beforeend', `<dialog id="pending-navigation-dialog" class="pending-navigation-dialog">
@@ -13,12 +20,7 @@
       $('#pending-navigation-dialog').close();
       $('#stream-dialog')?.focus({preventScroll: true});
     });
-    $('#move-without-applying').onclick = () => {
-      const action = pendingNavigation;
-      pendingNavigation = null;
-      $('#pending-navigation-dialog').close();
-      action?.();
-    };
+    $('#move-without-applying').onclick = window.completePendingStreamNavigation;
     $('#apply-before-navigation').onclick = () => {
       pendingNavigation = null;
       $('#pending-navigation-dialog').close();

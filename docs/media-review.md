@@ -14,7 +14,8 @@ conversion or full-catalog run is started by this feature.
   explicitly unsupported, never silently burned into video.
 - The full-media slider and ±10-second controls seek within the current browser
   buffer when possible; other positions request a new short server buffer.
-  Native container/keyframe boundaries can affect seek precision.
+  A preceding keyframe is copied for decoding, then skipped in the browser to
+  reach the requested position without shifting subtitle timing.
 - Video-only works without an audio stream. Subtitle-only displays text and
   offers queued HTML removal where applicable. Downloaded subtitle text opens
   in a separate popup; staged subtitles can also be selected for overlay review.
@@ -23,11 +24,39 @@ conversion or full-catalog run is started by this feature.
 
 ## Compatibility and resource limits
 
-Compatible H.264 video and AAC audio are copied. Other audio uses temporary
+Compatible H.264 video and verified AAC-LC mono/stereo at 44.1/48 kHz are copied.
+Unknown AAC profiles, surround audio and other codecs use temporary
 AAC-LC, 48 kHz, stereo, 192 kbit/s. Incompatible video uses a bounded two-thread
 H.264 conversion. Browser MediaCapabilities checks supplement codec metadata;
 runtime errors still matter. **Try AAC stereo playback** forces audio conversion
 without changing the media. It does not repair an undecodable/damaged source.
+
+### Synchronization and playback reliability
+
+FFmpeg preserves the original common video/audio timestamps (`copyts`), including
+seek preroll. The player maps HLS.js's measured timestamp offset back to the
+source's timestamp origin; video, audio, subtitle cues and the timeline slider
+share that clock. The requested seek time is never used as a guessed subtitle
+offset. The inner transport muxer also preserves timestamps rather than adding
+its own negative-timestamp shift. See [FFmpeg's timestamp options](https://ffmpeg.org/ffmpeg.html#Advanced-options).
+
+Video playback uses timestamp-preserving transport segments. Audio-only uses
+fragmented MP4 to avoid audio packet discontinuities at transport/PES boundaries;
+the first fragment's edit-list offset is measured before playback becomes ready.
+Both paths retain the original movie position when changing playback mode.
+
+AAC-LC is explicitly declared to HLS.js for both copied and converted audio;
+the browser is not left to guess AAC-LC versus HE-AAC. Subtitle tracks are hidden
+until their cue times are mapped, and obsolete tracks are disabled before removal.
+Generation checks isolate delayed callbacks from earlier stream selections.
+Changing playback releases the previous decoder and server producer immediately.
+An overlay failure is reported and pauses review, rather than silently presenting
+a subtitle-less video as a successful synchronized review.
+
+Read-ahead is measured from completed HLS segments and source-time heartbeats,
+not FFmpeg's progress clock, which can rebase after seeking. A small bounded
+timestamp probe reads only the first completed temporary segment. No full-media
+conversion, additional catalog scan or permanent media change is required.
 
 `MEDIA_REVIEW_WORKERS` defaults to 2 (allowed 1–3). At most six active/waiting
 sessions exist. FFmpeg runs at lower CPU priority with bounded read-ahead,
@@ -74,3 +103,12 @@ mounts/credentials. `scripts/test_review_player.py` exercises real browser HLS,
 subtitle switching, audio switching, rapid seeks, video-only playback, layout,
 real AAC staging and add/replace approval, stale-source rejection and cleanup.
 The fixture contains generated H.264 video, AAC and AC3 audio, and a text subtitle.
+It includes B-frames, six-second keyframe spacing and a nonzero source origin.
+`scripts/test_review_sync.py` checks active subtitle cues after non-keyframe seeks,
+copied/transcoded audio changes, decoded 440/660 Hz browser tones, audio-only
+playback, rapid cancellation, stale-track disabling and
+producer cleanup. `scripts/test_review_timeline.py` verifies nine real FFmpeg
+copy combinations, encoded AAC payloads, bounded priming-frame differences and
+continuous timestamps. Its optional `--media FILE` checks a short read-only sample
+with each audio track; it never modifies the selected file. Browser integration
+currently covers Chromium/HLS.js; native-HLS Safari still needs device validation.

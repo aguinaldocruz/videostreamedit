@@ -160,13 +160,13 @@ def _aac_browser_safe(stream: dict) -> bool:
     tag = str(stream.get("codec_tag_string") or "").casefold()
     rate = int(float(stream.get("sample_rate") or 0)) if str(stream.get("sample_rate") or "").replace(".", "", 1).isdigit() else 0
     channels = int(stream.get("channels") or 0)
-    if codec != "aac" or rate not in (0, 44100, 48000) or channels > 6:
+    if codec != "aac" or rate not in (44100, 48000) or channels not in (1, 2):
         return False
     # AAC-LC is object type 2 and the most portable browser/HLS profile.
     if profile in {"lc", "aac lc", "low complexity"}:
         return True
     # Some containers omit the profile but expose the MPEG-4 object tag.
-    return not profile and ("mp4a.40.2" in tag or tag == "mp4a")
+    return not profile and "mp4a.40.2" in tag
 
 
 def _review_plan(metadata: dict, mode: str, audio_index: int | None, subtitles: list[dict], subtitle_source: str, subtitle_index: int | None) -> dict:

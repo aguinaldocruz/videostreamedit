@@ -50,4 +50,10 @@ with TemporaryDirectory() as temp:
     late.write_bytes(header + tracks + cluster)
     assert scope["revalidate_warning_rows"]([saved]) == set()
     assert database.execute("SELECT status FROM matroska_layout_check WHERE path=?", (str(late),)).fetchone()["status"] == "ok"
+    import os
+    before = late.stat()
+    late.write_bytes(header + cluster + tracks)
+    os.utime(late, ns=(before.st_atime_ns, before.st_mtime_ns))
+    assert scope["checkpoint"](late) == "ok"  # unchanged size/mtime cache
+    assert scope["checkpoint"](late, force=True) == "tracks_after_cluster"
 print("PASS: bounded Matroska header-order check and changed-media checkpoint")

@@ -9,7 +9,6 @@ from pathlib import Path
 from fastapi import HTTPException
 
 import app.v7 as media_editor
-import app.v28 as movie_import
 from app.v2 import make_language
 from app.v5 import plex_language_pair, split_tag
 from app.v40 import app, record_track_name_corrections
@@ -38,7 +37,6 @@ def typed_streams(data: dict) -> dict[str, list[dict]]:
         if stream.get("codec_type") in result:
             result[stream["codec_type"]].append(stream)
     return result
-
 
 def old_track_names(typed: dict[str, list[dict]]) -> dict[tuple[str, int], str]:
     return {
@@ -186,6 +184,11 @@ def apply_in_place(source: Path, request: media_editor.ReorderEditRequest, typed
             mismatches = _verify_language_updates(source, request)
             if mismatches:
                 raise HTTPException(422, "Language metadata verification failed: " + "; ".join(mismatches))
+        # Record the applied metadata even if a subsequent layout repair fails;
+        # recovery must not mistake that failure for an untouched original.
+        inplace_checkpoint(source, before, applied=True)
+        from app.matroska_remux import ensure_front_track_headers
+        ensure_front_track_headers(source, live=True)
         try:
             os.utime(source, ns=(original.st_atime_ns, original.st_mtime_ns))
         except OSError as exc:
@@ -198,6 +201,8 @@ def apply_in_place(source: Path, request: media_editor.ReorderEditRequest, typed
             warnings.append(f"Could not remove {subtitle.name}: {exc}")
     if command:
         inplace_checkpoint(source, before, applied=True)
+        from app.matroska_layout import safe_checkpoint
+        safe_checkpoint(source, force=True)
     media = str(source).replace("\n", "\\n")
     for track in request.tracks:
         changed = []
@@ -242,7 +247,10 @@ def optimized_media_edit(request: media_editor.ReorderEditRequest) -> dict:
     typed = typed_streams(data)
     before = old_track_names(typed)
     structural, external_removed = requires_container_rewrite(request, typed)
-    if source.suffix.lower() in MATROSKA_EXTENSIONS and not structural:
+    if request.subtitle_color:
+        from app.subtitle_color import apply_color_edit
+        result = apply_color_edit(request)
+    elif source.suffix.lower() in MATROSKA_EXTENSIONS and not structural:
         result = apply_in_place(source, request, typed, external_removed)
     else:
         logger.info(
@@ -258,6 +266,11 @@ def optimized_media_edit(request: media_editor.ReorderEditRequest) -> dict:
         result["final_version"] = set_final_version(FinalVersionRequest(path=request.path, final_version=bool(request.final_version)))
         result["operation"] = "single_remux"
     record_track_name_corrections(request, before)
+    if request.subtitle_color and result.get('operation') == 'single_remux' and result.get('_color_cache'):
+        from app.subtitle_color import publish_color_cache
+        publish_color_cache(source, result.pop('_color_cache', {}))
+    else:
+        result.pop('_color_cache', None)
     try:
         from app.v80 import (
             detection_scope_for_edit,
@@ -268,6 +281,3 @@ def optimized_media_edit(request: media_editor.ReorderEditRequest) -> dict:
     except Exception as exc:
         logger.warning("subtitle_detection event=post_edit_reindex_failed file=%s error=%s", str(request.path).replace("\n", "\\n"), str(exc).replace("\n", " ")[-300:])
     return result
-
-
-movie_import.reorder_edit = optimized_media_edit

@@ -1,11 +1,8 @@
 from __future__ import annotations
 
 import logging
-import os
 import re
 import subprocess
-import tempfile
-import uuid
 from pathlib import Path
 
 from fastapi import HTTPException, Query
@@ -13,7 +10,7 @@ from pydantic import BaseModel
 
 import app.v38 as movie_index
 from app.v2 import probe
-from app.v5 import checked_external, external_subtitles
+from app.v5 import external_subtitles
 from app.v11 import column_exists, connection
 from app.v28 import authorized_import_file
 from app.v50 import app
@@ -96,17 +93,27 @@ def complete_extracted_text(path: Path, selector: str) -> str:
         raise HTTPException(503, 'Complete subtitle extraction unavailable or timed out; original retained') from exc
 
 
-def cached_subtitle_text(media: Path, source: str, type_index: int, external_path: str = "", snapshot: tuple | None = None) -> str | None:
+def cached_subtitle_text(media: Path, source: str, type_index: int, external_path: str = "", snapshot: tuple | None = None,
+                         *, with_details: bool = False, mutation_input: bool = False):
     """Use only source-verified complete text; a miss keeps the old read path."""
     try:
-        if snapshot is not None:
+        if snapshot is not None or with_details or mutation_input:
             from app.subtitle_cache import get_valid_track
+            if snapshot is None:
+                from app.subtitle_cache_worker import text_track_manifest
+                signature, tracks = text_track_manifest(media)
+                snapshot = (signature, { (t["source"], t["type_index"], t["external_path"]) for t in tracks })
             signature, keys = snapshot
             key = (source, type_index, external_path)
             if key not in keys:
                 return None
             track = get_valid_track(str(media), signature, key)
-            return track.text if track else None
+            # Older FFmpeg-decoded caches can have normalized tags or hidden
+            # bad source bytes. Keep them readable, but refresh only affected
+            # tracks before using their text to replace a media stream.
+            if track and mutation_input and track.extraction_revision < 2:
+                return None
+            return (track if with_details else track.text) if track else None
         from app.subtitle_cache_worker import cached_track_text
         return cached_track_text(media, source, type_index, external_path)
     except Exception as exc:
@@ -116,7 +123,10 @@ def cached_subtitle_text(media: Path, source: str, type_index: int, external_pat
 
 def damage_kind(text: str) -> str:
     """Return conservative SRT corruption markers, not ordinary accented text."""
+    from app.subtitle_damage_policy import has_mojibake, language_punctuation_only, isolated_letter_stats, OCR_REASON
     issues = []
+    if not text.strip():
+        return "Empty subtitle track (no cues)"
     if "\ufffd" in text:
         issues.append("Replacement characters")
     controls = sum(1 for char in text if ord(char) < 32 and char not in "\r\n\t")
@@ -126,7 +136,7 @@ def damage_kind(text: str) -> str:
     timings = len(re.findall(r"(?m)^\s*\d{1,2}:\d{2}:\d{2}[,.]\d{1,3}\s+-->\s+\d{1,2}:\d{2}:\d{2}[,.]\d{1,3}", text))
     if cue_numbers and not timings:
         issues.append("Malformed SRT timing")
-    if re.search(r"(?:Ã.|Â.|â€|â€™|â€œ|â€)", text):
+    if has_mojibake(text):
         issues.append("Possible mojibake")
     # Do not classify a subtitle merely because its language is outside the
     # configured detector. Only flag substantial payloads with almost no
@@ -134,15 +144,12 @@ def damage_kind(text: str) -> str:
     payload = re.sub(r"^\s*\d+\s*$|^\s*\d{1,2}:\d{2}:\d{2}[,.]\d{1,3}\s+-->.*$", " ", text, flags=re.MULTILINE)
     printable = "".join(char for char in payload if char.isprintable() and not char.isspace())
     letters = sum(char.isalpha() for char in printable)
-    if len(printable) >= 40 and letters < max(4, len(printable) // 12) and not re.search(r"[♪♫]", payload):
+    if len(printable) >= 40 and letters < max(4, len(printable) // 12) and not re.search(r"[♪♫]", payload) and not language_punctuation_only(printable):
         issues.append("No recognizable text")
-    # A common failed bitmap-OCR signature is many isolated letters instead of
-    # words. Require a meaningful sample so short dialogue such as "I am" is
-    # not reported as damaged.
-    tokens = re.findall(r"[^\W\d_]+", payload, flags=re.UNICODE)
-    isolated = sum(1 for token in tokens if len(token) == 1)
-    if len(tokens) >= 12 and isolated >= 8 and isolated / len(tokens) >= 0.35:
-        issues.append("Likely OCR gibberish (isolated letters)")
+    # Inspect visible dialogue, not HTML/ASS tokens or letters inside time
+    # notation. A high ratio alone is not proof: require fragmented runs too.
+    if isolated_letter_stats(text).suspicious:
+        issues.append(OCR_REASON)
     return " + ".join(dict.fromkeys(issues)) or "None"
 
 
@@ -174,12 +181,18 @@ def inspect_extended(path: Path, text_cache: dict | None = None, *, cache_only: 
             if text is None:
                 if cache_only:
                     raise SubtitleCachePending(f"Subtitle {subtitle_index + 1} is not cached yet")
-                text = cached_subtitle_text(path, "embedded", subtitle_index, snapshot=snapshot)
+                cached = cached_subtitle_text(path, "embedded", subtitle_index, snapshot=snapshot, with_details=True)
+                text = cached.text if cached else None
+                if cached:
+                    text_cache[("source_encoding", *cache_key)] = cached.source_encoding
                 if text is None:
                     text = extracted_text(path, f"0:s:{subtitle_index}")
                 text_cache[cache_key] = text
-            encoding, markup = "UTF-8 (container)", markup_kind(text)
+            encoding = text_cache.get(("source_encoding", *cache_key)) or "UTF-8 (container)"
+            markup = markup_kind(text)
             damage = damage_kind(text)
+            if "inferred" in encoding:
+                damage = "Non-UTF-8 source bytes" + (" + " + damage if damage != "None" else "")
         else:
             encoding, markup, damage = "Bitmap", "Graphical", "None"
         found.append((str(path), "embedded", subtitle_index, "", codec, encoding, markup, damage))
@@ -192,7 +205,8 @@ def inspect_extended(path: Path, text_cache: dict | None = None, *, cache_only: 
             if cache_only:
                 raise SubtitleCachePending(f"External subtitle is not cached yet: {subtitle.name}")
             original_sample, encoding = decode_external(subtitle.read_bytes()[:2_000_000])
-            cached = (cached_subtitle_text(path, "external", -1, str(subtitle), snapshot=snapshot) or original_sample, encoding)
+            saved = cached_subtitle_text(path, "external", -1, str(subtitle), snapshot=snapshot)
+            cached = (saved if saved is not None else original_sample, encoding)
             text_cache[cache_key] = cached
         elif isinstance(cached, str):
             cached = (cached, "UTF-8 (cached)") if cache_only else (cached, decode_external(subtitle.read_bytes()[:2_000_000])[1])
@@ -245,24 +259,29 @@ def subtitle_properties(path: str) -> dict:
 
 @app.get("/api/v51/subtitle-cache-status")
 def subtitle_cache_status(path: str) -> dict:
-    """Live, source- and checksum-verified per-track status for stream properties."""
+    """Live source-verified per-track status for stream properties."""
     from app.subtitle_cache import valid_cached_keys
-    from app.subtitle_cache_worker import TEXT_CODECS, TEXT_SIDECAR_SUFFIXES, text_track_manifest
+    from app.subtitle_cache_worker import TEXT_CODECS, TEXT_SIDECAR_SUFFIXES, image_track_manifest, text_track_manifest
+    from app.subtitle_image_cache import IMAGE_CODECS, cached_image_indexes
 
     media = authorized_import_file(path)
     metadata = probe(media)
     signature, tracks = text_track_manifest(media, metadata)
     eligible = {(track["source"], track["type_index"], track["external_path"]) for track in tracks}
     valid = valid_cached_keys(str(media), signature) & eligible
+    image_signature, image_tracks = image_track_manifest(media, metadata)
+    image_eligible = {track["type_index"] for track in image_tracks}
+    valid_images = cached_image_indexes(str(media), image_signature) & image_eligible
     result = []
     subtitle_index = 0
     for stream in metadata.get("streams", []):
         if stream.get("codec_type") != "subtitle":
             continue
         key = ("embedded", subtitle_index, "")
+        codec_name = str(stream.get("codec_name") or "").casefold()
         result.append({"source": key[0], "type_index": key[1], "external_path": key[2],
-                       "cacheable": str(stream.get("codec_name") or "").casefold() in TEXT_CODECS,
-                       "cached": key in valid})
+                       "cacheable": codec_name in TEXT_CODECS or codec_name in IMAGE_CODECS,
+                       "cached": key in valid or subtitle_index in valid_images})
         subtitle_index += 1
     for item in external_subtitles(media):
         subtitle = Path(item["path"])
@@ -301,151 +320,26 @@ def validate_cleaned_srt(expected: str, actual: str) -> None:
         raise RuntimeError("Subtitle cleanup output changed cue count or dialogue; original retained")
 
 
-def _publish_cleaned_cache(media: Path, source: str, type_index: int, external_path: str, verified_srt: str) -> None:
-    # Media replacement has already passed verification. A cache outage must
-    # not turn that completed filesystem edit into a retryable failed job.
-    try:
-        from app.subtitle_cache_worker import publish_edited_track
-        publish_edited_track(media, source, type_index, external_path, verified_srt)
-    except Exception as exc:
-        logger.warning("subtitle_cache event=edited_track_publish_failed path=%s error=%s", media, str(exc).replace("\n", " ")[:300])
-
-
-def clean_external_html(subtitle: Path, operation_id: str | None = None, media: Path | None = None) -> bool:
-    from app.job_safety import stamp, replace_prepared, output_space
-    original = stamp(subtitle)
-    text, current = decode_external(subtitle.read_bytes())
-    if media is not None and subtitle.suffix.casefold() == ".srt":
-        text = cached_subtitle_text(media, "external", -1, str(subtitle)) or text
-    if not has_removable_html(text):
-        logger.info("change=subtitle_html_cleanup_skipped reason=no_tags file=%s source=external", str(subtitle).replace("\n", "\\n"))
-        return False
-    codecs = {"UTF-8": "utf-8", "UTF-8 BOM": "utf-8-sig", "UTF-16": "utf-16", "Windows-1252": "cp1252"}
-    token = re.sub(r"[^A-Za-z0-9_-]", "", str(operation_id or uuid.uuid4().hex))[-48:]
-    temporary = subtitle.with_name(f".{subtitle.name}.vse-{token}.tmp")
-    clean = strip_html(text)
-    try:
-        with output_space(subtitle.parent, original['size'] * 2):
-            temporary.write_bytes(clean.encode(codecs[current], errors="replace"))
-            verified, _ = decode_external(temporary.read_bytes())
-            if subtitle.suffix.casefold() == ".srt":
-                validate_cleaned_srt(clean, verified)
-            elif not verified or has_removable_html(verified):
-                raise RuntimeError("External subtitle cleanup output verification failed")
-            os.chmod(temporary, subtitle.stat().st_mode)
-            replace_prepared(temporary, subtitle, original)
-    finally:
-        temporary.unlink(missing_ok=True)
-    if media is not None:
-        if subtitle.suffix.casefold() == ".srt":
-            _publish_cleaned_cache(media, "external", -1, str(subtitle), verified)
-        else:
-            try:
-                from app.subtitle_cache_worker import _extract_track
-                normalized = _extract_track(media, {"source": "external", "type_index": -1, "external_path": str(subtitle), "codec": subtitle.suffix[1:].casefold()}).text
-                _publish_cleaned_cache(media, "external", -1, str(subtitle), normalized)
-            except Exception as exc:
-                logger.warning("subtitle_cache event=external_refresh_failed path=%s error=%s", subtitle, str(exc).replace("\n", " ")[:300])
-                try:
-                    from app.subtitle_cache import invalidate_media
-                    invalidate_media(str(media))
-                except Exception:
-                    logger.warning("subtitle_cache event=external_invalidation_failed path=%s", media)
-    return True
-
-
-def clean_embedded(media: Path, type_index: int, operation_id: str | None = None) -> bool:
-    from app.job_safety import stamp, replace_prepared, output_space, run_write_command
-    original = stamp(media)
-    streams = probe(media).get("streams", [])
-    subtitle_globals = [index for index, stream in enumerate(streams) if stream.get("codec_type") == "subtitle"]
-    if type_index < 0 or type_index >= len(subtitle_globals):
-        raise HTTPException(404, "Subtitle stream was not found")
-    selected_global = subtitle_globals[type_index]
-    # Cleanup must inspect the whole stream. Some valid subtitles have their
-    # first event well after the 15-minute indexing sample.
-    text = cached_subtitle_text(media, "embedded", type_index)
-    if text is None:
-        text = complete_extracted_text(media, f"0:s:{type_index}")
-    if not text:
-        raise HTTPException(422, "Only text subtitles can have markup removed")
-    if not has_removable_html(text):
-        # Cleanup requests may have been queued from an older preview/index or
-        # the same stream may already have been cleaned. Treat that as complete
-        # instead of aborting unrelated edits in the same task.
-        logger.info("change=subtitle_html_cleanup_skipped reason=no_tags file=%s stream=subtitle:%d", str(media).replace("\n", "\\n"), type_index)
-        return False
-    clean = strip_html(text)
-    with tempfile.TemporaryDirectory(prefix="vse-subtitle-") as folder:
-        subtitle = Path(folder) / "clean.srt"
-        subtitle.write_text(clean, encoding="utf-8")
-        token = re.sub(r"[^A-Za-z0-9_-]", "", str(operation_id or uuid.uuid4().hex))[-48:]
-        temporary = media.with_name(f".{media.stem}.subtitle-clean.vse-{token}{media.suffix}")
-        command = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-i", str(media), "-i", str(subtitle)]
-        subtitle_output = 0
-        for global_index, stream in enumerate(streams):
-            if global_index == selected_global:
-                command += ["-map", "1:0"]
-            else:
-                command += ["-map", f"0:{global_index}"]
-            if stream.get("codec_type") == "subtitle":
-                if global_index == selected_global:
-                    command += [f"-c:s:{subtitle_output}", "srt"]
-                subtitle_output += 1
-        command += ["-map_metadata", "0", "-map_chapters", "0", "-c", "copy"]
-        selected = streams[selected_global]
-        tags = selected.get("tags") or {}
-        if tags.get("language"):
-            command += [f"-metadata:s:s:{type_index}", f"language={tags["language"]}"]
-        if tags.get("title") is not None:
-            command += [f"-metadata:s:s:{type_index}", f"title={tags.get("title") or ""}"]
-        disposition = selected.get("disposition") or {}
-        flags = "+".join(name for name, enabled in disposition.items() if enabled) or "0"
-        command += [f"-disposition:s:{type_index}", flags, str(temporary)]
-        # This path is owned by the current task. Remove an artifact left by a
-        # previous interrupted attempt, then allow FFmpeg to replace it.
-        temporary.unlink(missing_ok=True)
-        command.insert(1, "-y")
-        try:
-            with output_space(media.parent, int(original['size'] * 1.1) + 64 * 1024**2):
-                run_write_command(command, media.parent)
-                # Verify a readable container with the same stream count before
-                # publishing it. A zero-exit encoder alone is not verification.
-                if len(probe(temporary).get('streams', [])) != len(streams):
-                    raise RuntimeError('Subtitle cleanup output stream verification failed')
-                verified = complete_extracted_text(temporary, f"0:s:{type_index}")
-                validate_cleaned_srt(clean, verified)
-                os.chmod(temporary, media.stat().st_mode)
-                replace_prepared(temporary, media, original)
-        except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
-            temporary.unlink(missing_ok=True)
-            raise HTTPException(422, (getattr(exc, "stderr", None) or "Subtitle cleanup failed")[-1600:]) from exc
-        except RuntimeError as exc:
-            raise HTTPException(422, str(exc)[:1600]) from exc
-        finally:
-            temporary.unlink(missing_ok=True)
-    _publish_cleaned_cache(media, "embedded", type_index, "", verified)
-    return True
+def apply_subtitle_cleanups(path: str, requests: list[SubtitleCleanup], operation_id: str | None = None, progress=None) -> dict:
+    """One media-level cleanup shared by individual, bulk and editor requests."""
+    from app.v86 import assert_media_editable
+    from app.subtitle_cleanup import clean_subtitles
+    assert_media_editable(path)
+    media = authorized_import_file(path)
+    if any(Path(request.path).resolve() != media for request in requests):
+        raise HTTPException(400, "Subtitle cleanup targets must belong to the same media")
+    result = clean_subtitles(media, [request.model_dump() for request in requests], operation_id=operation_id, progress=progress)
+    # Legacy movie stream projection tables were removed in the canonical
+    # index migration.  Invalidate only the current subtitle index; the task
+    # workflow queues the dependent stages after this function returns.
+    if result["changed"]:
+        with connection() as db:
+            db.execute("DELETE FROM subtitle_extended_index WHERE path=?", (str(media),))
+            db.execute("DELETE FROM subtitle_extended_media WHERE path=?", (str(media),))
+        logger.info("change=subtitle_html_removed file=%s targets=%d", str(media).replace("\n", "\\n"), result["changed_subtitles"])
+    return result
 
 
 @app.post("/api/v51/subtitle-cleanup")
 def apply_subtitle_cleanup(request: SubtitleCleanup, operation_id: str | None = None) -> dict:
-    from app.v86 import assert_media_editable
-    assert_media_editable(request.path)
-    media = authorized_import_file(request.path)
-    if request.external_path:
-        subtitle = checked_external(media, request.external_path)
-        changed = clean_external_html(subtitle, operation_id, media)
-        target = subtitle.name
-    else:
-        changed = clean_embedded(media, request.type_index if request.type_index is not None else -1, operation_id)
-        target = f"subtitle:{request.type_index}"
-    # Legacy movie stream projection tables were removed in the canonical
-    # index migration.  Invalidate only the current subtitle index; the task
-    # workflow queues the dependent stages after this function returns.
-    if changed:
-        with connection() as db:
-            db.execute("DELETE FROM subtitle_extended_index WHERE path=?", (str(media),))
-            db.execute("DELETE FROM subtitle_extended_media WHERE path=?", (str(media),))
-        logger.info("change=subtitle_html_removed file=%s target=%s", str(media).replace("\n", "\\n"), target.replace("\n", "\\n"))
-    return {"changed": changed, "path": str(media)}
+    return apply_subtitle_cleanups(request.path, [request], operation_id=operation_id)

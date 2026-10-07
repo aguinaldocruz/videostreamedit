@@ -2,10 +2,10 @@ let configuredOutputRoot = '', currentImportOutput = '', outputSetupBrowsePath =
 
 function ensureOutputSetup() {
   if (!$('#movie-output-settings')) {
-    $('#movie-import-settings').insertAdjacentHTML('beforeend', '<hr><h3 id="movie-output-settings">Movie output</h3><p>Choose the default destination root. Import browsing stays inside this folder.</p><div id="movie-import-output-path" class="import-path">Not configured</div><button type="button" id="browse-import-output">Choose output folder</button>');
+    $('#movie-import-settings').insertAdjacentHTML('beforeend', '<hr><h3 id="movie-output-settings">Media output</h3><p>Choose the default destination root. Import browsing stays inside this folder.</p><div id="movie-import-output-path" class="import-path">Not configured</div><button type="button" id="browse-import-output">Choose output folder</button>');
     $('#browse-import-output').onclick = () => openOutputSetupBrowser('/');
   }
-  if (!$('#output-setup-dialog')) document.body.insertAdjacentHTML('beforeend', '<dialog id="output-setup-dialog"><div class="dialog-title"><div><h2>Default movie output folder</h2><code id="output-setup-current">/</code></div><button type="button" class="icon-close" data-close-output-setup>×</button></div><div id="output-setup-list" class="import-folder-list"></div><div class="dialog-actions"><button type="button" data-close-output-setup>Cancel</button><button type="button" id="save-output-setup" class="primary">Use this folder</button></div></dialog>');
+  if (!$('#output-setup-dialog')) document.body.insertAdjacentHTML('beforeend', '<dialog id="output-setup-dialog"><div class="dialog-title"><div><h2>Default media output folder</h2><code id="output-setup-current">/</code></div><button type="button" class="icon-close" data-close-output-setup>×</button></div><div id="output-setup-list" class="import-folder-list"></div><div class="dialog-actions"><button type="button" data-close-output-setup>Cancel</button><button type="button" id="save-output-setup" class="primary">Use this folder</button></div></dialog>');
   document.querySelectorAll('[data-close-output-setup]').forEach(button => button.onclick = () => $('#output-setup-dialog').close());
   $('#save-output-setup').onclick = saveOutputSetupFolder;
 }
@@ -20,7 +20,7 @@ async function openOutputSetupBrowser(path) {
 }
 
 async function saveOutputSetupFolder() {
-  try {const config=await api('/api/v32/import/output/config',{method:'PUT',body:JSON.stringify({path:outputSetupBrowsePath})});configuredOutputRoot=config.output_folder;currentImportOutput=configuredOutputRoot;$('#movie-import-output-path').textContent=configuredOutputRoot;$('#output-setup-dialog').close();renderFilesystemOutputFolder();toast('Default movie output folder saved')}catch(error){toast(error.message,true)}
+  try {const config=await api('/api/v32/import/output/config',{method:'PUT',body:JSON.stringify({path:outputSetupBrowsePath})});configuredOutputRoot=config.output_folder;currentImportOutput=configuredOutputRoot;$('#movie-import-output-path').textContent=configuredOutputRoot;$('#output-setup-dialog').close();renderFilesystemOutputFolder();toast('Default media output folder saved')}catch(error){toast(error.message,true)}
 }
 
 async function loadMovieImport() {

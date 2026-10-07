@@ -10,7 +10,7 @@
   // another top-level tab or moving an entire screen into a sibling screen.
   const groups=[
     {id:'connections',label:'Connections',items:[['Plex','plex'],['Media folders','folders'],['OpenSubtitles','integrations']]},
-    {id:'editing',label:'Editing',items:[['Movie import','import'],['Saved properties','properties'],['Templates','templates'],['Editing preferences','automation'],['Learned suggestions','suggestions']]},
+    {id:'editing',label:'Editing',items:[['Media import','import'],['Saved properties','properties'],['Templates','templates'],['Subtitle color','subtitle-color'],['Subtitle autofix','subtitle-autofix'],['Editing preferences','automation'],['Learned suggestions','suggestions']]},
     {id:'analysis',label:'Detection & reports',items:[['Language detection','language-detection']]},
     {id:'tasks',label:'Tasks',items:[['Task queue','queue'],['Indexes','indexes'],['Scheduled tasks','schedules'],['Priorities','priorities'],['Staged work','staged']]},
     {id:'data',label:'Data & safety',items:[['Backup','backup'],['Migrate','migrate'],['System info','info']]},
@@ -22,10 +22,12 @@
     plex:'Connect the library that supplies movies, shows, and episode updates.',
     folders:'Manage the movie and TV folders available inside the application container.',
     integrations:'Configure optional subtitle searches and download credentials.',
-    import:'Choose the locations used when importing movies.',
+    import:'Choose the locations used when importing movies and TV episodes.',
     properties:'Maintain reusable language, region, and track-name values.',
     templates:'Review and maintain saved stream-change templates.',
     automation:'Control the optional prompts shown while editing media.',
+    'subtitle-color':'Choose the text color offered by Set subtitle color in Stream Properties.',
+    'subtitle-autofix':'Maintain language-specific character and word replacements for future subtitle repairs.',
     suggestions:'Review track-name corrections learned from your edits.',
     'language-detection':'Configure subtitle inspection, audio detection, and report rules.',
     queue:'Review and control user-requested and background work.',
@@ -49,9 +51,17 @@
   pageTitle.insertAdjacentElement('afterend',workspace);
   workspace.append(navigation,content);
   const legacyPanels=setup.querySelector('.setup-tab-panels');
+  ['subtitle-color','subtitle-autofix'].forEach(name=>{
+    if(legacyPanels&&!legacyPanels.querySelector(`[data-setup-panel="${name}"]`)){
+      const panel=document.createElement('section');panel.dataset.setupPanel=name;panel.className='hidden';legacyPanels.append(panel);
+    }
+  });
   if(legacyPanels)content.append(legacyPanels);
   const groupTabs=navigation.querySelector('.setup-group-tabs');
   const sectionTabs=navigation.querySelector('.setup-section-tabs');
+  // Keep the selected area's sections above its content. Placing them below
+  // every sidebar category makes Editing look like just the import screen.
+  content.prepend(sectionTabs);
   groups.forEach(group=>{const button=document.createElement('button');button.type='button';button.dataset.setupGroup=group.id;button.setAttribute('role','tab');button.textContent=group.label;button.onclick=()=>activate(group.id,localStorage.getItem(`videostreamedit.setup-item.${group.id}.v2`)||group.items[0][1]);groupTabs.append(button)});
 
   const queueToolbar=setup.querySelector('.task-queue-heading>div:last-child');
@@ -87,12 +97,14 @@
   const backupSchedule=shell.querySelector('.backup-schedule');
   if(scheduleCards&&backupSchedule){
     const card=document.createElement('section');card.className='scheduled-task-card setup-schedule-extra';
+    card.dataset.scheduleActionsJob='backup';
     card.innerHTML='<div><strong>System backup</strong><small>Copies the database and protected configuration; media files are not included.</small></div>';
     card.append(backupSchedule);scheduleCards.append(card);
   }
   const dispatcherControls=setup.querySelector('.dispatcher-request-controls');
   if(scheduleCards&&dispatcherControls){
     const card=document.createElement('section');card.className='scheduled-task-card setup-schedule-extra';
+    card.dataset.scheduleActionsJob='preflight_cleanup';
     card.innerHTML='<div><strong>Preflight history cleanup</strong><small>Deletes old finished validation records only. Active requests and resulting media tasks are retained.</small></div>';
     const controls=document.createElement('div');controls.className='schedule-card-controls';
     ['[data-dispatcher-enabled]','[data-dispatcher-retention]','[data-dispatcher-save]'].forEach(selector=>{const input=dispatcherControls.querySelector(selector);const control=input?.closest('label')||input;if(control)controls.append(control)});
@@ -144,6 +156,7 @@
     sectionTabs.replaceChildren();
     group.items.forEach(([label,id])=>{const button=document.createElement('button');button.type='button';button.setAttribute('role','tab');button.textContent=label;button.classList.toggle('active',id===item[1]);button.setAttribute('aria-selected',String(id===item[1]));button.onclick=()=>activate(group.id,id);sectionTabs.append(button)});
     sectionTabs.hidden=group.items.length<2;
+    sectionTabs.setAttribute('aria-label',group.label+' sections');
     content.querySelector('[data-setup-current-area]').textContent=group.label;
     content.querySelector('[data-setup-current-title]').textContent=item[0];
     content.querySelector('[data-setup-current-description]').textContent=sectionDescriptions[item[1]]||'';
@@ -159,13 +172,19 @@
         if(taskButton)taskButton.click();else showTaskPanel(item[1]);
       }
     }else{
-      legacyTabs.querySelector(`[data-setup-tab="${item[1]}"]`)?.click();
+      const legacyButton=legacyTabs.querySelector(`[data-setup-tab="${item[1]}"]`);
+      if(legacyButton)legacyButton.click();
+      else if(['subtitle-color','subtitle-autofix'].includes(item[1])){
+        setup.querySelectorAll('[data-setup-panel]').forEach(panel=>panel.classList.toggle('hidden',panel.dataset.setupPanel!==item[1]));
+        legacyTabs.querySelectorAll('[data-setup-tab]').forEach(button=>button.classList.remove('active'));
+      }
     }
     localStorage.setItem('videostreamedit.setup-group.v2',group.id);
     localStorage.setItem(`videostreamedit.setup-item.${group.id}.v2`,item[1]);
     if(item[1]==='indexes')window.refreshSetupIndexCards?.();
     if(item[1]==='schedules')loadPreflightSchedule();
     if(item[1]==='staged')window.loadOcrStaged?.();
+    document.dispatchEvent(new CustomEvent('setup-section-opened',{detail:{group:group.id,section:item[1]}}));
   }
   window.openSetupDestination=(group,item)=>activate(group,item);
   async function loadPreflightSchedule(){try{const data=await api('/api/v89/preflight/settings');const enabled=setup.querySelector('[data-dispatcher-enabled]'),retention=setup.querySelector('[data-dispatcher-retention]');if(enabled)enabled.checked=Boolean(data.cleanup_enabled);if(retention)retention.value=data.retention_days||30}catch(_error){}}

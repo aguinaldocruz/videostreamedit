@@ -11,6 +11,7 @@ from pydantic import BaseModel
 import app.v54 as index_jobs
 from app.v11 import connection
 from app.v65 import app
+from app import scheduled_job_log as job_log
 
 logger = logging.getLogger("uvicorn.error")
 schedule_thread: threading.Thread | None = None
@@ -90,31 +91,15 @@ def run_scheduler() -> None:
             continue
         for schedule in schedules:
             job = schedule["job"]
-            if job in {"subtitle_detection", "voice_detection"}:
-                try:
-                    if not schedule_due(schedule["frequency"], schedule["time_of_day"], schedule["last_run"], now):
-                        continue
-                    from app.v80 import flush_deferred_language_detection
-                    with connection() as db:
-                        paths = [str(row["path"]) for row in db.execute("SELECT path FROM deferred_language_detection ORDER BY requested_at,path LIMIT 250").fetchall()]
-                    for path in paths:
-                        flush_deferred_language_detection(path, "subtitle" if job == "subtitle_detection" else "audio")
-                    with connection() as db:
-                        db.execute("UPDATE index_job_schedule SET last_run=?,updated_at=CURRENT_TIMESTAMP WHERE job=?", (now.isoformat(timespec="seconds"), job))
-                    logger.info("detection_scheduler event=scheduled_run subtitle_or_voice=%s media=%d", job, len(paths))
-                except Exception as exc:
-                    logger.warning("detection_scheduler event=scheduled_run_failed job=%s error=%s", job, str(exc).replace("\n", " "))
-                continue
             try:
                 if not schedule_due(schedule["frequency"], schedule["time_of_day"], schedule["last_run"], now):
                     continue
-                if index_jobs.status(job)["running"]:
+                if job in index_jobs.JOBS and index_jobs.status(job)["running"]:
                     continue
-                index_jobs.start(job)
+                queue_scheduled_job(job, source='schedule')
                 with connection() as db:
                     db.execute("UPDATE index_job_schedule SET last_run=?,updated_at=CURRENT_TIMESTAMP WHERE job=?", (now.isoformat(timespec="seconds"), job))
-                state = index_jobs.status(job)
-                logger.info("index_scheduler event=scheduled_check_started job=%s pending=%d frequency=%s", job, state.get("total", 0), schedule["frequency"])
+                logger.info("index_scheduler event=scheduled_check_queued job=%s frequency=%s", job, schedule["frequency"])
             except Exception as exc:
                 logger.warning("index_scheduler event=scheduled_check_failed job=%s error=%s", job, str(exc).replace("\n", " ")[-500:])
         threading.Event().wait(30)
@@ -168,3 +153,87 @@ def update_index_schedule(job: str, request: IndexSchedule) -> dict:
         )
     logger.info("index_scheduler event=schedule_changed job=%s frequency=%s time=%s", job, request.frequency, request.time)
     return schedule_data(job)
+
+
+def queue_scheduled_job(job: str, source: str = 'manual') -> dict:
+    """Run saved settings now, even when recurrence is disabled; never inline."""
+    import app.v65 as tasks
+    if job in index_jobs.JOBS:
+        task_type = 'index_check_prepare'
+    elif job in {'subtitle_detection', 'voice_detection', 'preflight_cleanup'}:
+        task_type = 'scheduled_task_dispatch'
+    elif job == 'subtitle_cache':
+        from app.subtitle_cache_schedule import start_run
+        return start_run(manual=source=='manual')
+    elif job == 'plex_sync':
+        from app.v68 import queue_logged_plex_check
+        return queue_logged_plex_check(source)
+    elif job == 'backup':
+        from app.v99_backup import _start
+        return _start('create', source=source)
+    else:
+        raise HTTPException(404, 'Unknown scheduled task')
+    task = tasks.enqueue(task_type, {'job': job, '_schedule_source': source},
+                         f'{job_log.JOBS[job]} · run now' if source=='manual' else f'Scheduled {job_log.JOBS[job]}', deduplicate=True)
+    job_log.begin(job, source, task_id=task['id'])
+    return {'accepted': True, 'task_id': task['id'], 'status': task['status']}
+
+
+def dispatch_scheduled_job(task_id: int, payload: dict) -> dict:
+    import app.v65 as tasks
+    job = str(payload.get('job') or '')
+    if job not in {'subtitle_detection', 'voice_detection', 'preflight_cleanup'}:
+        raise ValueError('Unknown scheduled dispatcher task')
+    run_id = job_log.begin(job, payload.get('_schedule_source', 'manual'), task_id=task_id)
+    job_log.running(run_id)
+    try:
+        if job=='preflight_cleanup':
+            from app.preflight_dispatcher import _cleanup_if_due
+            result = _cleanup_if_due(force=True, log_id=run_id)
+            tasks.update_progress(task_id, 1, 1, f"Cleanup finished; {result['deleted']} old requests removed")
+            return result
+        family = 'subtitle' if job=='subtitle_detection' else 'audio'
+        from app.v80 import flush_deferred_language_detection
+        with connection() as db:
+            rows = db.execute('SELECT path FROM deferred_language_detection WHERE detection_json LIKE ? '
+                              'ORDER BY requested_at,path LIMIT 250', (f'%"{family}_%',)).fetchall()
+        queued = skipped = failed = 0
+        for number, row in enumerate(rows, 1):
+            path = str(row['path'])
+            tasks.update_progress(task_id, number-1, len(rows), 'Dispatching '+path)
+            try:
+                result = flush_deferred_language_detection(path, family)
+                if result.get('queued'):
+                    queued += 1
+                    child = result.get('voice_task_id')
+                    kind = 'task'
+                    if family=='subtitle':
+                        with connection() as db:
+                            item = db.execute("SELECT id FROM index_task_queue WHERE job='subtitles' AND path=? "
+                                              "AND status IN ('pending','running') ORDER BY id DESC LIMIT 1", (path,)).fetchone()
+                        child, kind = (item['id'] if item else None), 'index'
+                    job_log.record(run_id, 'Detection queued; processing results appear here as the worker advances', path=path, queue_kind=kind, task_id=child)
+                else:
+                    skipped += 1
+                    job_log.record(run_id, 'No eligible deferred detection'+(' · Final Revision' if result.get('skipped')=='final_version' else ''), path=path)
+            except Exception as exc:
+                failed += 1
+                job_log.record(run_id, str(exc), level='error', path=path)
+        tasks.update_progress(task_id, len(rows), len(rows), f'{queued} media dispatched; {skipped} skipped; {failed} failed')
+        summary = f'{len(rows)} media checked · {queued} detection requests queued · {skipped} skipped · {failed} failed. Detection runs in its own queue, not in this dispatch step.'
+        if failed:
+            raise RuntimeError(summary)
+        job_log.finish(run_id, 'completed', summary)
+        return {'checked': len(rows), 'queued': queued, 'skipped': skipped, 'failed': failed}
+    except Exception as exc:
+        job_log.finish(run_id, 'failed', str(exc))
+        raise
+
+
+import app.v65 as _tasks
+_tasks.TASK_HANDLERS['scheduled_task_dispatch'] = dispatch_scheduled_job
+
+
+@app.post('/api/scheduled-tasks/{job}/run-now')
+def run_scheduled_job_now(job: str) -> dict:
+    return queue_scheduled_job(job)
